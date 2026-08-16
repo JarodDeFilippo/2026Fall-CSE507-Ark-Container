@@ -2,6 +2,7 @@ import os
 
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 
 class Accelerator:
@@ -49,6 +50,53 @@ class Accelerator:
             rank=self.rank,
             world_size=self.world_size,
         )
+
+    def wrap_model(self, model):
+        if not self.distributed:
+            return model
+
+        if self.is_cuda:
+            return DistributedDataParallel(
+                model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=True,
+            )
+
+        return DistributedDataParallel(
+            model,
+            device_ids=None,
+            find_unused_parameters=True,
+        )
+
+    @staticmethod
+    def unwrap_model(model):
+        return model.module if hasattr(model, "module") else model
+
+    @staticmethod
+    def strip_module_prefix(state_dict):
+        if any(key.startswith("module.") for key in state_dict):
+            return {
+                key[len("module."):] if key.startswith("module.") else key: value
+                for key, value in state_dict.items()
+            }
+        return state_dict
+
+    @property
+    def is_main_process(self):
+        return self.rank == 0
+
+    def barrier(self):
+        if self.distributed:
+            dist.barrier()
+
+    def broadcast(self, tensor):
+        if self.distributed:
+            dist.broadcast(tensor, src=0)
+
+    def destroy_distributed(self):
+        if self.distributed and dist.is_initialized():
+            dist.destroy_process_group()
 
     @property
     def is_cuda(self):
