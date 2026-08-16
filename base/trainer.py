@@ -114,12 +114,12 @@ def evaluate(model, use_head_n, data_loader_val, device, criterion, dataset):
     return losses.avg
 
 
-def test_classification(model, use_head_n, data_loader_test, device, multiclass = False): 
+def test_classification(model, use_head_n, data_loader_test, device, multiclass = False, num_classes = None):
        
     model.eval()
 
-    y_test = torch.FloatTensor().to(device)
-    p_test = torch.FloatTensor().to(device)
+    y_test = torch.empty((0, num_classes), device=device)
+    p_test = torch.empty((0, num_classes), device=device)
 
     with torch.no_grad():
         for i, (samples, _, targets) in enumerate(tqdm(data_loader_test)):

@@ -152,18 +152,29 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 teacher_state_dict = accelerator.strip_module_prefix(checkpoint['teacher'])
                 
                 if args.reinit_heads:
+                    current_head_shapes = {
+                        k: tuple(v.shape) for k, v in student_model.state_dict().items()
+                        if k.startswith('omni_heads.')
+                    }
                     reinitialized_head_keys = {
-                        k for k in student_model.state_dict().keys()
+                        k for k in current_head_shapes
+                    }
+                    checkpoint_head_shapes = {
+                        k: tuple(v.shape) for k, v in state_dict.items()
                         if k.startswith('omni_heads.')
                     }
                     checkpoint_head_keys = {
-                        k for k in state_dict.keys()
-                        if k.startswith('omni_heads.')
+                        k for k in checkpoint_head_shapes
                     }
+                    checkpoint_head_shapes.update({
+                        k: tuple(v.shape) for k, v in teacher_state_dict.items()
+                        if k.startswith('omni_heads.')
+                    })
                     checkpoint_head_keys.update(
                         k for k in teacher_state_dict.keys()
                         if k.startswith('omni_heads.')
                     )
+                    head_topology_matches = checkpoint_head_shapes == current_head_shapes
                     for k in sorted(checkpoint_head_keys):
                         if accelerator.is_main_process:
                             print(f"Removing key {k} from pretrained checkpoint")
@@ -184,12 +195,15 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 else:
                     student_model.load_state_dict(state_dict, strict=True)
                     teacher.load_state_dict(teacher_state_dict, strict=True)
-                lr_scheduler.load_state_dict(checkpoint['scheduler'])
-                optimizer.load_state_dict(checkpoint['optimizer'])
-                if args.reinit_heads:
-                    for name, parameter in student_model.named_parameters():
-                        if name.startswith('omni_heads.'):
-                            optimizer.state.pop(parameter, None)
+                if not args.reinit_heads or head_topology_matches:
+                    lr_scheduler.load_state_dict(checkpoint['scheduler'])
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                    if args.reinit_heads:
+                        for name, parameter in student_model.named_parameters():
+                            if name.startswith('omni_heads.'):
+                                optimizer.state.pop(parameter, None)
+                elif accelerator.is_main_process:
+                    print("Skipping optimizer and scheduler state because task-head topology changed")
                 if accelerator.is_main_process:
                     print("=> loaded checkpoint '{}' (epoch={:04d}, val_loss={})"
                             .format(resume, start_epoch, init_loss))
@@ -298,8 +312,8 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         writer.write("{} Disease = {}\n".format(dataset, diseases))
 
                     multiclass =  datasets_config[dataset]['task_type'] == "multi-class classification"
-                    y_test, p_test = test_classification(student_model, i, data_loader_list_test[i], device, multiclass)
-                    y_test_teacher, p_test_teacher = test_classification(teacher, i, data_loader_list_test[i], device, multiclass)
+                    y_test, p_test = test_classification(student_model, i, data_loader_list_test[i], device, multiclass, len(diseases))
+                    y_test_teacher, p_test_teacher = test_classification(teacher, i, data_loader_list_test[i], device, multiclass, len(diseases))
                     y_test = torch.cat(accelerator.gather_tensor(y_test), 0)
                     p_test = torch.cat(accelerator.gather_tensor(p_test), 0)
                     y_test_teacher = torch.cat(accelerator.gather_tensor(y_test_teacher), 0)
