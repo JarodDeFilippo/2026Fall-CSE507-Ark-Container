@@ -92,7 +92,7 @@ def build_omni_model_from_checkpoint(args, num_classes_list, key):
         model = ArkConvNeXt(num_classes_list, args.projector_features, args.use_mlp, depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024])
 
     if args.pretrained_weights is not None:
-        checkpoint = torch.load(args.pretrained_weights)
+        checkpoint = torch.load(args.pretrained_weights, map_location='cpu', weights_only=False)
         state_dict = checkpoint[key]
         if any([True if 'module.' in k else False for k in state_dict.keys()]):
                     state_dict = {k.replace('module.', ''): v for k, v in state_dict.items() if k.startswith('module.')}

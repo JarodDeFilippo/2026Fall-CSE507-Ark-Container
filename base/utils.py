@@ -2,7 +2,7 @@ from sklearn.metrics import roc_auc_score
 import torch
 import numpy as np
 import yaml
-from scipy import interpolate
+from scipy.interpolate import RectBivariateSpline
 from PIL import Image
 
 def get_config(config):
@@ -144,8 +144,8 @@ def cosine_anneal_schedule(t,epochs,learning_rate):
     return float(alpha_zero / 2 * cos_out)
 
 def dice(im1, im2, empty_score=1.0):
-    im1 = np.asarray(im1 > 0.5).astype(np.bool)
-    im2 = np.asarray(im2 > 0.5).astype(np.bool)
+    im1 = np.asarray(im1 > 0.5).astype(bool)
+    im2 = np.asarray(im2 > 0.5).astype(bool)
 
     if im1.shape != im2.shape:
         raise ValueError("Shape mismatch: im1 and im2 must have the same shape.")
@@ -215,7 +215,7 @@ def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epoch
 # --------------------------------------------------------
 def load_pretrained_simmim(pretrained_weights, model):
     print(">>>>>>>>>> Fine-tuned from {pretrained_weights} ..........")
-    checkpoint = torch.load(pretrained_weights, map_location='cpu')
+    checkpoint = torch.load(pretrained_weights, map_location='cpu', weights_only=False)
     checkpoint_model = checkpoint['model']
     
     if any([True if 'encoder.' in k else False for k in checkpoint_model.keys()]):
@@ -299,8 +299,8 @@ def remap_pretrained_keys_swin(model, checkpoint_model):
 
                     for i in range(nH1):
                         z = relative_position_bias_table_pretrained[:, i].view(src_size, src_size).float().numpy()
-                        f_cubic = interpolate.interp2d(x, y, z, kind='cubic')
-                        all_rel_pos_bias.append(torch.Tensor(f_cubic(dx, dy)).contiguous().view(-1, 1).to(
+                        spline = RectBivariateSpline(y, x, z, kx=3, ky=3)
+                        all_rel_pos_bias.append(torch.Tensor(spline(dy, dx)).contiguous().view(-1, 1).to(
                             relative_position_bias_table_pretrained.device))
 
                     new_rel_pos_bias = torch.cat(all_rel_pos_bias, dim=-1)

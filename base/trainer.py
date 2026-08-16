@@ -2,9 +2,8 @@ from utils import MetricLogger, ProgressLogger, save_image, save_snapshot
 import time
 import torch
 from tqdm import tqdm
-import wandb
 
-def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, criterion, optimizer, epoch, ema_mode, teacher, momentum_schedule, it):
+def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, criterion, optimizer, epoch, ema_mode, teacher, momentum_schedule, it, is_main_process=True):
     batch_time = MetricLogger('Time', ':6.3f')
     losses_cls = MetricLogger('Loss_'+dataset+' cls', ':.4e')
     losses_mse = MetricLogger('Loss_'+dataset+' mse', ':.4e')
@@ -21,7 +20,8 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
     for i, (samples1, samples2, targets) in enumerate(data_loader_train):
         samples1, samples2, targets = samples1.float().to(device), samples2.float().to(device), targets.float().to(device)
         
-        feat_t, pred_t = teacher(samples2, use_head_n)
+        with torch.no_grad():
+            feat_t, pred_t = teacher(samples2, use_head_n)
         feat_s, pred_s = model(samples1, use_head_n)
         loss_cls = criterion(pred_s, targets)
         loss_const = MSE(feat_s, feat_t)
@@ -44,7 +44,7 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % 50 == 0:
+        if is_main_process and i % 50 == 0:
             progress.display(i)
             save_image(samples1[0].cpu().numpy().transpose(1, 2, 0), "Models/student"+str(i))
             save_image(samples2[0].cpu().numpy().transpose(1, 2, 0),"Models/teacher"+str(i))
@@ -57,9 +57,6 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
         ema_update_teacher(model, teacher, momentum_schedule, it)
         it += 1
     
-    wandb.log({"train_loss_cls_{}".format(dataset): losses_cls.avg})
-    wandb.log({"train_loss_mse_{}".format(dataset): losses_mse.avg})
-
 
 def ema_update_teacher(model, teacher, momentum_schedule, it):
     with torch.no_grad():
@@ -104,7 +101,7 @@ def test_classification(model, use_head_n, data_loader_test, device, multiclass 
 
     with torch.no_grad():
         for i, (samples, _, targets) in enumerate(tqdm(data_loader_test)):
-            targets = targets.cuda()
+            targets = targets.to(device)
             y_test = torch.cat((y_test, targets), 0)
 
             if len(samples.size()) == 4:

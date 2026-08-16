@@ -94,7 +94,8 @@ def get_args_parser():
     parser.add_option("--test_augment", dest="test_augment", help="whether use test time augmentation",
                       default=True, action="callback", callback=vararg_callback_bool)
     parser.add_option("--anno_percent", dest="anno_percent", help="data percent", default=100, type="int")
-    parser.add_option("--device", dest="device", help="cpu|cuda", default="cuda", type="string")
+    parser.add_option("--device", dest="device", help="cpu|cuda|hpu", default=os.environ.get("PROJECT_ACCELERATOR", "cuda"), type="string")
+    parser.add_option("--reinit_heads", dest="reinit_heads", help="reinitialize task heads when resuming", default=False, action="callback", callback=vararg_callback_bool)
     parser.add_option("--activate", dest="activate", help="Sigmoid", default="Sigmoid", type="string")
     parser.add_option("--uncertain_label", dest="uncertain_label",
                       help="the label assigned to uncertain data (Ones | Zeros | LSR-Ones | LSR-Zeros)",

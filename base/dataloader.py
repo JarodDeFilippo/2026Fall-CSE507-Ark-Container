@@ -13,13 +13,9 @@ import pydicom as dicom
 import cv2
 from skimage import transform, io, img_as_float, exposure
 from albumentations import (
-    Compose, HorizontalFlip, CLAHE, HueSaturationValue,
-    RandomBrightness, RandomBrightnessContrast, RandomGamma,OneOf,
-    ToFloat, ShiftScaleRotate,GridDistortion, ElasticTransform, JpegCompression, HueSaturationValue,
-    RGBShift, RandomBrightness, RandomContrast, Blur, MotionBlur, MedianBlur, GaussNoise,CenterCrop,
-    IAAAdditiveGaussianNoise,GaussNoise,OpticalDistortion,RandomSizedCrop, RandomResizedCrop, Normalize
+    Compose, RandomBrightnessContrast, RandomGamma, OneOf,
+    ShiftScaleRotate, RandomResizedCrop,
 )
-from albumentations.pytorch import ToTensorV2
 
 def build_transform_classification(normalize, crop_size=224, resize=256, mode="train", test_augment=True):
     transformations_list = []
@@ -66,7 +62,7 @@ def build_transform_classification(normalize, crop_size=224, resize=256, mode="t
 
 def build_ts_transformations(crop_size):
     AUGMENTATIONS = Compose([
-      RandomResizedCrop(height=crop_size, width=crop_size),
+      RandomResizedCrop(size=(crop_size, crop_size)),
       ShiftScaleRotate(rotate_limit=10),
       OneOf([
           RandomBrightnessContrast(),
