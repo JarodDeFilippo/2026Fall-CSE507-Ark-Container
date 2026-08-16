@@ -37,8 +37,10 @@ if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
     args+=(--env "HABANA_VISIBLE_MODULES=$HABANA_VISIBLE_MODULES")
 elif [[ -n "${HABANA_VISIBLE_DEVICES:-}" ]]; then
     args+=(--env "HABANA_VISIBLE_DEVICES=$HABANA_VISIBLE_DEVICES")
+elif [[ -n "${SLURM_JOB_GPUS:-}" ]]; then
+    args+=(--env "HABANA_VISIBLE_DEVICES=$SLURM_JOB_GPUS")
 else
-    echo "No scheduler-provided Habana visibility variable found" >&2
+    echo "Set HABANA_VISIBLE_MODULES, HABANA_VISIBLE_DEVICES, or SLURM_JOB_GPUS" >&2
     exit 2
 fi
 
