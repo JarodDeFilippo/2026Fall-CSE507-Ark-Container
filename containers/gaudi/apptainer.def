@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: vault.habana.ai/gaudi-docker/1.24.1/ubuntu24.04/habanalabs/pytorch-installer-2.11.0:latest
+From: vault.habana.ai/gaudi-docker/1.24.1/ubuntu24.04/habanalabs/pytorch-installer-2.11.0@sha256:b257eaeffdc6ba5e1deaa4ca3aad8ec9ed0d777d00794a0635050e0160f09fd8
 
 %environment
     export PYTHONUNBUFFERED=1
@@ -21,6 +21,8 @@ From: vault.habana.ai/gaudi-docker/1.24.1/ubuntu24.04/habanalabs/pytorch-install
 
     # Inherit Intel's HPU torch without modifying the system installation.
     python3 -m venv --system-site-packages /opt/venv
+    /opt/venv/bin/python -c \
+        'import torch, torchvision; print("Torch:", torch.__version__, "Torchvision:", getattr(torchvision, "__version__", "N/A"))'
     /opt/venv/bin/python -m pip install --upgrade pip "setuptools<82" wheel
     /opt/venv/bin/python -m pip install \
         --no-cache-dir -r /opt/requirements.txt
