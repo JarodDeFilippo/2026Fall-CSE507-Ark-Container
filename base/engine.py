@@ -9,6 +9,7 @@ from tqdm import tqdm
 import copy
 
 
+from accelerator import Accelerator
 from models import build_omni_model, save_checkpoint
 from utils import metric_AUROC, cosine_scheduler
 from sklearn.metrics import accuracy_score
@@ -33,8 +34,10 @@ import torch.nn as nn
 sys.setrecursionlimit(40000)
 
 def omni_engine(args, model_path, output_path, dataset_list, datasets_config, dataset_train_list, dataset_val_list, dataset_test_list):
-    device = torch.device(args.device)
-    cudnn.benchmark = True
+    accelerator = Accelerator(args.device)
+    device = accelerator.device
+    if accelerator.is_cuda:
+        cudnn.benchmark = True
 
     # logs
     exp = 'Ark_Plus'
@@ -55,15 +58,15 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     data_loader_list_train = []
     for d in dataset_train_list:
         data_loader_list_train.append(DataLoader(dataset=d, batch_size=args.batch_size, shuffle=True,
-                                        num_workers=args.workers, pin_memory=True))
+                                        num_workers=args.workers, pin_memory=accelerator.pin_memory))
     data_loader_list_val = []
     for dv in dataset_val_list:
         data_loader_list_val.append(DataLoader(dataset=dv, batch_size=args.batch_size, shuffle=False,
-                                        num_workers=args.workers, pin_memory=True))
+                                        num_workers=args.workers, pin_memory=accelerator.pin_memory))
     data_loader_list_test = []
     for dt in dataset_test_list: 
         data_loader_list_test.append(DataLoader(dataset=dt, batch_size=int(args.batch_size/2), shuffle=False,
-                                        num_workers=args.workers, pin_memory=True))
+                                        num_workers=args.workers, pin_memory=accelerator.pin_memory))
 
     num_classes_list = [len(datasets_config[dataset]['diseases']) for dataset in dataset_list]
     print("num_classes_list:", num_classes_list)
@@ -74,7 +77,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     teacher = build_omni_model(args, num_classes_list)     
     print(model)
 
-    if torch.cuda.device_count() > 1:
+    if accelerator.is_cuda and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
         teacher = torch.nn.DataParallel(teacher)
     model.to(device)
@@ -106,7 +109,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             resume = save_model_path + '.pth.tar'
             if os.path.isfile(resume):
                 print("=> loading checkpoint '{}'".format(resume))
-                checkpoint = torch.load(resume)
+                checkpoint = torch.load(resume, map_location=device, weights_only=False)
                 start_epoch = checkpoint['epoch']
                 init_loss = checkpoint['lossMIN']
                 state_dict = checkpoint['state_dict']
