@@ -16,7 +16,7 @@ args=(
     --cleanenv
     --bind "$ROOT:/workspace:rw"
     --bind "$RUNTIME_ROOT:/runtime:rw"
-    --pwd /workspace
+    --pwd /workspace/base
     --env "PROJECT_ACCELERATOR=cuda"
     --env "PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin"
     --env "TMPDIR=/runtime/tmp"

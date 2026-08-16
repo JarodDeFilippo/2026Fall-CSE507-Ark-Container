@@ -231,7 +231,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 if train_sampler_list[i] is not None:
                     train_sampler_list[i].set_epoch(epoch)
                 criterion = torch.nn.CrossEntropyLoss() if datasets_config[dataset_list[i]]['task_type'] == "multi-class classification" else torch.nn.BCEWithLogitsLoss()
-                train_one_epoch(model, i, dataset_list[i], data_loader, device, criterion, optimizer, epoch, args.ema_mode, teacher, momentum_schedule, it, accelerator.is_main_process)
+                train_one_epoch(model, i, dataset_list[i], data_loader, device, criterion, optimizer, epoch, args.ema_mode, teacher, momentum_schedule, it, accelerator.is_main_process, accelerator)
                 it += 1
 
             accelerator.barrier()

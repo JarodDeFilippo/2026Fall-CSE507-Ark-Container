@@ -3,7 +3,7 @@ import time
 import torch
 from tqdm import tqdm
 
-def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, criterion, optimizer, epoch, ema_mode, teacher, momentum_schedule, it, is_main_process=True):
+def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, criterion, optimizer, epoch, ema_mode, teacher, momentum_schedule, it, is_main_process=True, accelerator=None):
     batch_time = MetricLogger('Time', ':6.3f')
     losses_cls = MetricLogger('Loss_'+dataset+' cls', ':.4e')
     losses_mse = MetricLogger('Loss_'+dataset+' mse', ':.4e')
@@ -44,10 +44,32 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if is_main_process and i % 50 == 0:
-            progress.display(i)
-            save_image(samples1[0].cpu().numpy().transpose(1, 2, 0), "Models/student"+str(i))
-            save_image(samples2[0].cpu().numpy().transpose(1, 2, 0),"Models/teacher"+str(i))
+        if i % 50 == 0:
+            if accelerator is not None and accelerator.distributed:
+                loss_stats = torch.tensor(
+                    [
+                        losses_cls.sum,
+                        losses_cls.count,
+                        loss_cls.item() * samples1.size(0),
+                        samples1.size(0),
+                        losses_mse.sum,
+                        losses_mse.count,
+                        loss_const.item() * samples1.size(0),
+                        samples1.size(0),
+                    ],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                accelerator.all_reduce(loss_stats)
+                losses_cls.val = (loss_stats[2] / loss_stats[3]).item()
+                losses_cls.avg = (loss_stats[0] / loss_stats[1]).item()
+                losses_mse.val = (loss_stats[6] / loss_stats[7]).item()
+                losses_mse.avg = (loss_stats[4] / loss_stats[5]).item()
+
+            if is_main_process:
+                progress.display(i)
+                save_image(samples1[0].cpu().numpy().transpose(1, 2, 0), "Models/student"+str(i))
+                save_image(samples2[0].cpu().numpy().transpose(1, 2, 0),"Models/teacher"+str(i))
 
         if ema_mode == "iteration":
             ema_update_teacher(model, teacher, momentum_schedule, it)

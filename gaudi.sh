@@ -18,7 +18,7 @@ args=(
     --bind "$ROOT:/workspace:rw"
     --bind "$RUNTIME_ROOT:/runtime:rw"
     --bind "$RUNTIME_ROOT/habana_logs:/var/log/habana_logs:rw"
-    --pwd /workspace
+    --pwd /workspace/base
     --env "PROJECT_ACCELERATOR=hpu"
     --env "PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin"
     --env "TMPDIR=/runtime/tmp"
