@@ -178,14 +178,15 @@ class CheXpert(Dataset):
             elif a == 0:
               label[i] = 0
             elif a == -1: # uncertain label
+              soft_label_rng = random.Random("{}:{}".format(line[0], i))
               if self.uncertain_label == "Ones":
                 label[i] = 1
               elif self.uncertain_label == "Zeros":
                 label[i] = 0
               elif self.uncertain_label == "LSR-Ones":
-                label[i] = random.uniform(0.55, 0.85)
+                label[i] = soft_label_rng.uniform(0.55, 0.85)
               elif self.uncertain_label == "LSR-Zeros":
-                label[i] = random.uniform(0, 0.3)
+                label[i] = soft_label_rng.uniform(0, 0.3)
           else:
             label[i] = unknown_label # unknown label
 
@@ -467,14 +468,15 @@ class MIMIC(Dataset):
             elif a == 0:
               label[i] = 0
             elif a == -1: # uncertain label
+              soft_label_rng = random.Random("{}:{}".format(line[0], i))
               if self.uncertain_label == "Ones":
                 label[i] = 1
               elif self.uncertain_label == "Zeros":
                 label[i] = 0
               elif self.uncertain_label == "LSR-Ones":
-                label[i] = random.uniform(0.55, 0.85)
+                label[i] = soft_label_rng.uniform(0.55, 0.85)
               elif self.uncertain_label == "LSR-Zeros":
-                label[i] = random.uniform(0, 0.3)
+                label[i] = soft_label_rng.uniform(0, 0.3)
           else:
             label[i] = unknown_label # unknown label
 
