@@ -114,6 +114,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     teacher.to(device)
     model = accelerator.wrap_model(model)
     student_model = accelerator.unwrap_model(model)
+    accelerator.synchronize_model(teacher)
     for p in teacher.parameters():
         p.requires_grad = False
     if accelerator.is_main_process:

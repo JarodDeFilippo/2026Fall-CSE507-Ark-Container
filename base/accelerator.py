@@ -104,6 +104,12 @@ class Accelerator:
         if self.distributed:
             dist.barrier()
 
+    def synchronize_model(self, model):
+        if self.distributed:
+            with torch.no_grad():
+                for tensor in model.state_dict().values():
+                    dist.broadcast(tensor, src=0)
+
     def all_reduce(self, tensor):
         if self.distributed:
             dist.all_reduce(tensor)
