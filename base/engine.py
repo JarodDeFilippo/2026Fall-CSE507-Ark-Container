@@ -151,18 +151,45 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 state_dict = accelerator.strip_module_prefix(checkpoint['state_dict'])
                 teacher_state_dict = accelerator.strip_module_prefix(checkpoint['teacher'])
                 
-                if args.reinit_heads: 
-                    for k in student_model.state_dict().keys():
-                        if k.startswith('omni_heads.'):
-                            if accelerator.is_main_process:
-                                print(f"Removing key {k} from pretrained checkpoint")
-                            state_dict.pop(k, None)
+                if args.reinit_heads:
+                    reinitialized_head_keys = {
+                        k for k in student_model.state_dict().keys()
+                        if k.startswith('omni_heads.')
+                    }
+                    checkpoint_head_keys = {
+                        k for k in state_dict.keys()
+                        if k.startswith('omni_heads.')
+                    }
+                    checkpoint_head_keys.update(
+                        k for k in teacher_state_dict.keys()
+                        if k.startswith('omni_heads.')
+                    )
+                    for k in sorted(checkpoint_head_keys):
+                        if accelerator.is_main_process:
+                            print(f"Removing key {k} from pretrained checkpoint")
+                        state_dict.pop(k, None)
+                        teacher_state_dict.pop(k, None)
 
-
-                student_model.load_state_dict(state_dict, strict=True)
-                teacher.load_state_dict(teacher_state_dict, strict=True)
+                    student_load_result = student_model.load_state_dict(state_dict, strict=False)
+                    teacher_load_result = teacher.load_state_dict(teacher_state_dict, strict=False)
+                    for model_name, load_result in (
+                            ('student', student_load_result),
+                            ('teacher', teacher_load_result)):
+                        missing_keys = set(load_result.missing_keys)
+                        unexpected_keys = set(load_result.unexpected_keys)
+                        if missing_keys != reinitialized_head_keys or unexpected_keys:
+                            raise RuntimeError(
+                                "{} checkpoint load had missing keys {} and unexpected keys {}"
+                                .format(model_name, sorted(missing_keys), sorted(unexpected_keys)))
+                else:
+                    student_model.load_state_dict(state_dict, strict=True)
+                    teacher.load_state_dict(teacher_state_dict, strict=True)
                 lr_scheduler.load_state_dict(checkpoint['scheduler'])
                 optimizer.load_state_dict(checkpoint['optimizer'])
+                if args.reinit_heads:
+                    for name, parameter in student_model.named_parameters():
+                        if name.startswith('omni_heads.'):
+                            optimizer.state.pop(parameter, None)
                 if accelerator.is_main_process:
                     print("=> loaded checkpoint '{}' (epoch={:04d}, val_loss={})"
                             .format(resume, start_epoch, init_loss))
