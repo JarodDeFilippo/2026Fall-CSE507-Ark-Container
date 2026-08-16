@@ -1,0 +1,9 @@
+*.sif
+.container-runtime/
+
+# Generated training artifacts
+base/Models/
+base/Outputs/
+*.pth
+*.pth.tar
+
