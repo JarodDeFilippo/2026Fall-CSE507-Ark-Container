@@ -35,6 +35,7 @@ sys.setrecursionlimit(40000)
 
 def omni_engine(args, model_path, output_path, dataset_list, datasets_config, dataset_train_list, dataset_val_list, dataset_test_list):
     accelerator = Accelerator(args.device)
+    accelerator.initialize_distributed()
     device = accelerator.device
     if accelerator.is_cuda:
         cudnn.benchmark = True
