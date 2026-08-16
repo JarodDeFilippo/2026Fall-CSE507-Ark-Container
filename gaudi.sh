@@ -33,6 +33,12 @@ args=(
     --env "OMPI_MCA_btl_vader_single_copy_mechanism=none"
 )
 
+if [[ -n "${DATA_BIND:-}" ]]; then
+    args+=(--bind "$DATA_BIND")
+elif [[ -d /data ]]; then
+    args+=(--bind "/data:/data:ro")
+fi
+
 if [[ -n "${HABANA_VISIBLE_MODULES:-}" ]]; then
     args+=(--env "HABANA_VISIBLE_MODULES=$HABANA_VISIBLE_MODULES")
 elif [[ -n "${HABANA_VISIBLE_DEVICES:-}" ]]; then

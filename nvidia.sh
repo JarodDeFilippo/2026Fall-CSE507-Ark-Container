@@ -28,6 +28,12 @@ args=(
     --env "MPLCONFIGDIR=/runtime/cache/matplotlib"
 )
 
+if [[ -n "${DATA_BIND:-}" ]]; then
+    args+=(--bind "$DATA_BIND")
+elif [[ -d /data ]]; then
+    args+=(--bind "/data:/data:ro")
+fi
+
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     args+=(--env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
 fi
