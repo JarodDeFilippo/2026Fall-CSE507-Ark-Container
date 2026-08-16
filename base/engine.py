@@ -9,7 +9,7 @@ from tqdm import tqdm
 import copy
 
 
-from accelerator import Accelerator
+from accelerator import Accelerator, DistributedEvaluationSampler
 from models import build_omni_model, save_checkpoint
 from utils import metric_AUROC, cosine_scheduler
 from sklearn.metrics import accuracy_score
@@ -79,12 +79,27 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                                         sampler=train_sampler,
                                         num_workers=args.workers, pin_memory=accelerator.pin_memory))
     data_loader_list_val = []
+    val_sampler_list = []
     for dv in dataset_val_list:
-        data_loader_list_val.append(DataLoader(dataset=dv, batch_size=args.batch_size, shuffle=False,
+        val_sampler = DistributedEvaluationSampler(
+            dv,
+            num_replicas=accelerator.world_size,
+            rank=accelerator.rank,
+        ) if accelerator.distributed else None
+        val_sampler_list.append(val_sampler)
+        data_loader_list_val.append(DataLoader(dataset=dv, batch_size=train_batch_size if accelerator.distributed else args.batch_size, shuffle=False,
+                                        sampler=val_sampler,
                                         num_workers=args.workers, pin_memory=accelerator.pin_memory))
     data_loader_list_test = []
     for dt in dataset_test_list: 
-        data_loader_list_test.append(DataLoader(dataset=dt, batch_size=int(args.batch_size/2), shuffle=False,
+        test_sampler = DistributedEvaluationSampler(
+            dt,
+            num_replicas=accelerator.world_size,
+            rank=accelerator.rank,
+        ) if accelerator.distributed else None
+        test_batch_size = max(1, int(train_batch_size / 2)) if accelerator.distributed else int(args.batch_size/2)
+        data_loader_list_test.append(DataLoader(dataset=dt, batch_size=test_batch_size, shuffle=False,
+                                        sampler=test_sampler,
                                         num_workers=args.workers, pin_memory=accelerator.pin_memory))
 
     num_classes_list = [len(datasets_config[dataset]['diseases']) for dataset in dataset_list]
@@ -192,18 +207,20 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 it += 1
 
             accelerator.barrier()
-            if accelerator.is_main_process:
-                val_loss_list = []
-                for i, dv in enumerate(data_loader_list_val):
-                    criterion = torch.nn.CrossEntropyLoss() if datasets_config[dataset_list[i]]['task_type'] == "multi-class classification" else torch.nn.BCEWithLogitsLoss()
-                    val_loss = evaluate(student_model, i, dv, device, criterion, dataset_list[i])
-                    val_loss_list.append(val_loss)
-            else:
-                val_loss_list = [0.0] * len(data_loader_list_val)
-
-            val_loss_tensor = torch.tensor(val_loss_list, dtype=torch.float32, device=device)
-            accelerator.broadcast(val_loss_tensor)
-            val_loss_list = val_loss_tensor.cpu().tolist()
+            val_loss_list = []
+            for i, dv in enumerate(data_loader_list_val):
+                criterion = torch.nn.CrossEntropyLoss() if datasets_config[dataset_list[i]]['task_type'] == "multi-class classification" else torch.nn.BCEWithLogitsLoss()
+                val_loss = evaluate(student_model, i, dv, device, criterion, dataset_list[i])
+                if accelerator.distributed:
+                    sample_count = len(val_sampler_list[i])
+                    val_loss_stats = torch.tensor(
+                        [val_loss * sample_count, sample_count],
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    accelerator.all_reduce(val_loss_stats)
+                    val_loss = (val_loss_stats[0] / val_loss_stats[1]).item()
+                val_loss_list.append(val_loss)
             
             avg_val_loss = np.average(val_loss_list)
             if args.val_loss_metric == "average":
@@ -232,61 +249,67 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     log.close()
   
             if epoch % args.test_epoch == 0 or epoch+1 == args.pretrain_epochs:
-                if not accelerator.is_main_process:
-                    accelerator.barrier()
-                    continue
-                save_checkpoint({
-                     'epoch': epoch,
-                     'lossMIN': val_loss_list,
-                     'state_dict': student_model.state_dict(),
-                     'teacher': teacher.state_dict(),
-                     'optimizer': optimizer.state_dict(),
-                     'scheduler': lr_scheduler.state_dict(),
-                     },  filename=save_model_path+str(epoch))
-                with open(output_file, 'a') as writer:
+                if accelerator.is_main_process:
+                    save_checkpoint({
+                         'epoch': epoch,
+                         'lossMIN': val_loss_list,
+                         'state_dict': student_model.state_dict(),
+                         'teacher': teacher.state_dict(),
+                         'optimizer': optimizer.state_dict(),
+                         'scheduler': lr_scheduler.state_dict(),
+                         },  filename=save_model_path+str(epoch))
+                    writer = open(output_file, 'a')
                     writer.write("Omni-pretraining stage:\n")
                     writer.write("Epoch {:04d}:\n".format(epoch))
-                    t_res, t_res_teacher = [],[]
-                    for i, dataset in enumerate(dataset_list):
+                t_res, t_res_teacher = [],[]
+                for i, dataset in enumerate(dataset_list):
+                    diseases = datasets_config[dataset]['diseases']
+                    if accelerator.is_main_process:
                         writer.write("{} Validation Loss = {:.5f}:\n".format(dataset, val_loss_list[i]))
-                        diseases = datasets_config[dataset]['diseases']
                         print(">>{} Disease = {}".format(dataset, diseases))
                         writer.write("{} Disease = {}\n".format(dataset, diseases))
 
-                        multiclass =  datasets_config[dataset]['task_type'] == "multi-class classification"
-                        y_test, p_test = test_classification(student_model, i, data_loader_list_test[i], device, multiclass)
-                        y_test_teacher, p_test_teacher = test_classification(teacher, i, data_loader_list_test[i], device, multiclass)
-                        if multiclass:
-                            acc = accuracy_score(np.argmax(y_test.cpu().numpy(),axis=1),np.argmax(p_test.cpu().numpy(),axis=1))
-                            acc_teacher = accuracy_score(np.argmax(y_test_teacher.cpu().numpy(),axis=1),np.argmax(p_test_teacher.cpu().numpy(),axis=1))
-                            print(">>{}:Student ACCURACY = {}, \nTeacher ACCURACY = {}\n".format(dataset,acc, acc_teacher))
-                            writer.write(
-                                "\n{}: Student ACCURACY = {}, \nTeacher ACCURACY = {}\n".format(dataset, np.array2string(np.array(acc), precision=4, separator='\t'), np.array2string(np.array(acc_teacher), precision=4, separator='\t')))   
-                            t_res.append(acc)
-                            t_res_teacher.append(acc_teacher)
-
-                        if dataset == "CheXpert":
-                            test_diseases_name = datasets_config['CheXpert']['test_diseases_name']
-                            test_diseases = [diseases.index(c) for c in test_diseases_name]
-                            y_test = copy.deepcopy(y_test[:,test_diseases])
-                            p_test = copy.deepcopy(p_test[:, test_diseases])
-                            individual_results = metric_AUROC(y_test, p_test, len(test_diseases)) 
-                            y_test_teacher = copy.deepcopy(y_test_teacher[:,test_diseases])
-                            p_test_teacher = copy.deepcopy(p_test_teacher[:, test_diseases])
-                            individual_results_teacher = metric_AUROC(y_test_teacher, p_test_teacher, len(test_diseases)) 
-                        else: 
-                            individual_results = metric_AUROC(y_test, p_test, len(diseases))
-                            individual_results_teacher = metric_AUROC(y_test_teacher, p_test_teacher, len(diseases)) 
-                        print(">>{}:Student AUC = {}, \nTeacher AUC = {}\n".format(dataset, np.array2string(np.array(individual_results), precision=4, separator='\t'),np.array2string(np.array(individual_results_teacher), precision=4, separator='\t')))
+                    multiclass =  datasets_config[dataset]['task_type'] == "multi-class classification"
+                    y_test, p_test = test_classification(student_model, i, data_loader_list_test[i], device, multiclass)
+                    y_test_teacher, p_test_teacher = test_classification(teacher, i, data_loader_list_test[i], device, multiclass)
+                    y_test = torch.cat(accelerator.gather_tensor(y_test), 0)
+                    p_test = torch.cat(accelerator.gather_tensor(p_test), 0)
+                    y_test_teacher = torch.cat(accelerator.gather_tensor(y_test_teacher), 0)
+                    p_test_teacher = torch.cat(accelerator.gather_tensor(p_test_teacher), 0)
+                    if not accelerator.is_main_process:
+                        continue
+                    if multiclass:
+                        acc = accuracy_score(np.argmax(y_test.cpu().numpy(),axis=1),np.argmax(p_test.cpu().numpy(),axis=1))
+                        acc_teacher = accuracy_score(np.argmax(y_test_teacher.cpu().numpy(),axis=1),np.argmax(p_test_teacher.cpu().numpy(),axis=1))
+                        print(">>{}:Student ACCURACY = {}, \nTeacher ACCURACY = {}\n".format(dataset,acc, acc_teacher))
                         writer.write(
-                            "\n{}: Student AUC = {}, \nTeacher AUC = {}\n".format(dataset, np.array2string(np.array(individual_results), precision=4, separator='\t'),np.array2string(np.array(individual_results_teacher), precision=4, separator='\t')))
-                        mean_over_all_classes = np.array(individual_results).mean()
-                        mean_over_all_classes_teacher = np.array(individual_results_teacher).mean()
-                        print(">>{}: Student mAUC = {:.4f}, Teacher mAUC = {:.4f}".format(dataset, mean_over_all_classes,mean_over_all_classes_teacher))
-                        writer.write("{}: Student mAUC = {:.4f}, Teacher mAUC = {:.4f}\n".format(dataset, mean_over_all_classes,mean_over_all_classes_teacher))
-                        t_res.append(mean_over_all_classes)
-                        t_res_teacher.append(mean_over_all_classes_teacher)
-                        
+                            "\n{}: Student ACCURACY = {}, \nTeacher ACCURACY = {}\n".format(dataset, np.array2string(np.array(acc), precision=4, separator='\t'), np.array2string(np.array(acc_teacher), precision=4, separator='\t')))
+                        t_res.append(acc)
+                        t_res_teacher.append(acc_teacher)
+
+                    if dataset == "CheXpert":
+                        test_diseases_name = datasets_config['CheXpert']['test_diseases_name']
+                        test_diseases = [diseases.index(c) for c in test_diseases_name]
+                        y_test = copy.deepcopy(y_test[:,test_diseases])
+                        p_test = copy.deepcopy(p_test[:, test_diseases])
+                        individual_results = metric_AUROC(y_test, p_test, len(test_diseases))
+                        y_test_teacher = copy.deepcopy(y_test_teacher[:,test_diseases])
+                        p_test_teacher = copy.deepcopy(p_test_teacher[:, test_diseases])
+                        individual_results_teacher = metric_AUROC(y_test_teacher, p_test_teacher, len(test_diseases))
+                    else:
+                        individual_results = metric_AUROC(y_test, p_test, len(diseases))
+                        individual_results_teacher = metric_AUROC(y_test_teacher, p_test_teacher, len(diseases))
+                    print(">>{}:Student AUC = {}, \nTeacher AUC = {}\n".format(dataset, np.array2string(np.array(individual_results), precision=4, separator='\t'),np.array2string(np.array(individual_results_teacher), precision=4, separator='\t')))
+                    writer.write(
+                        "\n{}: Student AUC = {}, \nTeacher AUC = {}\n".format(dataset, np.array2string(np.array(individual_results), precision=4, separator='\t'),np.array2string(np.array(individual_results_teacher), precision=4, separator='\t')))
+                    mean_over_all_classes = np.array(individual_results).mean()
+                    mean_over_all_classes_teacher = np.array(individual_results_teacher).mean()
+                    print(">>{}: Student mAUC = {:.4f}, Teacher mAUC = {:.4f}".format(dataset, mean_over_all_classes,mean_over_all_classes_teacher))
+                    writer.write("{}: Student mAUC = {:.4f}, Teacher mAUC = {:.4f}\n".format(dataset, mean_over_all_classes,mean_over_all_classes_teacher))
+                    t_res.append(mean_over_all_classes)
+                    t_res_teacher.append(mean_over_all_classes_teacher)
+
+                if accelerator.is_main_process:
                     writer.close()
 
                     test_results.append(t_res)

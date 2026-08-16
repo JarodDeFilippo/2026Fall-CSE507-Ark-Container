@@ -3,6 +3,20 @@ import os
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import Sampler
+
+
+class DistributedEvaluationSampler(Sampler):
+    def __init__(self, dataset, num_replicas, rank):
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self):
+        return max(0, (len(self.dataset) + self.num_replicas - 1 - self.rank) // self.num_replicas)
 
 
 class Accelerator:
@@ -90,9 +104,28 @@ class Accelerator:
         if self.distributed:
             dist.barrier()
 
-    def broadcast(self, tensor):
+    def all_reduce(self, tensor):
         if self.distributed:
-            dist.broadcast(tensor, src=0)
+            dist.all_reduce(tensor)
+
+    def gather_tensor(self, tensor):
+        if not self.distributed:
+            return [tensor]
+
+        local_size = torch.tensor([tensor.shape[0]], device=tensor.device, dtype=torch.long)
+        sizes = [torch.zeros_like(local_size) for _ in range(self.world_size)]
+        dist.all_gather(sizes, local_size)
+        max_size = max(size.item() for size in sizes)
+
+        padded = torch.zeros(
+            (max_size, *tensor.shape[1:]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        padded[:tensor.shape[0]] = tensor
+        gathered = [torch.zeros_like(padded) for _ in range(self.world_size)]
+        dist.all_gather(gathered, padded)
+        return [value[:size.item()] for value, size in zip(gathered, sizes)]
 
     def destroy_distributed(self):
         if self.distributed and dist.is_initialized():
