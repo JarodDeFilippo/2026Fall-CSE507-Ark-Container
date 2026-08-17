@@ -35,6 +35,13 @@ import torch.nn as nn
 sys.setrecursionlimit(40000)
 
 
+def _print_and_log(message, log_file=None):
+    print(message)
+    if log_file is not None:
+        log_file.write(message + "\n")
+        log_file.flush()
+
+
 def _raw_label_counts(dataset, split_key, file_path, num_classes):
     categories = ("positive", "negative", "uncertain", "missing")
     label_counts = [dict.fromkeys(categories, 0) for _ in range(num_classes)]
@@ -72,11 +79,14 @@ def _raw_label_counts(dataset, split_key, file_path, num_classes):
     return sample_count, label_counts
 
 
-def print_label_summary(dataset_list, datasets_config, dataset_train_list, dataset_val_list, dataset_test_list):
-    print("Label distribution:")
+def print_label_summary(dataset_list, datasets_config, dataset_train_list, dataset_val_list, dataset_test_list, log_file=None):
+    _print_and_log("Label distribution:", log_file)
     for dataset_index, dataset in enumerate(dataset_list, start=1):
         diseases = datasets_config[dataset]['diseases']
-        print("Dataset {}/{}: {}".format(dataset_index, len(dataset_list), dataset))
+        _print_and_log(
+            "Dataset {}/{}: {}".format(dataset_index, len(dataset_list), dataset),
+            log_file,
+        )
         split_datasets = (
             ("Train", "train_list", dataset_train_list[dataset_index - 1]),
             ("Validation", "val_list", dataset_val_list[dataset_index - 1]),
@@ -89,7 +99,10 @@ def print_label_summary(dataset_list, datasets_config, dataset_train_list, datas
             if split_name == "Validation" and uses_test_for_validation:
                 split_name = "Validation (test split)"
             sample_count = len(split_dataset)
-            print("  {}: {} samples".format(split_name, sample_count))
+            _print_and_log(
+                "  {}: {} samples".format(split_name, sample_count),
+                log_file,
+            )
             if sample_count == 0:
                 continue
 
@@ -112,7 +125,7 @@ def print_label_summary(dataset_list, datasets_config, dataset_train_list, datas
                         category: 100.0 * counts[category] / sample_count
                         for category in counts
                     }
-                    print(
+                    _print_and_log(
                         "    {}: positive {} ({:.1f}%), negative {} ({:.1f}%), "
                         "uncertain {} ({:.1f}%), missing {} ({:.1f}%)".format(
                             disease,
@@ -124,21 +137,23 @@ def print_label_summary(dataset_list, datasets_config, dataset_train_list, datas
                             percentages["uncertain"],
                             counts["missing"],
                             percentages["missing"],
-                        )
+                        ),
+                        log_file,
                     )
             else:
                 labels = np.asarray(split_dataset.img_label, dtype=np.float64)
                 for class_index, disease in enumerate(diseases):
                     positive_count = int(np.count_nonzero(labels[:, class_index] >= 0.5))
                     negative_count = sample_count - positive_count
-                    print(
+                    _print_and_log(
                         "    {}: positive {} ({:.1f}%), negative {} ({:.1f}%)".format(
                             disease,
                             positive_count,
                             100.0 * positive_count / sample_count,
                             negative_count,
                             100.0 * negative_count / sample_count,
-                        )
+                        ),
+                        log_file,
                     )
 
 
@@ -185,6 +200,33 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
 
     log_file = os.path.join(model_path, "train.log")
     output_file = os.path.join(output_path, exp+"_"+args.exp_name+"_results.txt")
+    train_log = None
+    loss_file = None
+    loss_writer = None
+    if args.mode == "train" and accelerator.is_main_process:
+        train_log = open(log_file, 'a', buffering=1)
+        train_log.write(str(args) + "\n")
+        loss_csv_path = os.path.join(output_path, "loss.csv")
+        loss_csv_exists = os.path.exists(loss_csv_path) and os.path.getsize(loss_csv_path) > 0
+        loss_file = open(loss_csv_path, 'a', newline='')
+        loss_writer = csv.writer(loss_file)
+        if not loss_csv_exists:
+            loss_writer.writerow([
+                "cycle",
+                "epoch",
+                "global_step",
+                "batch",
+                "dataset",
+                "samples",
+                "classification_loss",
+                "consistency_loss",
+                "total_loss",
+                "classification_percent",
+                "consistency_percent",
+                "learning_rate",
+                "momentum",
+            ])
+            loss_file.flush()
 
     # dataloaders for pretraining
     if accelerator.distributed:
@@ -233,7 +275,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
 
     num_classes_list = [len(datasets_config[dataset]['diseases']) for dataset in dataset_list]
     if accelerator.is_main_process:
-        print("num_classes_list:", num_classes_list)
+        _print_and_log("num_classes_list: {}".format(num_classes_list), train_log)
         if args.mode == "train":
             print_label_summary(
                 dataset_list,
@@ -241,6 +283,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 dataset_train_list,
                 dataset_val_list,
                 dataset_test_list,
+                train_log,
             )
 
 
@@ -255,7 +298,10 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     for p in teacher.parameters():
         p.requires_grad = False
     if accelerator.is_main_process:
-        print(f"Student and Teacher are built: they are both {args.model_name} network.")
+        _print_and_log(
+            "Student and Teacher are built: they are both {} network.".format(args.model_name),
+            train_log,
+        )
 
     # momentum parameter is increased to 1. during training with a cosine schedule
     if args.ema_mode == "epoch":
@@ -280,7 +326,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             resume = save_model_path + '.pth.tar'
             if os.path.isfile(resume):
                 if accelerator.is_main_process:
-                    print("=> loading checkpoint '{}'".format(resume))
+                    _print_and_log("=> loading checkpoint '{}'".format(resume), train_log)
                 checkpoint = torch.load(resume, map_location=device, weights_only=False)
                 start_epoch = checkpoint['epoch']
                 init_loss = checkpoint['lossMIN']
@@ -313,7 +359,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     head_topology_matches = checkpoint_head_shapes == current_head_shapes
                     for k in sorted(checkpoint_head_keys):
                         if accelerator.is_main_process:
-                            print(f"Removing key {k} from pretrained checkpoint")
+                            _print_and_log("Removing key {} from pretrained checkpoint".format(k), train_log)
                         state_dict.pop(k, None)
                         teacher_state_dict.pop(k, None)
 
@@ -339,14 +385,20 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                             if name.startswith('omni_heads.'):
                                 optimizer.state.pop(parameter, None)
                 elif accelerator.is_main_process:
-                    print("Skipping optimizer and scheduler state because task-head topology changed")
+                    _print_and_log(
+                        "Skipping optimizer and scheduler state because task-head topology changed",
+                        train_log,
+                    )
                 if accelerator.is_main_process:
-                    print("=> loaded checkpoint '{}' (epoch={:04d}, val_loss={})"
-                            .format(resume, start_epoch, init_loss))
+                    _print_and_log(
+                        "=> loaded checkpoint '{}' (epoch={:04d}, val_loss={})"
+                        .format(resume, start_epoch, init_loss),
+                        train_log,
+                    )
                 start_epoch += 1
             else:
                 if accelerator.is_main_process:
-                    print("=> no checkpoint found at '{}'".format(args.resume))
+                    _print_and_log("=> no checkpoint found at '{}'".format(args.resume), train_log)
         
             # wandb.init(
             #     # set the wandb project where this run will be logged
@@ -368,13 +420,9 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         #         }
         #     )
 
-        if accelerator.is_main_process:
-            with open(log_file, 'a') as log:
-                    log.write(str(args))
-            log.close()
-
         test_results,test_results_teacher = [],[]
         it = start_epoch * len(dataset_list)
+        global_step = start_epoch * sum(len(data_loader) for data_loader in data_loader_list_train)
         
         for epoch in range(start_epoch, args.pretrain_epochs):
             if accelerator.is_main_process:
@@ -382,8 +430,11 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     "{:.8e}".format(param_group["lr"])
                     for param_group in optimizer.param_groups
                 ]
-                print("Cycle {:04d}: learning rate = {}".format(
-                    epoch + 1, ", ".join(learning_rates)))
+                _print_and_log(
+                    "Cycle {:04d}: learning rate = {}".format(
+                        epoch + 1, ", ".join(learning_rates)),
+                    train_log,
+                )
             for i, data_loader in enumerate(data_loader_list_train): 
                 if train_sampler_list[i] is not None:
                     train_sampler_list[i].set_epoch(epoch)
@@ -391,7 +442,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 momentum = momentum_schedule[it]
                 coff = (momentum - 0.9) * 5
                 if accelerator.is_main_process:
-                    print(
+                    _print_and_log(
                         "Dataset {} ({}): momentum = {:.6f}, "
                         "classification/consistency = {:.4f}/{:.4f} ({:.1f}%/{:.1f}%)".format(
                             i + 1,
@@ -401,10 +452,41 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                             coff,
                             100 * (1 - coff),
                             100 * coff,
-                        )
+                        ),
+                        train_log,
                     )
-                train_one_epoch(model, i, dataset_list[i], data_loader, device, criterion, optimizer, epoch, args.ema_mode, teacher, momentum_schedule, it, accelerator.is_main_process, accelerator)
+                snapshot_directory = os.path.join(
+                    model_path,
+                    "snapshots",
+                    "cycle_{:04d}".format(epoch + 1),
+                    dataset_list[i],
+                )
+                if accelerator.is_main_process:
+                    os.makedirs(snapshot_directory, exist_ok=True)
+                train_one_epoch(
+                    model,
+                    i,
+                    dataset_list[i],
+                    data_loader,
+                    device,
+                    criterion,
+                    optimizer,
+                    epoch,
+                    args.ema_mode,
+                    teacher,
+                    momentum_schedule,
+                    it,
+                    accelerator.is_main_process,
+                    accelerator,
+                    global_step,
+                    momentum,
+                    train_log,
+                    loss_writer,
+                    loss_file,
+                    snapshot_directory,
+                )
                 it += 1
+                global_step += len(data_loader)
 
             accelerator.barrier()
             val_loss_list = []
@@ -432,7 +514,14 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             # wandb.log({"avg_val_loss": avg_val_loss})
             
             if accelerator.is_main_process:
-                print("Epoch {:04d}: avg_val_loss {:.5f}, saving model to {}".format(epoch, avg_val_loss,save_model_path))
+                _print_and_log(
+                    "Epoch {:04d}: avg_val_loss {:.5f}, saving model to {}".format(
+                        epoch,
+                        avg_val_loss,
+                        save_model_path,
+                    ),
+                    train_log,
+                )
                 save_checkpoint({
                         'epoch': epoch,
                         'lossMIN': val_loss_list,
@@ -442,11 +531,10 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         'scheduler': lr_scheduler.state_dict(),
                         },  filename=save_model_path)
 
-                with open(log_file, 'a') as log:
-                    log.write("Epoch {:04d}: avg_val_loss = {:.5f} \n".format(epoch, avg_val_loss))
-                    log.write("     Datasets  : " + str(dataset_list) + "\n")
-                    log.write("     Val Losses: " + str(val_loss_list) + "\n")
-                    log.close()
+                if train_log is not None:
+                    train_log.write("     Datasets  : " + str(dataset_list) + "\n")
+                    train_log.write("     Val Losses: " + str(val_loss_list) + "\n")
+                    train_log.flush()
   
             if epoch % args.test_epoch == 0 or epoch+1 == args.pretrain_epochs:
                 if accelerator.is_main_process:
@@ -480,7 +568,14 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     if multiclass:
                         acc = accuracy_score(np.argmax(y_test.cpu().numpy(),axis=1),np.argmax(p_test.cpu().numpy(),axis=1))
                         acc_teacher = accuracy_score(np.argmax(y_test_teacher.cpu().numpy(),axis=1),np.argmax(p_test_teacher.cpu().numpy(),axis=1))
-                        print(">>{}:Student ACCURACY = {}, \nTeacher ACCURACY = {}\n".format(dataset,acc, acc_teacher))
+                        _print_and_log(
+                            ">>{}:Student ACCURACY = {}, \nTeacher ACCURACY = {}\n".format(
+                                dataset,
+                                acc,
+                                acc_teacher,
+                            ),
+                            train_log,
+                        )
                         writer.write(
                             "\n{}: Student ACCURACY = {}, \nTeacher ACCURACY = {}\n".format(dataset, np.array2string(np.array(acc), precision=4, separator='\t'), np.array2string(np.array(acc_teacher), precision=4, separator='\t')))
                         t_res.append(acc)
@@ -498,12 +593,26 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     else:
                         individual_results = metric_AUROC(y_test, p_test, len(diseases))
                         individual_results_teacher = metric_AUROC(y_test_teacher, p_test_teacher, len(diseases))
-                    print(">>{}:Student AUC = {}, \nTeacher AUC = {}\n".format(dataset, np.array2string(np.array(individual_results), precision=4, separator='\t'),np.array2string(np.array(individual_results_teacher), precision=4, separator='\t')))
+                    _print_and_log(
+                        ">>{}:Student AUC = {}, \nTeacher AUC = {}\n".format(
+                            dataset,
+                            np.array2string(np.array(individual_results), precision=4, separator='\t'),
+                            np.array2string(np.array(individual_results_teacher), precision=4, separator='\t'),
+                        ),
+                        train_log,
+                    )
                     writer.write(
                         "\n{}: Student AUC = {}, \nTeacher AUC = {}\n".format(dataset, np.array2string(np.array(individual_results), precision=4, separator='\t'),np.array2string(np.array(individual_results_teacher), precision=4, separator='\t')))
                     mean_over_all_classes = np.array(individual_results).mean()
                     mean_over_all_classes_teacher = np.array(individual_results_teacher).mean()
-                    print(">>{}: Student mAUC = {:.4f}, Teacher mAUC = {:.4f}".format(dataset, mean_over_all_classes,mean_over_all_classes_teacher))
+                    _print_and_log(
+                        ">>{}: Student mAUC = {:.4f}, Teacher mAUC = {:.4f}".format(
+                            dataset,
+                            mean_over_all_classes,
+                            mean_over_all_classes_teacher,
+                        ),
+                        train_log,
+                    )
                     writer.write("{}: Student mAUC = {:.4f}, Teacher mAUC = {:.4f}\n".format(dataset, mean_over_all_classes,mean_over_all_classes_teacher))
                     t_res.append(mean_over_all_classes)
                     t_res_teacher.append(mean_over_all_classes_teacher)
@@ -514,7 +623,13 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     test_results.append(t_res)
                     test_results_teacher.append(t_res_teacher)
         
-                    print("Omni-pretraining stage: \nStudent meanAUC = \n{} \nTeacher meanAUC = \n{}\n".format(test_results, test_results_teacher))
+                    _print_and_log(
+                        "Omni-pretraining stage: \nStudent meanAUC = \n{} \nTeacher meanAUC = \n{}\n".format(
+                            test_results,
+                            test_results_teacher,
+                        ),
+                        train_log,
+                    )
             accelerator.barrier()
 
         accelerator.barrier()
@@ -523,6 +638,10 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 writer.write("Omni-pretraining stage: \nStudent meanAUC = \n{} \nTeacher meanAUC = \n{}\n".format(np.array2string(np.array(test_results), precision=4, separator='\t'),np.array2string(np.array(test_results_teacher), precision=4, separator='\t')))
             writer.close()
 
+    if loss_file is not None:
+        loss_file.close()
+    if train_log is not None:
+        train_log.close()
     accelerator.destroy_distributed()
 
     

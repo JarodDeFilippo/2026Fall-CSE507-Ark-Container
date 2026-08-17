@@ -1,9 +1,10 @@
 from utils import MetricLogger, ProgressLogger, save_image, save_snapshot
+import os
 import time
 import torch
 from tqdm import tqdm
 
-def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, criterion, optimizer, epoch, ema_mode, teacher, momentum_schedule, it, is_main_process=True, accelerator=None):
+def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, criterion, optimizer, epoch, ema_mode, teacher, momentum_schedule, it, is_main_process=True, accelerator=None, global_step=0, momentum=None, train_log=None, loss_writer=None, loss_file=None, snapshot_directory=None):
     losses_cls = MetricLogger('Loss_'+dataset+' cls', ':.4e')
     losses_mse = MetricLogger('Loss_'+dataset+' mse', ':.4e')
     losses_total = MetricLogger('Loss_'+dataset+' total', ':.4e')
@@ -16,6 +17,8 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
     model.train()
     MSE = torch.nn.MSELoss()
     coff = (momentum_schedule[it] - 0.9) * 5
+    if momentum is None:
+        momentum = momentum_schedule[it]
     #print(momentum_schedule[it],it, coff)
     for i, (samples1, samples2, targets) in enumerate(progress):
         samples1, samples2, targets = samples1.float().to(device), samples2.float().to(device), targets.float().to(device)
@@ -41,52 +44,97 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
 
         loss_cls_value = (1 - coff) * loss_cls.item()
         loss_const_value = coff * loss_const.item()
-        losses_cls.update(loss_cls_value, samples1.size(0))
-        losses_mse.update(loss_const_value, samples1.size(0))
-        losses_total.update(loss.item(), samples1.size(0))
-        if i % 50 == 0:
-            if accelerator is not None and accelerator.distributed:
-                loss_stats = torch.tensor(
-                    [
-                        losses_cls.sum,
-                        losses_cls.count,
-                        loss_cls_value * samples1.size(0),
-                        samples1.size(0),
-                        losses_mse.sum,
-                        losses_mse.count,
-                        loss_const_value * samples1.size(0),
-                        samples1.size(0),
-                        losses_total.sum,
-                        losses_total.count,
-                        loss.item() * samples1.size(0),
-                        samples1.size(0),
-                    ],
-                    dtype=torch.float32,
-                    device=device,
-                )
-                accelerator.all_reduce(loss_stats)
-                losses_cls.val = (loss_stats[2] / loss_stats[3]).item()
-                losses_cls.avg = (loss_stats[0] / loss_stats[1]).item()
-                losses_mse.val = (loss_stats[6] / loss_stats[7]).item()
-                losses_mse.avg = (loss_stats[4] / loss_stats[5]).item()
-                losses_total.val = (loss_stats[10] / loss_stats[11]).item()
-                losses_total.avg = (loss_stats[8] / loss_stats[9]).item()
+        batch_size = samples1.size(0)
+        loss_stats = torch.tensor(
+            [
+                loss_cls_value * batch_size,
+                loss_const_value * batch_size,
+                loss.item() * batch_size,
+                batch_size,
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        if accelerator is not None and accelerator.distributed:
+            accelerator.all_reduce(loss_stats)
+        global_batch_size = int(loss_stats[3].item())
+        global_cls_value = (loss_stats[0] / loss_stats[3]).item()
+        global_const_value = (loss_stats[1] / loss_stats[3]).item()
+        global_total_value = (loss_stats[2] / loss_stats[3]).item()
+        losses_cls.update(global_cls_value, global_batch_size)
+        losses_mse.update(global_const_value, global_batch_size)
+        losses_total.update(global_total_value, global_batch_size)
 
+        total_loss = losses_total.avg
+        if total_loss != 0:
+            cls_percent = 100 * losses_cls.avg / total_loss
+            const_percent = 100 * losses_mse.avg / total_loss
+        else:
+            cls_percent = 0
+            const_percent = 0
+        current_total = global_total_value
+        if current_total != 0:
+            current_cls_percent = 100 * global_cls_value / current_total
+            current_const_percent = 100 * global_const_value / current_total
+        else:
+            current_cls_percent = 0
+            current_const_percent = 0
+
+        if is_main_process and loss_writer is not None:
+            loss_writer.writerow([
+                epoch + 1,
+                epoch,
+                global_step + i,
+                i + 1,
+                dataset,
+                global_batch_size,
+                global_cls_value,
+                global_const_value,
+                global_total_value,
+                current_cls_percent,
+                current_const_percent,
+                optimizer.param_groups[0]["lr"],
+                momentum,
+            ])
+            if loss_file is not None:
+                loss_file.flush()
+
+        if is_main_process and snapshot_directory is not None and i == 0:
+            save_image(
+                samples1[0].cpu().numpy().transpose(1, 2, 0),
+                os.path.join(snapshot_directory, "student"),
+            )
+            save_image(
+                samples2[0].cpu().numpy().transpose(1, 2, 0),
+                os.path.join(snapshot_directory, "teacher"),
+            )
+
+        if (i + 1) % 50 == 0 or i + 1 == len(data_loader_train):
             if is_main_process:
-                total_loss = losses_total.avg
-                if total_loss != 0:
-                    cls_percent = 100 * losses_cls.avg / total_loss
-                    const_percent = 100 * losses_mse.avg / total_loss
-                else:
-                    cls_percent = 0
-                    const_percent = 0
                 progress.set_postfix(
                     classification="{:.4e} ({:.1f}%)".format(losses_cls.avg, cls_percent),
                     consistency="{:.4e} ({:.1f}%)".format(losses_mse.avg, const_percent),
                     total="{:.4e} (100.0%)".format(total_loss),
                 )
-                save_image(samples1[0].cpu().numpy().transpose(1, 2, 0), "Models/student"+str(i))
-                save_image(samples2[0].cpu().numpy().transpose(1, 2, 0),"Models/teacher"+str(i))
+                message = (
+                    "Cycle {:04d} | Dataset {} | Batch {:04d}/{:04d} | "
+                    "classification={:.4e} ({:.1f}%) | "
+                    "consistency={:.4e} ({:.1f}%) | total={:.4e} (100.0%)"
+                ).format(
+                    epoch + 1,
+                    dataset,
+                    i + 1,
+                    len(data_loader_train),
+                    losses_cls.avg,
+                    cls_percent,
+                    losses_mse.avg,
+                    const_percent,
+                    total_loss,
+                )
+                print(message)
+                if train_log is not None:
+                    train_log.write(message + "\n")
+                    train_log.flush()
 
         if ema_mode == "iteration":
             ema_update_teacher(model, teacher, momentum_schedule, it)
