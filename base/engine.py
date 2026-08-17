@@ -357,10 +357,32 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         it = start_epoch * len(dataset_list)
         
         for epoch in range(start_epoch, args.pretrain_epochs):
+            if accelerator.is_main_process:
+                learning_rates = [
+                    "{:.8e}".format(param_group["lr"])
+                    for param_group in optimizer.param_groups
+                ]
+                print("Cycle {:04d}: learning rate = {}".format(
+                    epoch + 1, ", ".join(learning_rates)))
             for i, data_loader in enumerate(data_loader_list_train): 
                 if train_sampler_list[i] is not None:
                     train_sampler_list[i].set_epoch(epoch)
                 criterion = torch.nn.CrossEntropyLoss() if datasets_config[dataset_list[i]]['task_type'] == "multi-class classification" else torch.nn.BCEWithLogitsLoss()
+                momentum = momentum_schedule[it]
+                coff = (momentum - 0.9) * 5
+                if accelerator.is_main_process:
+                    print(
+                        "Dataset {} ({}): momentum = {:.6f}, "
+                        "classification/consistency = {:.4f}/{:.4f} ({:.1f}%/{:.1f}%)".format(
+                            i + 1,
+                            dataset_list[i],
+                            momentum,
+                            1 - coff,
+                            coff,
+                            100 * (1 - coff),
+                            100 * coff,
+                        )
+                    )
                 train_one_epoch(model, i, dataset_list[i], data_loader, device, criterion, optimizer, epoch, args.ema_mode, teacher, momentum_schedule, it, accelerator.is_main_process, accelerator)
                 it += 1
 

@@ -4,20 +4,20 @@ import torch
 from tqdm import tqdm
 
 def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, criterion, optimizer, epoch, ema_mode, teacher, momentum_schedule, it, is_main_process=True, accelerator=None):
-    batch_time = MetricLogger('Time', ':6.3f')
     losses_cls = MetricLogger('Loss_'+dataset+' cls', ':.4e')
     losses_mse = MetricLogger('Loss_'+dataset+' mse', ':.4e')
-    progress = ProgressLogger(
-        len(data_loader_train),
-        [batch_time, losses_cls, losses_mse],
-        prefix="Epoch: [{}]".format(epoch))
+    losses_total = MetricLogger('Loss_'+dataset+' total', ':.4e')
+    progress = tqdm(
+        data_loader_train,
+        desc="Train {}".format(dataset),
+        disable=not is_main_process,
+    )
 
     model.train()
     MSE = torch.nn.MSELoss()
     coff = (momentum_schedule[it] - 0.9) * 5
     #print(momentum_schedule[it],it, coff)
-    end = time.time()
-    for i, (samples1, samples2, targets) in enumerate(data_loader_train):
+    for i, (samples1, samples2, targets) in enumerate(progress):
         samples1, samples2, targets = samples1.float().to(device), samples2.float().to(device), targets.float().to(device)
         
         with torch.no_grad():
@@ -39,22 +39,26 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
         loss.backward()
         optimizer.step()
 
-        losses_cls.update(loss_cls.item(), samples1.size(0))
-        losses_mse.update(loss_const.item(), samples1.size(0))
-        batch_time.update(time.time() - end)
-        end = time.time()
-
+        loss_cls_value = (1 - coff) * loss_cls.item()
+        loss_const_value = coff * loss_const.item()
+        losses_cls.update(loss_cls_value, samples1.size(0))
+        losses_mse.update(loss_const_value, samples1.size(0))
+        losses_total.update(loss.item(), samples1.size(0))
         if i % 50 == 0:
             if accelerator is not None and accelerator.distributed:
                 loss_stats = torch.tensor(
                     [
                         losses_cls.sum,
                         losses_cls.count,
-                        loss_cls.item() * samples1.size(0),
+                        loss_cls_value * samples1.size(0),
                         samples1.size(0),
                         losses_mse.sum,
                         losses_mse.count,
-                        loss_const.item() * samples1.size(0),
+                        loss_const_value * samples1.size(0),
+                        samples1.size(0),
+                        losses_total.sum,
+                        losses_total.count,
+                        loss.item() * samples1.size(0),
                         samples1.size(0),
                     ],
                     dtype=torch.float32,
@@ -65,9 +69,22 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
                 losses_cls.avg = (loss_stats[0] / loss_stats[1]).item()
                 losses_mse.val = (loss_stats[6] / loss_stats[7]).item()
                 losses_mse.avg = (loss_stats[4] / loss_stats[5]).item()
+                losses_total.val = (loss_stats[10] / loss_stats[11]).item()
+                losses_total.avg = (loss_stats[8] / loss_stats[9]).item()
 
             if is_main_process:
-                progress.display(i)
+                total_loss = losses_total.avg
+                if total_loss != 0:
+                    cls_percent = 100 * losses_cls.avg / total_loss
+                    const_percent = 100 * losses_mse.avg / total_loss
+                else:
+                    cls_percent = 0
+                    const_percent = 0
+                progress.set_postfix(
+                    classification="{:.4e} ({:.1f}%)".format(losses_cls.avg, cls_percent),
+                    consistency="{:.4e} ({:.1f}%)".format(losses_mse.avg, const_percent),
+                    total="{:.4e} (100.0%)".format(total_loss),
+                )
                 save_image(samples1[0].cpu().numpy().transpose(1, 2, 0), "Models/student"+str(i))
                 save_image(samples2[0].cpu().numpy().transpose(1, 2, 0),"Models/teacher"+str(i))
 
@@ -78,6 +95,8 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
     if ema_mode == "epoch":
         ema_update_teacher(model, teacher, momentum_schedule, it)
         it += 1
+
+    progress.close()
     
 
 def ema_update_teacher(model, teacher, momentum_schedule, it):
