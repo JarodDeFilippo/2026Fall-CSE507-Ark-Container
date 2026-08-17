@@ -89,8 +89,11 @@ def get_args_parser():
     parser.add_option('--patience-epochs', type=int, default=10, metavar='N',
                         help='patience epochs for Plateau LR scheduler (default: 10')
 
-    parser.add_option("--resume", dest="resume", help="whether latest checkpoint", default=False, action="callback",
+    parser.add_option("--resume", dest="resume", help="resume the latest checkpoint in the run directory", default=False, action="callback",
                       callback=vararg_callback_bool)
+    parser.add_option("--resume_from", dest="resume_from",
+                      help="resume from an explicit cycle checkpoint path",
+                      default=None, type="string")
     parser.add_option("--workers", dest="workers", help="number of CPU workers", default=8, type="int")
     parser.add_option("--print_freq", dest="print_freq", help="print frequency", default=50, type="int")
     parser.add_option("--test_augment", dest="test_augment", help="whether use test time augmentation",
@@ -117,6 +120,8 @@ def main(args):
             raise ValueError("--exp_name is required for training")
         if args.seed is None:
             raise ValueError("--seed is required for training")
+        if args.resume and args.resume_from is not None:
+            raise ValueError("Use either --resume or --resume_from, not both")
 
     if args.seed is not None:
         random.seed(args.seed)

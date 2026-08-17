@@ -4,6 +4,9 @@ import sys
 import shutil
 import time
 import csv
+import glob
+import re
+import tempfile
 import numpy as np
 from optparse import OptionParser
 from tqdm import tqdm
@@ -49,6 +52,259 @@ def _append_evaluation_rows(file_path, rows):
         if not file_exists:
             writer.writerow(["cycle", "epoch", "metric", "student", "teacher"])
         writer.writerows(rows)
+
+
+def _checkpoint_cycle(file_path):
+    match = re.fullmatch(r"cycle_(\d+)\.pth\.tar", os.path.basename(file_path))
+    return int(match.group(1)) if match else None
+
+
+def _load_checkpoint_metadata(file_path):
+    checkpoint = torch.load(file_path, map_location='cpu', weights_only=False)
+    required_keys = {'epoch', 'lossMIN', 'state_dict', 'teacher', 'optimizer', 'scheduler'}
+    missing_keys = required_keys.difference(checkpoint.keys())
+    if missing_keys:
+        raise ValueError(
+            "Checkpoint '{}' is missing keys {}".format(
+                file_path,
+                sorted(missing_keys),
+            )
+        )
+    filename_cycle = _checkpoint_cycle(file_path)
+    checkpoint_cycle = checkpoint.get('cycle', filename_cycle)
+    if filename_cycle is None or checkpoint_cycle != filename_cycle:
+        raise ValueError("Checkpoint '{}' has an invalid cycle number".format(file_path))
+    return checkpoint
+
+
+def _find_latest_valid_checkpoint(checkpoint_directory):
+    checkpoint_paths = [
+        path for path in glob.glob(os.path.join(checkpoint_directory, "cycle_*.pth.tar"))
+        if _checkpoint_cycle(path) is not None
+    ]
+    checkpoint_paths.sort(key=_checkpoint_cycle, reverse=True)
+    for checkpoint_path in checkpoint_paths:
+        try:
+            checkpoint = _load_checkpoint_metadata(checkpoint_path)
+        except Exception:
+            continue
+        return checkpoint_path, int(checkpoint['cycle'])
+    raise FileNotFoundError(
+        "No valid cycle checkpoint found in {}".format(checkpoint_directory)
+    )
+
+
+def _checkpoint_run_directory(checkpoint_path):
+    checkpoint_directory = os.path.dirname(checkpoint_path)
+    if os.path.basename(checkpoint_directory) != "checkpoints" or os.path.basename(os.path.dirname(checkpoint_directory)) != "models":
+        raise ValueError(
+            "Checkpoint must be inside <run>/models/checkpoints: {}".format(checkpoint_path)
+        )
+    return os.path.dirname(os.path.dirname(checkpoint_directory))
+
+
+def _scheduler_config(args):
+    return {
+        'pretrain_epochs': args.pretrain_epochs,
+        'sched': args.sched,
+        'lr': args.lr,
+        'lr_noise': args.lr_noise,
+        'lr_noise_pct': args.lr_noise_pct,
+        'lr_noise_std': args.lr_noise_std,
+        'warmup_lr': args.warmup_lr,
+        'min_lr': args.min_lr,
+        'decay_epochs': args.decay_epochs,
+        'warmup_epochs': args.warmup_epochs,
+        'cooldown_epochs': args.cooldown_epochs,
+        'decay_rate': args.decay_rate,
+        'patience_epochs': args.patience_epochs,
+        'ema_mode': args.ema_mode,
+        'momentum_teacher': args.momentum_teacher,
+        'batch_size': args.batch_size,
+    }
+
+
+def _validate_checkpoint_total_cycles(checkpoint, file_path, args):
+    total_cycles = checkpoint.get('total_cycles')
+    if total_cycles is None:
+        raise ValueError(
+            "Checkpoint '{}' does not record the total cycle count".format(file_path)
+        )
+    if total_cycles != args.pretrain_epochs:
+        raise ValueError(
+            "Checkpoint '{}' was configured for {} cycles, but this run requests {}"
+            .format(file_path, total_cycles, args.pretrain_epochs)
+        )
+
+
+def _rewrite_csv_through_cycle(file_path, max_cycle):
+    if not os.path.isfile(file_path):
+        return
+    with open(file_path, 'r', newline='') as file_descriptor:
+        rows = list(csv.reader(file_descriptor))
+    if not rows:
+        return
+    filtered_rows = [rows[0]]
+    for row in rows[1:]:
+        try:
+            cycle = int(row[0])
+        except (IndexError, ValueError):
+            continue
+        if cycle <= max_cycle:
+            filtered_rows.append(row)
+    with tempfile.NamedTemporaryFile(
+            mode='w',
+            newline='',
+            dir=os.path.dirname(file_path),
+            delete=False) as temporary_file:
+        writer = csv.writer(temporary_file)
+        writer.writerows(filtered_rows)
+        temporary_path = temporary_file.name
+    os.replace(temporary_path, file_path)
+
+
+def _trim_train_log_through_cycle(file_path, max_cycle):
+    if not os.path.isfile(file_path):
+        return
+    with open(file_path, 'r') as file_descriptor:
+        lines = file_descriptor.readlines()
+    filtered_lines = []
+    for line in lines:
+        match = re.match(r"^Cycle\s+(\d+)(?::|\s+\|)", line)
+        if match and int(match.group(1)) > max_cycle:
+            break
+        filtered_lines.append(line)
+    with tempfile.NamedTemporaryFile(
+            mode='w',
+            dir=os.path.dirname(file_path),
+            delete=False) as temporary_file:
+        temporary_file.writelines(filtered_lines)
+        temporary_path = temporary_file.name
+    os.replace(temporary_path, file_path)
+
+
+def _remove_cycle_directories_after(directory, prefix, max_cycle):
+    if not os.path.isdir(directory):
+        return
+    for name in os.listdir(directory):
+        match = re.fullmatch(r"{}_([0-9]+)".format(prefix), name)
+        if match and int(match.group(1)) > max_cycle:
+            path = os.path.join(directory, name)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+
+
+def _remove_checkpoints_after(directory, max_cycle):
+    if not os.path.isdir(directory):
+        return
+    for path in glob.glob(os.path.join(directory, "cycle_*.pth.tar")):
+        cycle = _checkpoint_cycle(path)
+        if cycle is not None and cycle > max_cycle:
+            os.remove(path)
+
+
+def _discard_outputs_after_cycle(run_directory, max_cycle):
+    _remove_cycle_directories_after(
+        os.path.join(run_directory, "snapshots"),
+        "cycle",
+        max_cycle,
+    )
+    _remove_cycle_directories_after(
+        os.path.join(run_directory, "models", "weights"),
+        "epoch",
+        max_cycle,
+    )
+    _remove_checkpoints_after(
+        os.path.join(run_directory, "models", "checkpoints"),
+        max_cycle,
+    )
+    _rewrite_csv_through_cycle(os.path.join(run_directory, "loss.csv"), max_cycle)
+    evaluation_directory = os.path.join(run_directory, "evaluation")
+    if os.path.isdir(evaluation_directory):
+        for dataset in os.listdir(evaluation_directory):
+            dataset_directory = os.path.join(evaluation_directory, dataset)
+            if os.path.isdir(dataset_directory):
+                for file_name in os.listdir(dataset_directory):
+                    if file_name.endswith('.csv'):
+                        _rewrite_csv_through_cycle(
+                            os.path.join(dataset_directory, file_name),
+                            max_cycle,
+                        )
+    _trim_train_log_through_cycle(
+        os.path.join(run_directory, "train.log"),
+        max_cycle,
+    )
+
+
+def _copy_cycle_directories(source_directory, target_directory, prefix, max_cycle):
+    if not os.path.isdir(source_directory):
+        return
+    for name in os.listdir(source_directory):
+        match = re.fullmatch(r"{}_([0-9]+)".format(prefix), name)
+        if not match or int(match.group(1)) > max_cycle:
+            continue
+        source_path = os.path.join(source_directory, name)
+        target_path = os.path.join(target_directory, name)
+        if os.path.isdir(source_path):
+            os.makedirs(target_directory, exist_ok=True)
+            shutil.copytree(source_path, target_path)
+        else:
+            os.makedirs(target_directory, exist_ok=True)
+            shutil.copy2(source_path, target_path)
+
+
+def _copy_checkpoint_files(source_directory, target_directory, max_cycle):
+    if not os.path.isdir(source_directory):
+        return
+    for source_path in glob.glob(os.path.join(source_directory, "cycle_*.pth.tar")):
+        cycle = _checkpoint_cycle(source_path)
+        if cycle is None or cycle > max_cycle:
+            continue
+        os.makedirs(target_directory, exist_ok=True)
+        shutil.copy2(source_path, os.path.join(target_directory, os.path.basename(source_path)))
+
+
+def _copy_run_through_cycle(source_directory, target_directory, max_cycle):
+    os.makedirs(target_directory, exist_ok=True)
+    for file_name in ("train.log", "loss.csv"):
+        source_path = os.path.join(source_directory, file_name)
+        target_path = os.path.join(target_directory, file_name)
+        if os.path.isfile(source_path):
+            shutil.copy2(source_path, target_path)
+
+    _copy_cycle_directories(
+        os.path.join(source_directory, "snapshots"),
+        os.path.join(target_directory, "snapshots"),
+        "cycle",
+        max_cycle,
+    )
+    _copy_cycle_directories(
+        os.path.join(source_directory, "models", "weights"),
+        os.path.join(target_directory, "models", "weights"),
+        "epoch",
+        max_cycle,
+    )
+    _copy_checkpoint_files(
+        os.path.join(source_directory, "models", "checkpoints"),
+        os.path.join(target_directory, "models", "checkpoints"),
+        max_cycle,
+    )
+
+    source_evaluation_directory = os.path.join(source_directory, "evaluation")
+    if os.path.isdir(source_evaluation_directory):
+        for dataset in os.listdir(source_evaluation_directory):
+            source_dataset_directory = os.path.join(source_evaluation_directory, dataset)
+            if not os.path.isdir(source_dataset_directory):
+                continue
+            target_dataset_directory = os.path.join(target_directory, "evaluation", dataset)
+            os.makedirs(target_dataset_directory, exist_ok=True)
+            for file_name in os.listdir(source_dataset_directory):
+                if file_name.endswith('.csv'):
+                    source_path = os.path.join(source_dataset_directory, file_name)
+                    target_path = os.path.join(target_dataset_directory, file_name)
+                    shutil.copy2(source_path, target_path)
+
+    _discard_outputs_after_cycle(target_directory, max_cycle)
 
 
 def _raw_label_counts(dataset, split_key, file_path, num_classes):
@@ -177,10 +433,76 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     exp = 'Ark_Plus'
     for dataset in dataset_list:
         exp += '_' + dataset 
+    resume_requested = (
+        args.mode == "train"
+        and (args.resume or getattr(args, "resume_from", None) is not None)
+    )
+    resume_checkpoint_path = None
+    resume_cycle = None
     if args.mode != "train":
         model_path = os.path.join(model_path, exp)
         model_path = os.path.join(model_path, args.exp_name)
-    elif args.resume:
+    elif resume_requested and getattr(args, "resume_from", None) is not None:
+        source_checkpoint = os.path.realpath(os.path.abspath(args.resume_from))
+        source_run_directory = os.path.realpath(_checkpoint_run_directory(source_checkpoint))
+        target_run_directory = os.path.realpath(os.path.abspath(model_path))
+        selected_cycle = _checkpoint_cycle(source_checkpoint)
+        if selected_cycle is None or not os.path.isfile(source_checkpoint):
+            raise FileNotFoundError(
+                "Cannot resume because checkpoint does not exist or is not a cycle checkpoint: {}"
+                .format(source_checkpoint)
+            )
+        if accelerator.is_main_process:
+            selected_checkpoint = _load_checkpoint_metadata(source_checkpoint)
+            _validate_checkpoint_total_cycles(selected_checkpoint, source_checkpoint, args)
+            if selected_cycle >= selected_checkpoint['total_cycles']:
+                raise RuntimeError(
+                    "Cannot resume from completed checkpoint '{}'".format(source_checkpoint)
+                )
+
+        if target_run_directory == source_run_directory:
+            run_status = torch.zeros(1, dtype=torch.int32, device=device)
+            if accelerator.is_main_process:
+                run_status[0] = int(os.path.isdir(model_path))
+            accelerator.broadcast(run_status)
+            if run_status.item() == 0:
+                raise FileNotFoundError(
+                    "Cannot resume training because run directory does not exist: {}".format(model_path)
+                )
+            if accelerator.is_main_process:
+                _, latest_cycle = _find_latest_valid_checkpoint(
+                    os.path.join(model_path, "models", "checkpoints")
+                )
+                if selected_cycle != latest_cycle:
+                    raise ValueError(
+                        "Resuming from a checkpoint before the latest requires a new --exp_name"
+                    )
+                _discard_outputs_after_cycle(model_path, selected_cycle)
+            accelerator.barrier()
+        else:
+            run_status = torch.zeros(1, dtype=torch.int32, device=device)
+            if accelerator.is_main_process:
+                run_status[0] = int(not os.path.exists(model_path))
+            accelerator.broadcast(run_status)
+            if run_status.item() == 0:
+                raise FileExistsError(
+                    "Training run directory already exists: {}".format(model_path)
+                )
+            if accelerator.is_main_process:
+                _copy_run_through_cycle(
+                    source_run_directory,
+                    model_path,
+                    selected_cycle,
+                )
+            accelerator.barrier()
+        resume_cycle = selected_cycle
+        resume_checkpoint_path = os.path.join(
+            model_path,
+            "models",
+            "checkpoints",
+            "cycle_{:04d}.pth.tar".format(resume_cycle),
+        )
+    elif resume_requested:
         run_status = torch.zeros(1, dtype=torch.int32, device=device)
         if accelerator.is_main_process:
             run_status[0] = int(os.path.isdir(model_path))
@@ -189,6 +511,30 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             raise FileNotFoundError(
                 "Cannot resume training because run directory does not exist: {}".format(model_path)
             )
+        if accelerator.is_main_process:
+            latest_checkpoint, latest_cycle = _find_latest_valid_checkpoint(
+                os.path.join(model_path, "models", "checkpoints")
+            )
+            latest_metadata = _load_checkpoint_metadata(latest_checkpoint)
+            _validate_checkpoint_total_cycles(latest_metadata, latest_checkpoint, args)
+            if latest_cycle >= latest_metadata['total_cycles']:
+                raise RuntimeError(
+                    "Cannot resume completed run '{}'".format(model_path)
+                )
+            _discard_outputs_after_cycle(model_path, latest_cycle)
+            resume_cycle = latest_cycle
+        resume_cycle_tensor = torch.full((1,), -1, dtype=torch.int64, device=device)
+        if accelerator.is_main_process:
+            resume_cycle_tensor[0] = resume_cycle
+        accelerator.broadcast(resume_cycle_tensor)
+        resume_cycle = int(resume_cycle_tensor.item())
+        resume_checkpoint_path = os.path.join(
+            model_path,
+            "models",
+            "checkpoints",
+            "cycle_{:04d}.pth.tar".format(resume_cycle),
+        )
+        accelerator.barrier()
     else:
         run_status = torch.zeros(1, dtype=torch.int32, device=device)
         if accelerator.is_main_process:
@@ -335,87 +681,107 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     start_epoch = 0
     init_loss = 999999
     best_val_loss = init_loss
-    save_model_path = os.path.join(model_path, exp)
     checkpoint_frequency = 10
 
     if args.mode == "train":
-        if args.resume:
-            resume = save_model_path + '.pth.tar'
-            if os.path.isfile(resume):
-                if accelerator.is_main_process:
-                    _print_and_log("=> loading checkpoint '{}'".format(resume), train_log)
-                checkpoint = torch.load(resume, map_location=device, weights_only=False)
-                start_epoch = checkpoint['epoch']
-                init_loss = checkpoint['lossMIN']
-                state_dict = accelerator.strip_module_prefix(checkpoint['state_dict'])
-                teacher_state_dict = accelerator.strip_module_prefix(checkpoint['teacher'])
-                
-                if args.reinit_heads:
-                    current_head_shapes = {
-                        k: tuple(v.shape) for k, v in student_model.state_dict().items()
-                        if k.startswith('omni_heads.')
-                    }
-                    reinitialized_head_keys = {
-                        k for k in current_head_shapes
-                    }
-                    checkpoint_head_shapes = {
-                        k: tuple(v.shape) for k, v in state_dict.items()
-                        if k.startswith('omni_heads.')
-                    }
-                    checkpoint_head_keys = {
-                        k for k in checkpoint_head_shapes
-                    }
-                    checkpoint_head_shapes.update({
-                        k: tuple(v.shape) for k, v in teacher_state_dict.items()
-                        if k.startswith('omni_heads.')
-                    })
-                    checkpoint_head_keys.update(
-                        k for k in teacher_state_dict.keys()
-                        if k.startswith('omni_heads.')
-                    )
-                    head_topology_matches = checkpoint_head_shapes == current_head_shapes
-                    for k in sorted(checkpoint_head_keys):
-                        if accelerator.is_main_process:
-                            _print_and_log("Removing key {} from pretrained checkpoint".format(k), train_log)
-                        state_dict.pop(k, None)
-                        teacher_state_dict.pop(k, None)
+        if resume_requested:
+            resume = resume_checkpoint_path
+            if not os.path.isfile(resume):
+                raise FileNotFoundError("Cannot load resume checkpoint: {}".format(resume))
+            if accelerator.is_main_process:
+                _print_and_log("=> loading checkpoint '{}'".format(resume), train_log)
+            checkpoint = torch.load(resume, map_location=device, weights_only=False)
+            _validate_checkpoint_total_cycles(checkpoint, resume, args)
+            checkpoint_cycle = int(checkpoint.get('cycle', checkpoint['epoch'] + 1))
+            if checkpoint_cycle >= args.pretrain_epochs:
+                raise RuntimeError("Cannot continue training after cycle {}".format(checkpoint_cycle))
+            start_epoch = checkpoint_cycle
+            init_loss = checkpoint['lossMIN']
+            state_dict = accelerator.strip_module_prefix(checkpoint['state_dict'])
+            teacher_state_dict = accelerator.strip_module_prefix(checkpoint['teacher'])
+            head_topology_matches = True
+            if args.reinit_heads:
+                current_head_shapes = {
+                    k: tuple(v.shape) for k, v in student_model.state_dict().items()
+                    if k.startswith('omni_heads.')
+                }
+                reinitialized_head_keys = {
+                    k for k in current_head_shapes
+                }
+                checkpoint_head_shapes = {
+                    k: tuple(v.shape) for k, v in state_dict.items()
+                    if k.startswith('omni_heads.')
+                }
+                checkpoint_head_keys = {
+                    k for k in checkpoint_head_shapes
+                }
+                checkpoint_head_shapes.update({
+                    k: tuple(v.shape) for k, v in teacher_state_dict.items()
+                    if k.startswith('omni_heads.')
+                })
+                checkpoint_head_keys.update(
+                    k for k in teacher_state_dict.keys()
+                    if k.startswith('omni_heads.')
+                )
+                head_topology_matches = checkpoint_head_shapes == current_head_shapes
+                for k in sorted(checkpoint_head_keys):
+                    if accelerator.is_main_process:
+                        _print_and_log("Removing key {} from pretrained checkpoint".format(k), train_log)
+                    state_dict.pop(k, None)
+                    teacher_state_dict.pop(k, None)
 
-                    student_load_result = student_model.load_state_dict(state_dict, strict=False)
-                    teacher_load_result = teacher.load_state_dict(teacher_state_dict, strict=False)
-                    for model_name, load_result in (
-                            ('student', student_load_result),
-                            ('teacher', teacher_load_result)):
-                        missing_keys = set(load_result.missing_keys)
-                        unexpected_keys = set(load_result.unexpected_keys)
-                        if missing_keys != reinitialized_head_keys or unexpected_keys:
-                            raise RuntimeError(
-                                "{} checkpoint load had missing keys {} and unexpected keys {}"
-                                .format(model_name, sorted(missing_keys), sorted(unexpected_keys)))
-                else:
-                    student_model.load_state_dict(state_dict, strict=True)
-                    teacher.load_state_dict(teacher_state_dict, strict=True)
-                if not args.reinit_heads or head_topology_matches:
-                    lr_scheduler.load_state_dict(checkpoint['scheduler'])
-                    optimizer.load_state_dict(checkpoint['optimizer'])
-                    if args.reinit_heads:
-                        for name, parameter in student_model.named_parameters():
-                            if name.startswith('omni_heads.'):
-                                optimizer.state.pop(parameter, None)
-                elif accelerator.is_main_process:
-                    _print_and_log(
-                        "Skipping optimizer and scheduler state because task-head topology changed",
-                        train_log,
-                    )
-                if accelerator.is_main_process:
-                    _print_and_log(
-                        "=> loaded checkpoint '{}' (epoch={:04d}, val_loss={})"
-                        .format(resume, start_epoch, init_loss),
-                        train_log,
-                    )
-                start_epoch += 1
+                student_load_result = student_model.load_state_dict(state_dict, strict=False)
+                teacher_load_result = teacher.load_state_dict(teacher_state_dict, strict=False)
+                for model_name, load_result in (
+                        ('student', student_load_result),
+                        ('teacher', teacher_load_result)):
+                    missing_keys = set(load_result.missing_keys)
+                    unexpected_keys = set(load_result.unexpected_keys)
+                    if missing_keys != reinitialized_head_keys or unexpected_keys:
+                        raise RuntimeError(
+                            "{} checkpoint load had missing keys {} and unexpected keys {}"
+                            .format(model_name, sorted(missing_keys), sorted(unexpected_keys)))
             else:
-                if accelerator.is_main_process:
-                    _print_and_log("=> no checkpoint found at '{}'".format(args.resume), train_log)
+                student_model.load_state_dict(state_dict, strict=True)
+                teacher.load_state_dict(teacher_state_dict, strict=True)
+
+            dataset_configuration_matches = (
+                checkpoint.get('dataset_list') == list(dataset_list)
+                and checkpoint.get('num_classes_list') == num_classes_list
+            )
+            restore_optimizer = (
+                not args.reinit_heads
+                or (head_topology_matches and dataset_configuration_matches)
+            )
+            if restore_optimizer:
+                saved_scheduler_config = checkpoint.get('scheduler_config')
+                if saved_scheduler_config != _scheduler_config(args):
+                    raise ValueError(
+                        "Scheduler configuration does not match checkpoint '{}'"
+                        .format(resume)
+                    )
+                if not dataset_configuration_matches:
+                    raise ValueError(
+                        "Dataset configuration does not match checkpoint '{}'"
+                        .format(resume)
+                    )
+                lr_scheduler.load_state_dict(checkpoint['scheduler'])
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                if args.reinit_heads:
+                    for name, parameter in student_model.named_parameters():
+                        if name.startswith('omni_heads.'):
+                            optimizer.state.pop(parameter, None)
+            elif accelerator.is_main_process:
+                _print_and_log(
+                    "Skipping optimizer and scheduler state because task-head topology changed",
+                    train_log,
+                )
+            if accelerator.is_main_process:
+                _print_and_log(
+                    "=> loaded checkpoint '{}' (cycle={:04d}, val_loss={})"
+                    .format(resume, checkpoint_cycle, init_loss),
+                    train_log,
+                )
         
             # wandb.init(
             #     # set the wandb project where this run will be logged
@@ -694,6 +1060,10 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         {
                             'epoch': epoch,
                             'cycle': cycle,
+                            'total_cycles': args.pretrain_epochs,
+                            'scheduler_config': _scheduler_config(args),
+                            'dataset_list': list(dataset_list),
+                            'num_classes_list': num_classes_list,
                             'lossMIN': val_loss_list,
                             'state_dict': student_model.state_dict(),
                             'teacher': teacher.state_dict(),
