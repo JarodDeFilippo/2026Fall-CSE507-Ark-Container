@@ -2,6 +2,7 @@ import os
 import sys
 import shutil
 import time
+import random
 import numpy as np
 from optparse import OptionParser
 from shutil import copyfile
@@ -35,6 +36,7 @@ def get_args_parser():
     parser.add_option("--batch_size", dest="batch_size", help="batch size", default=32, type="int")
     parser.add_option("--epochs", dest="epochs", help="num of epoches", default=200, type="int")
     parser.add_option("--exp_name", dest="exp_name", default="", type="string")
+    parser.add_option("--seed", dest="seed", default=None, type="int")
     parser.add_option("--mode", dest="mode", help="train | test", default="train", type="string")
     
     parser.add_option("--ema_mode", dest="ema_mode", default="epoch", help="update teacher model at which time (epoch | iteration)", type="string")
@@ -110,6 +112,17 @@ def get_args_parser():
 
 
 def main(args):
+    if args.mode == "train":
+        if not args.exp_name:
+            raise ValueError("--exp_name is required for training")
+        if args.seed is None:
+            raise ValueError("--seed is required for training")
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+
     print(args)
 
     exp_name = args.model_name + "_" + args.exp_name
