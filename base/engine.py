@@ -42,6 +42,15 @@ def _print_and_log(message, log_file=None):
         log_file.flush()
 
 
+def _append_evaluation_rows(file_path, rows):
+    file_exists = os.path.exists(file_path) and os.path.getsize(file_path) > 0
+    with open(file_path, 'a', newline='') as file_descriptor:
+        writer = csv.writer(file_descriptor)
+        if not file_exists:
+            writer.writerow(["cycle", "epoch", "metric", "student", "teacher"])
+        writer.writerows(rows)
+
+
 def _raw_label_counts(dataset, split_key, file_path, num_classes):
     categories = ("positive", "negative", "uncertain", "missing")
     label_counts = [dict.fromkeys(categories, 0) for _ in range(num_classes)]
@@ -196,10 +205,17 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
 
         if not os.path.exists(output_path):
             os.makedirs(output_path)
+        if args.mode == "train":
+            os.makedirs(os.path.join(model_path, "models", "checkpoints"), exist_ok=True)
+            os.makedirs(os.path.join(model_path, "models", "weights"), exist_ok=True)
+            for dataset in dataset_list:
+                os.makedirs(os.path.join(model_path, "evaluation", dataset), exist_ok=True)
     accelerator.barrier()
 
     log_file = os.path.join(model_path, "train.log")
-    output_file = os.path.join(output_path, exp+"_"+args.exp_name+"_results.txt")
+    checkpoint_directory = os.path.join(model_path, "models", "checkpoints")
+    weights_directory = os.path.join(model_path, "models", "weights")
+    evaluation_directory = os.path.join(model_path, "evaluation")
     train_log = None
     loss_file = None
     loss_writer = None
@@ -320,6 +336,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     init_loss = 999999
     best_val_loss = init_loss
     save_model_path = os.path.join(model_path, exp)
+    checkpoint_frequency = 10
 
     if args.mode == "train":
         if args.resume:
@@ -491,8 +508,21 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             accelerator.barrier()
             val_loss_list = []
             for i, dv in enumerate(data_loader_list_val):
-                criterion = torch.nn.CrossEntropyLoss() if datasets_config[dataset_list[i]]['task_type'] == "multi-class classification" else torch.nn.BCEWithLogitsLoss()
-                val_loss = evaluate(student_model, i, dv, device, criterion, dataset_list[i])
+                dataset = dataset_list[i]
+                diseases = datasets_config[dataset]['diseases']
+                multiclass = datasets_config[dataset]['task_type'] == "multi-class classification"
+                criterion = torch.nn.CrossEntropyLoss() if multiclass else torch.nn.BCEWithLogitsLoss()
+                val_loss, y_val, p_val = evaluate(
+                    student_model,
+                    i,
+                    dv,
+                    device,
+                    criterion,
+                    dataset,
+                    return_outputs=True,
+                    multiclass=multiclass,
+                    num_classes=len(diseases),
+                )
                 if accelerator.distributed:
                     sample_count = len(val_sampler_list[i])
                     val_loss_stats = torch.tensor(
@@ -502,6 +532,19 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     )
                     accelerator.all_reduce(val_loss_stats)
                     val_loss = (val_loss_stats[0] / val_loss_stats[1]).item()
+                y_val = torch.cat(accelerator.gather_tensor(y_val), 0)
+                p_val = torch.cat(accelerator.gather_tensor(p_val), 0)
+                if accelerator.is_main_process:
+                    val_auc_values = metric_AUROC(y_val, p_val, len(diseases))
+                    val_rows = [[epoch + 1, epoch, "validation_loss", val_loss, ""]]
+                    for disease, auc in zip(diseases, val_auc_values):
+                        val_rows.append([epoch + 1, epoch, "AUC_{}".format(disease), auc, ""])
+                    if val_auc_values:
+                        val_rows.append([epoch + 1, epoch, "mAUC", np.mean(val_auc_values), ""])
+                    _append_evaluation_rows(
+                        os.path.join(evaluation_directory, dataset, "val_performance.csv"),
+                        val_rows,
+                    )
                 val_loss_list.append(val_loss)
             
             avg_val_loss = np.average(val_loss_list)
@@ -515,21 +558,12 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             
             if accelerator.is_main_process:
                 _print_and_log(
-                    "Epoch {:04d}: avg_val_loss {:.5f}, saving model to {}".format(
-                        epoch,
+                    "Cycle {:04d}: avg_val_loss {:.5f}".format(
+                        epoch + 1,
                         avg_val_loss,
-                        save_model_path,
                     ),
                     train_log,
                 )
-                save_checkpoint({
-                        'epoch': epoch,
-                        'lossMIN': val_loss_list,
-                        'state_dict': student_model.state_dict(),
-                        'teacher': teacher.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'scheduler': lr_scheduler.state_dict(),
-                        },  filename=save_model_path)
 
                 if train_log is not None:
                     train_log.write("     Datasets  : " + str(dataset_list) + "\n")
@@ -537,24 +571,9 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     train_log.flush()
   
             if epoch % args.test_epoch == 0 or epoch+1 == args.pretrain_epochs:
-                if accelerator.is_main_process:
-                    save_checkpoint({
-                         'epoch': epoch,
-                         'lossMIN': val_loss_list,
-                         'state_dict': student_model.state_dict(),
-                         'teacher': teacher.state_dict(),
-                         'optimizer': optimizer.state_dict(),
-                         'scheduler': lr_scheduler.state_dict(),
-                         },  filename=save_model_path+str(epoch))
-                    writer = open(output_file, 'a')
-                    writer.write("Omni-pretraining stage:\n")
-                    writer.write("Epoch {:04d}:\n".format(epoch))
                 t_res, t_res_teacher = [],[]
                 for i, dataset in enumerate(dataset_list):
                     diseases = datasets_config[dataset]['diseases']
-                    if accelerator.is_main_process:
-                        writer.write("{} Validation Loss = {:.5f}:\n".format(dataset, val_loss_list[i]))
-                        writer.write("{} Disease = {}\n".format(dataset, diseases))
 
                     multiclass =  datasets_config[dataset]['task_type'] == "multi-class classification"
                     y_test, p_test = test_classification(student_model, i, data_loader_list_test[i], device, multiclass, len(diseases))
@@ -576,14 +595,17 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                             ),
                             train_log,
                         )
-                        writer.write(
-                            "\n{}: Student ACCURACY = {}, \nTeacher ACCURACY = {}\n".format(dataset, np.array2string(np.array(acc), precision=4, separator='\t'), np.array2string(np.array(acc_teacher), precision=4, separator='\t')))
+                        _append_evaluation_rows(
+                            os.path.join(evaluation_directory, dataset, "test_performance.csv"),
+                            [[epoch + 1, epoch, "accuracy", acc, acc_teacher]],
+                        )
                         t_res.append(acc)
                         t_res_teacher.append(acc_teacher)
 
                     if dataset == "CheXpert":
                         test_diseases_name = datasets_config['CheXpert']['test_diseases_name']
                         test_diseases = [diseases.index(c) for c in test_diseases_name]
+                        performance_diseases = test_diseases_name
                         y_test = copy.deepcopy(y_test[:,test_diseases])
                         p_test = copy.deepcopy(p_test[:, test_diseases])
                         individual_results = metric_AUROC(y_test, p_test, len(test_diseases))
@@ -591,6 +613,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         p_test_teacher = copy.deepcopy(p_test_teacher[:, test_diseases])
                         individual_results_teacher = metric_AUROC(y_test_teacher, p_test_teacher, len(test_diseases))
                     else:
+                        performance_diseases = diseases
                         individual_results = metric_AUROC(y_test, p_test, len(diseases))
                         individual_results_teacher = metric_AUROC(y_test_teacher, p_test_teacher, len(diseases))
                     _print_and_log(
@@ -601,10 +624,22 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         ),
                         train_log,
                     )
-                    writer.write(
-                        "\n{}: Student AUC = {}, \nTeacher AUC = {}\n".format(dataset, np.array2string(np.array(individual_results), precision=4, separator='\t'),np.array2string(np.array(individual_results_teacher), precision=4, separator='\t')))
-                    mean_over_all_classes = np.array(individual_results).mean()
-                    mean_over_all_classes_teacher = np.array(individual_results_teacher).mean()
+                    test_rows = [
+                        [
+                            epoch + 1,
+                            epoch,
+                            "AUC_{}".format(disease),
+                            student_auc,
+                            teacher_auc,
+                        ]
+                        for disease, student_auc, teacher_auc in zip(
+                            performance_diseases,
+                            individual_results,
+                            individual_results_teacher,
+                        )
+                    ]
+                    mean_over_all_classes = np.mean(individual_results) if individual_results else np.nan
+                    mean_over_all_classes_teacher = np.mean(individual_results_teacher) if individual_results_teacher else np.nan
                     _print_and_log(
                         ">>{}: Student mAUC = {:.4f}, Teacher mAUC = {:.4f}".format(
                             dataset,
@@ -613,13 +648,21 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         ),
                         train_log,
                     )
-                    writer.write("{}: Student mAUC = {:.4f}, Teacher mAUC = {:.4f}\n".format(dataset, mean_over_all_classes,mean_over_all_classes_teacher))
+                    test_rows.append([
+                        epoch + 1,
+                        epoch,
+                        "mAUC",
+                        mean_over_all_classes,
+                        mean_over_all_classes_teacher,
+                    ])
+                    _append_evaluation_rows(
+                        os.path.join(evaluation_directory, dataset, "test_performance.csv"),
+                        test_rows,
+                    )
                     t_res.append(mean_over_all_classes)
                     t_res_teacher.append(mean_over_all_classes_teacher)
 
                 if accelerator.is_main_process:
-                    writer.close()
-
                     test_results.append(t_res)
                     test_results_teacher.append(t_res_teacher)
         
@@ -630,14 +673,41 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         ),
                         train_log,
                     )
+
+            cycle = epoch + 1
+            if accelerator.is_main_process:
+                weight_directory = os.path.join(
+                    weights_directory,
+                    "epoch_{:04d}".format(cycle),
+                )
+                os.makedirs(weight_directory, exist_ok=True)
+                torch.save(
+                    student_model.state_dict(),
+                    os.path.join(weight_directory, "student.pth"),
+                )
+                torch.save(
+                    teacher.state_dict(),
+                    os.path.join(weight_directory, "teacher.pth"),
+                )
+                if cycle % checkpoint_frequency == 0 or cycle == args.pretrain_epochs:
+                    save_checkpoint(
+                        {
+                            'epoch': epoch,
+                            'cycle': cycle,
+                            'lossMIN': val_loss_list,
+                            'state_dict': student_model.state_dict(),
+                            'teacher': teacher.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'scheduler': lr_scheduler.state_dict(),
+                        },
+                        filename=os.path.join(
+                            checkpoint_directory,
+                            "cycle_{:04d}".format(cycle),
+                        ),
+                    )
             accelerator.barrier()
 
         accelerator.barrier()
-        if accelerator.is_main_process:
-            with open(output_file, 'a') as writer:
-                writer.write("Omni-pretraining stage: \nStudent meanAUC = \n{} \nTeacher meanAUC = \n{}\n".format(np.array2string(np.array(test_results), precision=4, separator='\t'),np.array2string(np.array(test_results_teacher), precision=4, separator='\t')))
-            writer.close()
-
     if loss_file is not None:
         loss_file.close()
     if train_log is not None:

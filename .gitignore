@@ -2,8 +2,8 @@
 .container-runtime/
 
 # Generated training artifacts
+/*_seed_*/
 base/Models/
 base/Outputs/
 *.pth
 *.pth.tar
-

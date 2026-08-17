@@ -154,12 +154,14 @@ def ema_update_teacher(model, teacher, momentum_schedule, it):
             param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
 
-def evaluate(model, use_head_n, data_loader_val, device, criterion, dataset):
+def evaluate(model, use_head_n, data_loader_val, device, criterion, dataset, return_outputs=False, multiclass=False, num_classes=None):
     model.eval()
 
     with torch.no_grad():
         batch_time = MetricLogger('Time', ':6.3f')
         losses = MetricLogger('Loss', ':.4e')
+        targets_list = []
+        outputs_list = []
         progress = ProgressLogger(
         len(data_loader_val),
         [batch_time, losses], prefix='Val_'+dataset+': ')
@@ -172,13 +174,23 @@ def evaluate(model, use_head_n, data_loader_val, device, criterion, dataset):
             loss = criterion(outputs, targets)
 
             losses.update(loss.item(), samples.size(0))
+            if return_outputs:
+                targets_list.append(targets)
+                outputs_list.append(torch.softmax(outputs, dim=1) if multiclass else torch.sigmoid(outputs))
             batch_time.update(time.time() - end)
             end = time.time()
 
             if i % 50 == 0:
                 progress.display(i)
 
-    return losses.avg
+    if not return_outputs:
+        return losses.avg
+
+    if targets_list:
+        return losses.avg, torch.cat(targets_list, 0), torch.cat(outputs_list, 0)
+
+    empty_outputs = torch.empty((0, num_classes), device=device)
+    return losses.avg, empty_outputs, empty_outputs
 
 
 def test_classification(model, use_head_n, data_loader_test, device, multiclass = False, num_classes = None):
