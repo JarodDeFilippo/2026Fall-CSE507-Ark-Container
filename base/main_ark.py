@@ -3,6 +3,7 @@ import sys
 import shutil
 import time
 import random
+import re
 import numpy as np
 from optparse import OptionParser
 from shutil import copyfile
@@ -120,6 +121,12 @@ def main(args):
             raise ValueError("--exp_name is required for training")
         if args.seed is None:
             raise ValueError("--seed is required for training")
+        if (
+                args.exp_name in ('.', '..')
+                or re.fullmatch(r"[A-Za-z0-9._-]+", args.exp_name) is None):
+            raise ValueError(
+                "--exp_name may contain only letters, numbers, '.', '_' and '-'"
+            )
         if args.resume and args.resume_from is not None:
             raise ValueError("Use either --resume or --resume_from, not both")
     elif args.mode == "test":

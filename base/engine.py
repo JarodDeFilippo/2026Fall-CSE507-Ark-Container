@@ -7,6 +7,7 @@ import csv
 import glob
 import re
 import tempfile
+import json
 import numpy as np
 from optparse import OptionParser
 from tqdm import tqdm
@@ -61,6 +62,19 @@ def _checkpoint_cycle(file_path):
 
 def _checkpoint_stem(args, cycle):
     return "cycle_{:04d}_{}_seed_{}".format(cycle, args.exp_name, args.seed)
+
+
+def _run_metadata(args, dataset_list, num_classes_list, cycle):
+    return {
+        'cycle': cycle,
+        'dataset_list': list(dataset_list),
+        'num_classes_list': list(num_classes_list),
+        'model_name': args.model_name,
+        'projector_features': args.projector_features,
+        'use_mlp': bool(args.use_mlp),
+        'run_name': args.exp_name,
+        'seed': args.seed,
+    }
 
 
 def _find_checkpoint_for_cycle(checkpoint_directory, cycle):
@@ -350,15 +364,89 @@ def _is_saved_weight_file(file_path):
     )
 
 
+def _weight_cycle(weights_directory):
+    match = re.fullmatch(
+        r"epoch_(\d+)",
+        os.path.basename(os.path.normpath(weights_directory)),
+    )
+    return int(match.group(1)) if match else None
+
+
+def _load_weight_manifest(weights_directory):
+    manifest_path = os.path.join(weights_directory, 'manifest.json')
+    if not os.path.isfile(manifest_path):
+        raise FileNotFoundError(
+            "Saved weights require manifest.json: {}".format(weights_directory)
+        )
+    with open(manifest_path, 'r') as manifest_file:
+        manifest = json.load(manifest_file)
+    if not isinstance(manifest, dict):
+        raise ValueError(
+            "Weight manifest '{}' is not a JSON object".format(manifest_path)
+        )
+    required_keys = {
+        'cycle',
+        'dataset_list',
+        'num_classes_list',
+        'model_name',
+        'projector_features',
+        'use_mlp',
+        'run_name',
+        'seed',
+    }
+    missing_keys = required_keys.difference(manifest.keys())
+    if missing_keys:
+        raise ValueError(
+            "Weight manifest '{}' is missing keys {}"
+            .format(manifest_path, sorted(missing_keys))
+        )
+    directory_cycle = _weight_cycle(weights_directory)
+    if not isinstance(manifest['cycle'], int) or manifest['cycle'] < 1:
+        raise ValueError(
+            "Weight manifest '{}' has an invalid cycle".format(manifest_path)
+        )
+    if directory_cycle is not None and manifest['cycle'] != directory_cycle:
+        raise ValueError(
+            "Weight manifest '{}' does not match its directory cycle"
+            .format(manifest_path)
+        )
+    if (
+            not isinstance(manifest['run_name'], str)
+            or manifest['run_name'] in ('.', '..')
+            or re.fullmatch(r"[A-Za-z0-9._-]+", manifest['run_name']) is None):
+        raise ValueError(
+            "Weight manifest '{}' has an unsafe run name"
+            .format(manifest_path)
+        )
+    if not isinstance(manifest['seed'], int):
+        raise ValueError(
+            "Weight manifest '{}' has an invalid seed".format(manifest_path)
+        )
+    return manifest
+
+
 def _test_output_path(output_directory, checkpoint_path):
     checkpoint_name = os.path.basename(os.path.normpath(checkpoint_path))
     if os.path.isdir(checkpoint_path):
-        return os.path.join(output_directory, checkpoint_name + '.csv')
-    if _is_saved_weight_file(checkpoint_path):
-        weights_directory = os.path.dirname(checkpoint_path)
+        manifest = _load_weight_manifest(checkpoint_path)
         return os.path.join(
             output_directory,
-            os.path.basename(os.path.normpath(weights_directory)) + '.csv',
+            "cycle_{:04d}_{}_seed_{}.csv".format(
+                manifest['cycle'],
+                manifest['run_name'],
+                manifest['seed'],
+            ),
+        )
+    if _is_saved_weight_file(checkpoint_path):
+        weights_directory = os.path.dirname(checkpoint_path)
+        manifest = _load_weight_manifest(weights_directory)
+        return os.path.join(
+            output_directory,
+            "cycle_{:04d}_{}_seed_{}.csv".format(
+                manifest['cycle'],
+                manifest['run_name'],
+                manifest['seed'],
+            ),
         )
     if checkpoint_name.endswith('.pth.tar'):
         result_name = checkpoint_name[:-len('.pth.tar')] + '.csv'
@@ -385,6 +473,7 @@ def _load_test_state_dicts(weights_path):
     if os.path.isfile(weights_path) and _is_saved_weight_file(weights_path):
         weights_path = os.path.dirname(weights_path)
     if os.path.isdir(weights_path):
+        manifest = _load_weight_manifest(weights_path)
         student_path = _find_saved_weight(weights_path, 'student')
         teacher_path = _find_saved_weight(weights_path, 'teacher')
         student_state_dict = torch.load(
@@ -397,7 +486,7 @@ def _load_test_state_dicts(weights_path):
             map_location='cpu',
             weights_only=False,
         )
-        return student_state_dict, teacher_state_dict
+        return student_state_dict, teacher_state_dict, manifest
 
     checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
     for key in ('state_dict', 'teacher'):
@@ -405,7 +494,75 @@ def _load_test_state_dicts(weights_path):
             raise ValueError(
                 "Test checkpoint '{}' is missing '{}'".format(weights_path, key)
             )
-    return checkpoint['state_dict'], checkpoint['teacher']
+    return checkpoint['state_dict'], checkpoint['teacher'], checkpoint
+
+
+def _validate_test_metadata(metadata, file_path, args, dataset_list, num_classes_list, require_model_metadata=False):
+    if not isinstance(metadata, dict):
+        raise ValueError(
+            "Test weights '{}' do not contain a metadata object".format(file_path)
+        )
+    required_keys = {'dataset_list', 'num_classes_list'}
+    if require_model_metadata:
+        required_keys.update({
+            'cycle',
+            'model_name',
+            'projector_features',
+            'use_mlp',
+            'run_name',
+            'seed',
+        })
+    missing_keys = required_keys.difference(metadata.keys())
+    if missing_keys:
+        raise ValueError(
+            "Test weights '{}' are missing metadata keys {}"
+            .format(file_path, sorted(missing_keys))
+        )
+    if not isinstance(metadata['dataset_list'], (list, tuple)):
+        raise ValueError(
+            "Test weights '{}' have invalid dataset metadata".format(file_path)
+        )
+    if not isinstance(metadata['num_classes_list'], (list, tuple)):
+        raise ValueError(
+            "Test weights '{}' have invalid class-count metadata".format(file_path)
+        )
+    if list(metadata['dataset_list']) != list(dataset_list):
+        raise ValueError(
+            "Test weights '{}' were trained for datasets {}, requested {}"
+            .format(file_path, metadata['dataset_list'], list(dataset_list))
+        )
+    if list(metadata['num_classes_list']) != list(num_classes_list):
+        raise ValueError(
+            "Test weights '{}' have class counts {}, requested {}"
+            .format(file_path, metadata['num_classes_list'], num_classes_list)
+        )
+    artifact_cycle = _checkpoint_cycle(file_path)
+    if artifact_cycle is None:
+        weights_directory = (
+            file_path
+            if os.path.isdir(file_path)
+            else os.path.dirname(file_path)
+        )
+        artifact_cycle = _weight_cycle(weights_directory)
+    if artifact_cycle is not None and metadata.get('cycle') != artifact_cycle:
+        raise ValueError(
+            "Test weights '{}' have metadata cycle {}, but the artifact is cycle {}"
+            .format(file_path, metadata.get('cycle'), artifact_cycle)
+        )
+    for key, expected_value in (
+            ('model_name', args.model_name),
+            ('projector_features', args.projector_features),
+            ('use_mlp', bool(args.use_mlp))):
+        if key in metadata and metadata[key] != expected_value:
+            raise ValueError(
+                "Test weights '{}' have {}={}, requested {}"
+                .format(file_path, key, metadata[key], expected_value)
+            )
+
+
+def _mean_defined_metrics(values):
+    defined_values = [value for value in values if np.isfinite(value)]
+    return np.mean(defined_values) if defined_values else np.nan
 
 
 def _raw_label_counts(dataset, split_key, file_path, num_classes):
@@ -759,6 +916,17 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         model_args = copy.copy(args)
         model_args.pretrained_weights = None
         test_state_dicts = _load_test_state_dicts(args.pretrained_weights)
+        _validate_test_metadata(
+            test_state_dicts[2],
+            args.pretrained_weights,
+            args,
+            dataset_list,
+            num_classes_list,
+            require_model_metadata=(
+                os.path.isdir(args.pretrained_weights)
+                or _is_saved_weight_file(args.pretrained_weights)
+            ),
+        )
     model = build_omni_model(model_args, num_classes_list)
     teacher = build_omni_model(model_args, num_classes_list)
     if test_state_dicts is not None:
@@ -857,7 +1025,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 )
                 for disease, auc in zip(performance_diseases, individual_results):
                     result_rows.append([dataset, model_name, "AUC", disease, auc])
-                mean_auc = np.mean(individual_results) if individual_results else np.nan
+                mean_auc = _mean_defined_metrics(individual_results)
                 result_rows.append([dataset, model_name, "mAUC", "", mean_auc])
 
         write_status = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1100,7 +1268,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     for disease, auc in zip(diseases, val_auc_values):
                         val_rows.append([epoch + 1, epoch, "AUC_{}".format(disease), auc, ""])
                     if val_auc_values:
-                        val_rows.append([epoch + 1, epoch, "mAUC", np.mean(val_auc_values), ""])
+                        val_rows.append([epoch + 1, epoch, "mAUC", _mean_defined_metrics(val_auc_values), ""])
                     _append_evaluation_rows(
                         os.path.join(evaluation_directory, dataset, "val_performance.csv"),
                         val_rows,
@@ -1198,8 +1366,8 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                             individual_results_teacher,
                         )
                     ]
-                    mean_over_all_classes = np.mean(individual_results) if individual_results else np.nan
-                    mean_over_all_classes_teacher = np.mean(individual_results_teacher) if individual_results_teacher else np.nan
+                    mean_over_all_classes = _mean_defined_metrics(individual_results)
+                    mean_over_all_classes_teacher = _mean_defined_metrics(individual_results_teacher)
                     _print_and_log(
                         ">>{}: Student mAUC = {:.4f}, Teacher mAUC = {:.4f}".format(
                             dataset,
@@ -1235,12 +1403,26 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     )
 
             cycle = epoch + 1
+            checkpoint_this_cycle = (
+                cycle % checkpoint_frequency == 0
+                or cycle == args.pretrain_epochs
+            )
             if accelerator.is_main_process:
                 weight_directory = os.path.join(
                     weights_directory,
                     "epoch_{:04d}".format(cycle),
                 )
                 os.makedirs(weight_directory, exist_ok=True)
+                metadata = _run_metadata(
+                    args,
+                    dataset_list,
+                    num_classes_list,
+                    cycle,
+                )
+                with open(
+                        os.path.join(weight_directory, "manifest.json"),
+                        'w') as manifest_file:
+                    json.dump(metadata, manifest_file, indent=2, sort_keys=True)
                 torch.save(
                     student_model.state_dict(),
                     os.path.join(
@@ -1255,21 +1437,20 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         "teacher_{}.pth".format(_checkpoint_stem(args, cycle)),
                     ),
                 )
-                if cycle % checkpoint_frequency == 0 or cycle == args.pretrain_epochs:
+                if checkpoint_this_cycle:
+                    checkpoint = metadata.copy()
+                    checkpoint.update({
+                        'epoch': epoch,
+                        'lossMIN': val_loss_list,
+                        'state_dict': student_model.state_dict(),
+                        'teacher': teacher.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'scheduler': lr_scheduler.state_dict(),
+                        'total_cycles': args.pretrain_epochs,
+                        'scheduler_config': _scheduler_config(args),
+                    })
                     save_checkpoint(
-                        {
-                            'epoch': epoch,
-                            'cycle': cycle,
-                            'total_cycles': args.pretrain_epochs,
-                            'scheduler_config': _scheduler_config(args),
-                            'dataset_list': list(dataset_list),
-                            'num_classes_list': num_classes_list,
-                            'lossMIN': val_loss_list,
-                            'state_dict': student_model.state_dict(),
-                            'teacher': teacher.state_dict(),
-                            'optimizer': optimizer.state_dict(),
-                            'scheduler': lr_scheduler.state_dict(),
-                        },
+                        checkpoint,
                         filename=os.path.join(
                             checkpoint_directory,
                             _checkpoint_stem(args, cycle),

@@ -59,8 +59,13 @@ def metric_AUROC(target, output, nb_classes=14):
     output = output.cpu().numpy()
 
     for i in range(nb_classes):
-        if np.any(target[:, i]):
+        if np.unique(target[:, i]).size < 2:
+            outAUROC.append(np.nan)
+            continue
+        try:
             outAUROC.append(roc_auc_score(target[:, i], output[:, i]))
+        except ValueError:
+            outAUROC.append(np.nan)
 
     return outAUROC
 
