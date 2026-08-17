@@ -153,8 +153,28 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     exp = 'Ark_Plus'
     for dataset in dataset_list:
         exp += '_' + dataset 
-    model_path = os.path.join(model_path, exp)
-    model_path = os.path.join(model_path, args.exp_name)
+    if args.mode != "train":
+        model_path = os.path.join(model_path, exp)
+        model_path = os.path.join(model_path, args.exp_name)
+    elif args.resume:
+        run_status = torch.zeros(1, dtype=torch.int32, device=device)
+        if accelerator.is_main_process:
+            run_status[0] = int(os.path.isdir(model_path))
+        accelerator.broadcast(run_status)
+        if run_status.item() == 0:
+            raise FileNotFoundError(
+                "Cannot resume training because run directory does not exist: {}".format(model_path)
+            )
+    else:
+        run_status = torch.zeros(1, dtype=torch.int32, device=device)
+        if accelerator.is_main_process:
+            run_status[0] = int(not os.path.exists(model_path))
+        accelerator.broadcast(run_status)
+        if run_status.item() == 0:
+            raise FileExistsError(
+                "Training run directory already exists: {}".format(model_path)
+            )
+
     if accelerator.is_main_process:
         if not os.path.exists(model_path):
             os.makedirs(model_path)

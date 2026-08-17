@@ -125,9 +125,17 @@ def main(args):
 
     print(args)
 
-    exp_name = args.model_name + "_" + args.exp_name
-    model_path = os.path.join("./Models",exp_name)
-    output_path = os.path.join("./Outputs",exp_name)
+    if args.mode == "train":
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        run_path = os.path.join(
+            repo_root, "{}_seed_{}".format(args.exp_name, args.seed)
+        )
+        model_path = run_path
+        output_path = run_path
+    else:
+        exp_name = args.model_name + "_" + args.exp_name
+        model_path = os.path.join("./Models",exp_name)
+        output_path = os.path.join("./Outputs",exp_name)
 
     datasets_config = get_config('datasets_config.yaml')
     for dataset in args.dataset_list:

@@ -114,6 +114,10 @@ class Accelerator:
         if self.distributed:
             dist.all_reduce(tensor)
 
+    def broadcast(self, tensor, src=0):
+        if self.distributed:
+            dist.broadcast(tensor, src=src)
+
     def gather_tensor(self, tensor):
         if not self.distributed:
             return [tensor]
