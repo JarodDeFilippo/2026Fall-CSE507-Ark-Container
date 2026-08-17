@@ -1,87 +1,63 @@
-"""Reference implementation copied from the original Ark+ concurrent code.
+"""Joint-training helpers based on the original Ark+ concurrent code."""
 
-This module is intentionally not imported by the current training entry point.
-The copied sections will be adapted in later commits.
-"""
-
-import cv2
-import numpy as np
+from bisect import bisect_right
 import random
 import time
 import torch
-import wandb
 from PIL import Image
 from torch.utils.data import Dataset
-from tqdm import tqdm
 
 from dataloader import (
     build_transform_classification,
-    build_ts_transformations,
     dict_dataloarder,
 )
 from utils import MetricLogger, ProgressLogger
 
 
-# Copied from https://github.com/jlianglab/Ark/tree/main/Ark_Plus/AblationStudy/Concurrent
-# Source: Concurrent/dataloader.py, OmniPretrainingDatasets.
+# Based on the copied implementation from:
+# https://github.com/jlianglab/Ark/tree/main/Ark_Plus/AblationStudy/Concurrent
+#
+# The original class reparsed datasets_config and rebuilt each dataset. This
+# version consumes the already-created current dataset objects so it preserves
+# their transforms, labels, and dataset-specific options.
 class OmniPretrainingDatasets(Dataset):
-  def __init__(self, datasets_config, dataset_list = ["ChestXray14"], crop_size=224, resize=256, augment=None):
-    self.dataset_list = dataset_list
-    self.datasets_config = datasets_config
-    self.dataset_image_list = []
-    self.dataset_label_list = []
-    self.dataset_index_list = []
+  def __init__(self, dataset_train_list, num_classes_list):
+    self.datasets = dataset_train_list
+    self.num_classes_list = list(num_classes_list)
+    if len(self.datasets) != len(self.num_classes_list):
+      raise ValueError("Expected one class count for each training dataset")
 
-    self.crop_size = crop_size
-    self.resize = resize
- 
-    self.augment = augment
-    self.train_augment = build_ts_transformations(crop_size)
-    
-    self.num_classes_list = []
-    for idx, dataset in enumerate(dataset_list):
-        dataset_loaded = dict_dataloarder[dataset](images_path=self.datasets_config[dataset]['data_dir'], file_path=self.datasets_config[dataset]['train_list'], augment=None)
-        self.dataset_image_list.extend(dataset_loaded.img_list)
-        self.dataset_label_list.extend(dataset_loaded.img_label)
-        self.dataset_index_list.extend([idx for _ in range(len(dataset_loaded.img_list))])
-        self.num_classes_list.append(len(self.datasets_config[dataset]['diseases']))
-  
-    max_class_num = max(self.num_classes_list)
-    print("max_class_num", max_class_num)
-    label_padding = []
-    for label in self.dataset_label_list:
-        if len(label) < max_class_num:
-          label.extend([0 for _ in range(max_class_num - len(label))])
-          assert len(label) == max_class_num
-        label_padding.append(label)
+    self.cumulative_sizes = []
+    cumulative_size = 0
+    for dataset in self.datasets:
+      cumulative_size += len(dataset)
+      self.cumulative_sizes.append(cumulative_size)
 
+    if not self.cumulative_sizes:
+      raise ValueError("At least one training dataset is required")
+    self.max_class_num = max(self.num_classes_list)
 
   def __getitem__(self, index):
-    cv2.setNumThreads(0)
+    dataset_index = bisect_right(self.cumulative_sizes, index)
+    previous_size = 0 if dataset_index == 0 else self.cumulative_sizes[dataset_index - 1]
+    sample_index = index - previous_size
+    student_img, teacher_img, image_label = self.datasets[dataset_index][sample_index]
+    image_label = torch.as_tensor(image_label, dtype=torch.float32)
+    if image_label.shape[0] < self.max_class_num:
+      image_label = torch.cat(
+          (
+              image_label,
+              torch.zeros(
+                  self.max_class_num - image_label.shape[0],
+                  dtype=image_label.dtype,
+              ),
+          )
+      )
 
-    image_path = self.dataset_image_list[index]
-    imageData = Image.open(image_path).convert('RGB').resize((self.resize,self.resize))
-    imageLabel = self.dataset_label_list[index]
-    imageLabel = torch.FloatTensor(imageLabel)
-    if self.augment != None: 
-      student_img, teacher_img = self.augment(imageData), self.augment(imageData)   
-    else:
-      teacher_img=np.array(imageData.resize((self.crop_size,self.crop_size))) / 255.     
-      imageData = (np.array(imageData)).astype('uint8')
-      augmented = self.train_augment(image = imageData)
-      student_img = augmented['image']
-      student_img=np.array(student_img) / 255.
-  
-      mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-      student_img = (student_img-mean)/std
-      teacher_img = (teacher_img-mean)/std
-      student_img = student_img.transpose(2, 0, 1).astype('float32')
-      teacher_img = teacher_img.transpose(2, 0, 1).astype('float32')
-
-    return student_img, teacher_img, imageLabel, self.dataset_index_list[index]
+    return student_img, teacher_img, image_label, dataset_index
 
   def __len__(self):
-    return len(self.dataset_image_list)
+    return self.cumulative_sizes[-1]
 
 
 # Copied from https://github.com/jlianglab/Ark/tree/main/Ark_Plus/AblationStudy/Concurrent
@@ -132,34 +108,65 @@ class OmniPretrainingDatasets_EqualSampling(Dataset):
     return self.prime_length
 
 
-# Copied from https://github.com/jlianglab/Ark/tree/main/Ark_Plus/AblationStudy/Concurrent
-# Source: Concurrent/trainer.py, train_one_epoch and ema_update_teacher.
-def train_one_epoch(model, data_loader_train, num_classes_list, device, criterion, optimizer, epoch, ema_mode, teacher, momentum_schedule, it):
+# Based on the copied implementation from:
+# https://github.com/jlianglab/Ark/tree/main/Ark_Plus/AblationStudy/Concurrent
+#
+# The dataset-index head routing and loss balance are retained. This version
+# uses the current model API, task-specific criteria, and distributed loss
+# reduction.
+def train_one_epoch_joint(
+        model,
+        data_loader_train,
+        num_classes_list,
+        task_types,
+        device,
+        optimizer,
+        epoch,
+        ema_mode,
+        teacher,
+        momentum_schedule,
+        it,
+        accelerator=None,
+        is_main_process=True,
+):
     batch_time = MetricLogger('Time', ':6.3f')
     losses_cls = MetricLogger('Loss_cls', ':.4e')
     losses_mse = MetricLogger('Loss_mse', ':.4e')
+    losses_total = MetricLogger('Loss_total', ':.4e')
     progress = ProgressLogger(
         len(data_loader_train),
-        [batch_time, losses_cls, losses_mse],
+        [batch_time, losses_cls, losses_mse, losses_total],
         prefix="Epoch: [{}]".format(epoch))
 
     model.train()
     MSE = torch.nn.MSELoss()
+    criteria = [
+        torch.nn.CrossEntropyLoss()
+        if task_type == "multi-class classification"
+        else torch.nn.BCEWithLogitsLoss()
+        for task_type in task_types
+    ]
     coff = (momentum_schedule[it] - 0.9) * 5
     end = time.time()
     for i, (samples1, samples2, targets, dataset_index) in enumerate(data_loader_train):
         samples1, samples2, targets = samples1.float().to(device), samples2.float().to(device), targets.float().to(device)
+        dataset_index = dataset_index.to(device)
 
-
-        feat_t, _ = teacher(samples2)
-        feat_s, pred_s_lst = model(samples1)
+        with torch.no_grad():
+            feat_t = teacher(samples2, return_features=True)
+        feat_s, pred_s_lst = model(samples1, return_all=True)
         loss_const = MSE(feat_s, feat_t)
 
-        loss_cls = 0
-        for j, di in enumerate(dataset_index):
-            l = criterion(pred_s_lst[di][j], targets[j][:num_classes_list[di]])
-            loss_cls += l
-        loss_cls = loss_cls/len(dataset_index)
+        loss_cls = torch.zeros((), dtype=loss_const.dtype, device=device)
+        for dataset_index_value, criterion in enumerate(criteria):
+            dataset_mask = dataset_index == dataset_index_value
+            if dataset_mask.any():
+                dataset_loss = criterion(
+                    pred_s_lst[dataset_index_value][dataset_mask],
+                    targets[dataset_mask, :num_classes_list[dataset_index_value]],
+                )
+                loss_cls += dataset_loss * dataset_mask.sum()
+        loss_cls = loss_cls / targets.shape[0]
 
         loss = (1-coff) * loss_cls + coff * loss_const
 
@@ -167,12 +174,29 @@ def train_one_epoch(model, data_loader_train, num_classes_list, device, criterio
         loss.backward()
         optimizer.step()
 
-        losses_cls.update(loss_cls.item(), samples1.size(0))
-        losses_mse.update(loss_const.item(), samples1.size(0))
+        loss_stats = torch.tensor(
+            [
+                (1 - coff) * loss_cls.item() * samples1.size(0),
+                coff * loss_const.item() * samples1.size(0),
+                loss.item() * samples1.size(0),
+                samples1.size(0),
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        if accelerator is not None and accelerator.distributed:
+            accelerator.all_reduce(loss_stats)
+        global_batch_size = int(loss_stats[3].item())
+        global_cls_value = (loss_stats[0] / loss_stats[3]).item()
+        global_mse_value = (loss_stats[1] / loss_stats[3]).item()
+        global_total_value = (loss_stats[2] / loss_stats[3]).item()
+        losses_cls.update(global_cls_value, global_batch_size)
+        losses_mse.update(global_mse_value, global_batch_size)
+        losses_total.update(global_total_value, global_batch_size)
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % 50 == 0:
+        if is_main_process and i % 50 == 0:
             progress.display(i)
         if ema_mode == "iteration":
             ema_update_teacher(model, teacher, momentum_schedule, it)
@@ -181,9 +205,12 @@ def train_one_epoch(model, data_loader_train, num_classes_list, device, criterio
     if ema_mode == "epoch":
         ema_update_teacher(model, teacher, momentum_schedule, it)
         it += 1
-    
-    wandb.log({"train_loss_cls": losses_cls.avg})
-    wandb.log({"train_loss_mse": losses_mse.avg})
+
+    return it, {
+        "classification_loss": losses_cls.avg,
+        "consistency_loss": losses_mse.avg,
+        "total_loss": losses_total.avg,
+    }
 
 
 def ema_update_teacher(model, teacher, momentum_schedule, it):

@@ -36,10 +36,14 @@ class ArkSwinTransformer(swin.SwinTransformer):
             self.omni_heads.append(nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity())
         self.omni_heads = nn.ModuleList(self.omni_heads)
 
-    def forward(self, x, head_n=None):
+    def forward(self, x, head_n=None, return_all=False, return_features=False):
         x = self.forward_features(x)
         if self.projector:
             x = self.projector(x)
+        if return_features:
+            return x
+        if return_all:
+            return x, [head(x) for head in self.omni_heads]
         if head_n is not None:
             return x, self.omni_heads[head_n](x)
         else:
@@ -69,10 +73,14 @@ class ArkConvNeXt(ConvNeXt):
             self.omni_heads.append(nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity())
         self.omni_heads = nn.ModuleList(self.omni_heads)
 
-    def forward(self, x, head_n=None):
+    def forward(self, x, head_n=None, return_all=False, return_features=False):
         x = self.forward_features(x)
         if self.projector:
             x = self.projector(x)
+        if return_features:
+            return x
+        if return_all:
+            return x, [head(x) for head in self.omni_heads]
         if head_n is not None:
             return x, self.omni_heads[head_n](x)
         else:
