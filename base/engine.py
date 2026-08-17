@@ -55,8 +55,25 @@ def _append_evaluation_rows(file_path, rows):
 
 
 def _checkpoint_cycle(file_path):
-    match = re.fullmatch(r"cycle_(\d+)\.pth\.tar", os.path.basename(file_path))
+    match = re.fullmatch(r"cycle_(\d+)(?:_[^/]+)?\.pth\.tar", os.path.basename(file_path))
     return int(match.group(1)) if match else None
+
+
+def _checkpoint_stem(args, cycle):
+    return "cycle_{:04d}_{}_seed_{}".format(cycle, args.exp_name, args.seed)
+
+
+def _find_checkpoint_for_cycle(checkpoint_directory, cycle):
+    checkpoint_paths = [
+        path for path in glob.glob(os.path.join(checkpoint_directory, "cycle_*.pth.tar"))
+        if _checkpoint_cycle(path) == cycle
+    ]
+    if not checkpoint_paths:
+        raise FileNotFoundError(
+            "No checkpoint found for cycle {} in {}".format(cycle, checkpoint_directory)
+        )
+    checkpoint_paths.sort()
+    return checkpoint_paths[0]
 
 
 def _load_checkpoint_metadata(file_path):
@@ -323,10 +340,26 @@ def _run_main_process_resume_setup(accelerator, device, setup):
         )
 
 
+def _is_saved_weight_file(file_path):
+    return (
+        os.path.basename(file_path) in ('student.pth', 'teacher.pth')
+        or re.fullmatch(
+            r"(?:student|teacher)_cycle_.+\.pth",
+            os.path.basename(file_path),
+        ) is not None
+    )
+
+
 def _test_output_path(output_directory, checkpoint_path):
     checkpoint_name = os.path.basename(os.path.normpath(checkpoint_path))
     if os.path.isdir(checkpoint_path):
         return os.path.join(output_directory, checkpoint_name + '.csv')
+    if _is_saved_weight_file(checkpoint_path):
+        weights_directory = os.path.dirname(checkpoint_path)
+        return os.path.join(
+            output_directory,
+            os.path.basename(os.path.normpath(weights_directory)) + '.csv',
+        )
     if checkpoint_name.endswith('.pth.tar'):
         result_name = checkpoint_name[:-len('.pth.tar')] + '.csv'
     else:
@@ -334,15 +367,26 @@ def _test_output_path(output_directory, checkpoint_path):
     return os.path.join(output_directory, result_name)
 
 
+def _find_saved_weight(weights_directory, role):
+    legacy_path = os.path.join(weights_directory, "{}.pth".format(role))
+    if os.path.isfile(legacy_path):
+        return legacy_path
+    weight_paths = glob.glob(
+        os.path.join(weights_directory, "{}_cycle_*.pth".format(role))
+    )
+    if len(weight_paths) != 1:
+        raise FileNotFoundError(
+            "Expected one {} weight file in {}".format(role, weights_directory)
+        )
+    return weight_paths[0]
+
+
 def _load_test_state_dicts(weights_path):
+    if os.path.isfile(weights_path) and _is_saved_weight_file(weights_path):
+        weights_path = os.path.dirname(weights_path)
     if os.path.isdir(weights_path):
-        student_path = os.path.join(weights_path, 'student.pth')
-        teacher_path = os.path.join(weights_path, 'teacher.pth')
-        if not os.path.isfile(student_path) or not os.path.isfile(teacher_path):
-            raise FileNotFoundError(
-                "Test weights directory must contain student.pth and teacher.pth: {}"
-                .format(weights_path)
-            )
+        student_path = _find_saved_weight(weights_path, 'student')
+        teacher_path = _find_saved_weight(weights_path, 'teacher')
         student_state_dict = torch.load(
             student_path,
             map_location='cpu',
@@ -561,11 +605,9 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         _run_main_process_resume_setup(accelerator, device, setup_explicit_resume)
         accelerator.broadcast(resume_cycle_tensor)
         resume_cycle = int(resume_cycle_tensor.item())
-        resume_checkpoint_path = os.path.join(
-            model_path,
-            "models",
-            "checkpoints",
-            "cycle_{:04d}.pth.tar".format(resume_cycle),
+        resume_checkpoint_path = _find_checkpoint_for_cycle(
+            os.path.join(model_path, "models", "checkpoints"),
+            resume_cycle,
         )
         accelerator.barrier()
     elif resume_requested:
@@ -591,11 +633,9 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         _run_main_process_resume_setup(accelerator, device, setup_latest_resume)
         accelerator.broadcast(resume_cycle_tensor)
         resume_cycle = int(resume_cycle_tensor.item())
-        resume_checkpoint_path = os.path.join(
-            model_path,
-            "models",
-            "checkpoints",
-            "cycle_{:04d}.pth.tar".format(resume_cycle),
+        resume_checkpoint_path = _find_checkpoint_for_cycle(
+            os.path.join(model_path, "models", "checkpoints"),
+            resume_cycle,
         )
         accelerator.barrier()
     else:
@@ -1203,11 +1243,17 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 os.makedirs(weight_directory, exist_ok=True)
                 torch.save(
                     student_model.state_dict(),
-                    os.path.join(weight_directory, "student.pth"),
+                    os.path.join(
+                        weight_directory,
+                        "student_{}.pth".format(_checkpoint_stem(args, cycle)),
+                    ),
                 )
                 torch.save(
                     teacher.state_dict(),
-                    os.path.join(weight_directory, "teacher.pth"),
+                    os.path.join(
+                        weight_directory,
+                        "teacher_{}.pth".format(_checkpoint_stem(args, cycle)),
+                    ),
                 )
                 if cycle % checkpoint_frequency == 0 or cycle == args.pretrain_epochs:
                     save_checkpoint(
@@ -1226,7 +1272,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         },
                         filename=os.path.join(
                             checkpoint_directory,
-                            "cycle_{:04d}".format(cycle),
+                            _checkpoint_stem(args, cycle),
                         ),
                     )
             accelerator.barrier()
