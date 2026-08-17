@@ -3,6 +3,7 @@ import os
 import sys
 import shutil
 import time
+import csv
 import numpy as np
 from optparse import OptionParser
 from tqdm import tqdm
@@ -32,6 +33,114 @@ import torch.nn as nn
 # import wandb
 
 sys.setrecursionlimit(40000)
+
+
+def _raw_label_counts(dataset, split_key, file_path, num_classes):
+    categories = ("positive", "negative", "uncertain", "missing")
+    label_counts = [dict.fromkeys(categories, 0) for _ in range(num_classes)]
+    sample_count = 0
+
+    with open(file_path, "r", newline="") as file_descriptor:
+        csv_reader = csv.reader(file_descriptor)
+        next(csv_reader, None)
+        for line in csv_reader:
+            if dataset == "CheXpert" and split_key == "test_list":
+                labels = line[1:]
+            else:
+                labels = line[5:]
+            if len(labels) < num_classes:
+                raise ValueError(
+                    "{} has {} labels; expected {}".format(
+                        file_path, len(labels), num_classes
+                    )
+                )
+            sample_count += 1
+            for class_index, value in enumerate(labels[:num_classes]):
+                value = value.strip()
+                if not value:
+                    category = "missing"
+                elif float(value) == 1:
+                    category = "positive"
+                elif float(value) == 0:
+                    category = "negative"
+                elif float(value) == -1:
+                    category = "uncertain"
+                else:
+                    raise ValueError("Unsupported label value {!r} in {}".format(value, file_path))
+                label_counts[class_index][category] += 1
+
+    return sample_count, label_counts
+
+
+def print_label_summary(dataset_list, datasets_config, dataset_train_list, dataset_val_list, dataset_test_list):
+    print("Label distribution:")
+    for dataset_index, dataset in enumerate(dataset_list, start=1):
+        diseases = datasets_config[dataset]['diseases']
+        print("Dataset {}/{}: {}".format(dataset_index, len(dataset_list), dataset))
+        split_datasets = (
+            ("Train", "train_list", dataset_train_list[dataset_index - 1]),
+            ("Validation", "val_list", dataset_val_list[dataset_index - 1]),
+            ("Test", "test_list", dataset_test_list[dataset_index - 1]),
+        )
+        uses_test_for_validation = (
+            datasets_config[dataset]['val_list'] == datasets_config[dataset]['test_list']
+        )
+        for split_name, split_key, split_dataset in split_datasets:
+            if split_name == "Validation" and uses_test_for_validation:
+                split_name = "Validation (test split)"
+            sample_count = len(split_dataset)
+            print("  {}: {} samples".format(split_name, sample_count))
+            if sample_count == 0:
+                continue
+
+            if dataset in ("CheXpert", "MIMIC"):
+                file_path = datasets_config[dataset][split_key]
+                label_counts_sample_count, label_counts = _raw_label_counts(
+                    dataset,
+                    split_key,
+                    file_path,
+                    len(diseases),
+                )
+                if label_counts_sample_count != sample_count:
+                    raise ValueError(
+                        "{} {} has {} parsed labels but dataset has {} samples".format(
+                            dataset, split_name, label_counts_sample_count, sample_count
+                        )
+                    )
+                for disease, counts in zip(diseases, label_counts):
+                    percentages = {
+                        category: 100.0 * counts[category] / sample_count
+                        for category in counts
+                    }
+                    print(
+                        "    {}: positive {} ({:.1f}%), negative {} ({:.1f}%), "
+                        "uncertain {} ({:.1f}%), missing {} ({:.1f}%)".format(
+                            disease,
+                            counts["positive"],
+                            percentages["positive"],
+                            counts["negative"],
+                            percentages["negative"],
+                            counts["uncertain"],
+                            percentages["uncertain"],
+                            counts["missing"],
+                            percentages["missing"],
+                        )
+                    )
+            else:
+                labels = np.asarray(split_dataset.img_label, dtype=np.float64)
+                for class_index, disease in enumerate(diseases):
+                    positive_count = int(np.count_nonzero(labels[:, class_index] >= 0.5))
+                    negative_count = sample_count - positive_count
+                    print(
+                        "    {}: positive {} ({:.1f}%), negative {} ({:.1f}%)".format(
+                            disease,
+                            positive_count,
+                            100.0 * positive_count / sample_count,
+                            negative_count,
+                            100.0 * negative_count / sample_count,
+                        )
+                    )
+
 
 def omni_engine(args, model_path, output_path, dataset_list, datasets_config, dataset_train_list, dataset_val_list, dataset_test_list):
     accelerator = Accelerator(args.device)
@@ -105,6 +214,14 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     num_classes_list = [len(datasets_config[dataset]['diseases']) for dataset in dataset_list]
     if accelerator.is_main_process:
         print("num_classes_list:", num_classes_list)
+        if args.mode == "train":
+            print_label_summary(
+                dataset_list,
+                datasets_config,
+                dataset_train_list,
+                dataset_val_list,
+                dataset_test_list,
+            )
 
 
     # training setups
@@ -118,7 +235,6 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     for p in teacher.parameters():
         p.requires_grad = False
     if accelerator.is_main_process:
-        print(model)
         print(f"Student and Teacher are built: they are both {args.model_name} network.")
 
     # momentum parameter is increased to 1. during training with a cosine schedule
@@ -308,7 +424,6 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     diseases = datasets_config[dataset]['diseases']
                     if accelerator.is_main_process:
                         writer.write("{} Validation Loss = {:.5f}:\n".format(dataset, val_loss_list[i]))
-                        print(">>{} Disease = {}".format(dataset, diseases))
                         writer.write("{} Disease = {}\n".format(dataset, diseases))
 
                     multiclass =  datasets_config[dataset]['task_type'] == "multi-class classification"
