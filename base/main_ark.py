@@ -46,6 +46,14 @@ def get_args_parser():
         choices=("cyclic", "joint"),
         default="cyclic",
     )
+    parser.add_option(
+        "--joint_sampling",
+        dest="joint_sampling",
+        help="proportional | equal",
+        type="choice",
+        choices=("proportional", "equal"),
+        default="proportional",
+    )
     
     parser.add_option("--ema_mode", dest="ema_mode", default="epoch", help="update teacher model at which time (epoch | iteration)", type="string")
     parser.add_option('--momentum_teacher', default=0.9, type=float, help="""Base EMA

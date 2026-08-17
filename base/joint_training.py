@@ -109,6 +109,46 @@ class OmniPretrainingDatasets_EqualSampling(Dataset):
     return self.prime_length
 
 
+# Adapted from the copied implementation above and the Ark+ Concurrent
+# joint-training dataset. It keeps the current dataset objects and returns
+# the same per-sample interface as OmniPretrainingDatasets.
+class OmniPretrainingDatasetsEqualSampling(Dataset):
+  def __init__(self, dataset_train_list, num_classes_list):
+    self.datasets = dataset_train_list
+    self.num_classes_list = list(num_classes_list)
+    if len(self.datasets) != len(self.num_classes_list):
+      raise ValueError("Expected one class count for each training dataset")
+    if not self.datasets:
+      raise ValueError("At least one training dataset is required")
+
+    self.dataset_sizes = [len(dataset) for dataset in self.datasets]
+    if any(size == 0 for size in self.dataset_sizes):
+      raise ValueError("Equal sampling requires non-empty training datasets")
+    self.max_dataset_size = max(self.dataset_sizes)
+    self.max_class_num = max(self.num_classes_list)
+
+  def __getitem__(self, index):
+    dataset_index = index % len(self.datasets)
+    sample_index = (index // len(self.datasets)) % self.dataset_sizes[dataset_index]
+    student_img, teacher_img, image_label = self.datasets[dataset_index][sample_index]
+    image_label = torch.as_tensor(image_label, dtype=torch.float32)
+    if image_label.shape[0] < self.max_class_num:
+      image_label = torch.cat(
+          (
+              image_label,
+              torch.zeros(
+                  self.max_class_num - image_label.shape[0],
+                  dtype=image_label.dtype,
+              ),
+          )
+      )
+
+    return student_img, teacher_img, image_label, dataset_index
+
+  def __len__(self):
+    return self.max_dataset_size * len(self.datasets)
+
+
 # Based on the copied implementation from:
 # https://github.com/jlianglab/Ark/tree/main/Ark_Plus/AblationStudy/Concurrent
 #

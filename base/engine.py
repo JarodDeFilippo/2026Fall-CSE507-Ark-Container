@@ -24,7 +24,11 @@ import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader, DistributedSampler
 #from torch.optim.lr_scheduler import ReduceLROnPlateau
 from trainer import train_one_epoch, test_classification, evaluate
-from joint_training import OmniPretrainingDatasets, train_one_epoch_joint
+from joint_training import (
+    OmniPretrainingDatasets,
+    OmniPretrainingDatasetsEqualSampling,
+    train_one_epoch_joint,
+)
 #import segmentation_models_pytorch as smp
 from utils import cosine_anneal_schedule,dice,mean_dice_coef
 
@@ -547,6 +551,7 @@ def _run_metadata(args, dataset_list, num_classes_list, cycle):
         'run_name': args.exp_name,
         'seed': args.seed,
         'training_strategy': getattr(args, 'training_strategy', 'cyclic'),
+        'joint_sampling': getattr(args, 'joint_sampling', 'proportional'),
     }
 
 
@@ -714,6 +719,14 @@ def _validate_checkpoint_training_strategy(checkpoint, file_path, args):
             "Checkpoint '{}' uses training strategy '{}', but this run requests '{}'"
             .format(file_path, checkpoint_strategy, requested_strategy)
         )
+    if requested_strategy == 'joint':
+        checkpoint_sampling = checkpoint.get('joint_sampling', 'proportional')
+        requested_sampling = getattr(args, 'joint_sampling', 'proportional')
+        if checkpoint_sampling != requested_sampling:
+            raise ValueError(
+                "Checkpoint '{}' uses joint sampling '{}', but this run requests '{}'"
+                .format(file_path, checkpoint_sampling, requested_sampling)
+            )
 
 
 def _rewrite_csv_through_cycle(file_path, max_cycle):
@@ -1508,13 +1521,19 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     num_classes_list = [len(datasets_config[dataset]['diseases']) for dataset in dataset_list]
     task_types = [datasets_config[dataset]['task_type'] for dataset in dataset_list]
     training_strategy = getattr(args, 'training_strategy', 'cyclic')
+    joint_sampling = getattr(args, 'joint_sampling', 'proportional')
     data_loader_list_train = []
     train_sampler_list = []
     joint_dataset = None
     joint_sampler = None
     data_loader_joint = None
     if args.mode == "train" and training_strategy == "joint":
-        joint_dataset = OmniPretrainingDatasets(
+        joint_dataset_class = (
+            OmniPretrainingDatasetsEqualSampling
+            if joint_sampling == 'equal'
+            else OmniPretrainingDatasets
+        )
+        joint_dataset = joint_dataset_class(
             dataset_train_list,
             num_classes_list,
         )
@@ -1919,9 +1938,11 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 if accelerator.is_main_process:
                     _print_and_log(
                         "Joint datasets {}: momentum = {:.6f}, "
-                        "classification/consistency = {:.4f}/{:.4f} ({:.1f}%/{:.1f}%)".format(
+                        "sampling = {}, classification/consistency = "
+                        "{:.4f}/{:.4f} ({:.1f}%/{:.1f}%)".format(
                             dataset_list,
                             momentum,
+                            joint_sampling,
                             1 - coff,
                             coff,
                             100 * (1 - coff),
