@@ -38,6 +38,14 @@ def get_args_parser():
     parser.add_option("--exp_name", dest="exp_name", default="", type="string")
     parser.add_option("--seed", dest="seed", default=None, type="int")
     parser.add_option("--mode", dest="mode", help="train | test", default="train", type="string")
+    parser.add_option(
+        "--training_strategy",
+        dest="training_strategy",
+        help="cyclic | joint",
+        type="choice",
+        choices=("cyclic", "joint"),
+        default="cyclic",
+    )
     
     parser.add_option("--ema_mode", dest="ema_mode", default="epoch", help="update teacher model at which time (epoch | iteration)", type="string")
     parser.add_option('--momentum_teacher', default=0.9, type=float, help="""Base EMA

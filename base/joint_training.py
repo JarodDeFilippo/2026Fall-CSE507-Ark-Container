@@ -1,6 +1,7 @@
 """Joint-training helpers based on the original Ark+ concurrent code."""
 
 from bisect import bisect_right
+import os
 import random
 import time
 import torch
@@ -11,7 +12,7 @@ from dataloader import (
     build_transform_classification,
     dict_dataloarder,
 )
-from utils import MetricLogger, ProgressLogger
+from utils import MetricLogger, ProgressLogger, save_image
 
 
 # Based on the copied implementation from:
@@ -128,6 +129,12 @@ def train_one_epoch_joint(
         it,
         accelerator=None,
         is_main_process=True,
+        global_step=0,
+        momentum=None,
+        train_log=None,
+        loss_writer=None,
+        loss_file=None,
+        snapshot_directory=None,
 ):
     batch_time = MetricLogger('Time', ':6.3f')
     losses_cls = MetricLogger('Loss_cls', ':.4e')
@@ -146,11 +153,23 @@ def train_one_epoch_joint(
         else torch.nn.BCEWithLogitsLoss()
         for task_type in task_types
     ]
-    coff = (momentum_schedule[it] - 0.9) * 5
+    if momentum is None:
+        momentum = momentum_schedule[it]
+    coff = (momentum - 0.9) * 5
     end = time.time()
     for i, (samples1, samples2, targets, dataset_index) in enumerate(data_loader_train):
         samples1, samples2, targets = samples1.float().to(device), samples2.float().to(device), targets.float().to(device)
         dataset_index = dataset_index.to(device)
+
+        if is_main_process and snapshot_directory is not None and i == 0:
+            save_image(
+                samples1[0].cpu().numpy().transpose(1, 2, 0),
+                os.path.join(snapshot_directory, "student"),
+            )
+            save_image(
+                samples2[0].cpu().numpy().transpose(1, 2, 0),
+                os.path.join(snapshot_directory, "teacher"),
+            )
 
         with torch.no_grad():
             feat_t = teacher(samples2, return_features=True)
@@ -196,8 +215,60 @@ def train_one_epoch_joint(
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if is_main_process and i % 50 == 0:
-            progress.display(i)
+        total_loss = losses_total.avg
+        if total_loss != 0:
+            cls_percent = 100 * losses_cls.avg / total_loss
+            mse_percent = 100 * losses_mse.avg / total_loss
+        else:
+            cls_percent = 0
+            mse_percent = 0
+        current_total = global_total_value
+        if current_total != 0:
+            current_cls_percent = 100 * global_cls_value / current_total
+            current_mse_percent = 100 * global_mse_value / current_total
+        else:
+            current_cls_percent = 0
+            current_mse_percent = 0
+
+        if is_main_process and loss_writer is not None:
+            loss_writer.writerow([
+                epoch + 1,
+                epoch,
+                global_step + i,
+                i + 1,
+                "joint",
+                global_batch_size,
+                global_cls_value,
+                global_mse_value,
+                global_total_value,
+                current_cls_percent,
+                current_mse_percent,
+                optimizer.param_groups[0]["lr"],
+                momentum,
+            ])
+            if loss_file is not None:
+                loss_file.flush()
+
+        if is_main_process and ((i + 1) % 50 == 0 or i + 1 == len(data_loader_train)):
+            progress.display(i + 1)
+            message = (
+                "Cycle {:04d} | Dataset joint | Batch {:04d}/{:04d} | "
+                "classification={:.4e} ({:.1f}%) | "
+                "consistency={:.4e} ({:.1f}%) | total={:.4e} (100.0%)"
+            ).format(
+                epoch + 1,
+                i + 1,
+                len(data_loader_train),
+                losses_cls.avg,
+                cls_percent,
+                losses_mse.avg,
+                mse_percent,
+                total_loss,
+            )
+            print(message)
+            if train_log is not None:
+                train_log.write(message + "\n")
+                train_log.flush()
         if ema_mode == "iteration":
             ema_update_teacher(model, teacher, momentum_schedule, it)
             it += 1

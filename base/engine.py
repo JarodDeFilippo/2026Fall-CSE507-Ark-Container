@@ -24,6 +24,7 @@ import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader, DistributedSampler
 #from torch.optim.lr_scheduler import ReduceLROnPlateau
 from trainer import train_one_epoch, test_classification, evaluate
+from joint_training import OmniPretrainingDatasets, train_one_epoch_joint
 #import segmentation_models_pytorch as smp
 from utils import cosine_anneal_schedule,dice,mean_dice_coef
 
@@ -545,6 +546,7 @@ def _run_metadata(args, dataset_list, num_classes_list, cycle):
         'use_mlp': bool(args.use_mlp),
         'run_name': args.exp_name,
         'seed': args.seed,
+        'training_strategy': getattr(args, 'training_strategy', 'cyclic'),
     }
 
 
@@ -701,6 +703,16 @@ def _validate_checkpoint_total_cycles(checkpoint, file_path, args):
         raise ValueError(
             "Checkpoint '{}' was configured for {} cycles, but this run requests {}"
             .format(file_path, total_cycles, args.pretrain_epochs)
+        )
+
+
+def _validate_checkpoint_training_strategy(checkpoint, file_path, args):
+    checkpoint_strategy = checkpoint.get('training_strategy', 'cyclic')
+    requested_strategy = getattr(args, 'training_strategy', 'cyclic')
+    if checkpoint_strategy != requested_strategy:
+        raise ValueError(
+            "Checkpoint '{}' uses training strategy '{}', but this run requests '{}'"
+            .format(file_path, checkpoint_strategy, requested_strategy)
         )
 
 
@@ -1360,6 +1372,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 )
             selected_checkpoint = _load_checkpoint_metadata(source_checkpoint)
             _validate_checkpoint_total_cycles(selected_checkpoint, source_checkpoint, args)
+            _validate_checkpoint_training_strategy(selected_checkpoint, source_checkpoint, args)
             if selected_cycle >= selected_checkpoint['total_cycles']:
                 raise RuntimeError(
                     "Cannot resume from completed checkpoint '{}'".format(source_checkpoint)
@@ -1413,6 +1426,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             )
             latest_metadata = _load_checkpoint_metadata(latest_checkpoint)
             _validate_checkpoint_total_cycles(latest_metadata, latest_checkpoint, args)
+            _validate_checkpoint_training_strategy(latest_metadata, latest_checkpoint, args)
             if latest_cycle >= latest_metadata['total_cycles']:
                 raise RuntimeError(
                     "Cannot resume completed run '{}'".format(model_path)
@@ -1491,20 +1505,47 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     else:
         train_batch_size = args.batch_size
 
+    num_classes_list = [len(datasets_config[dataset]['diseases']) for dataset in dataset_list]
+    task_types = [datasets_config[dataset]['task_type'] for dataset in dataset_list]
+    training_strategy = getattr(args, 'training_strategy', 'cyclic')
     data_loader_list_train = []
     train_sampler_list = []
-    for d in dataset_train_list:
-        train_sampler = DistributedSampler(
-            d,
+    joint_dataset = None
+    joint_sampler = None
+    data_loader_joint = None
+    if args.mode == "train" and training_strategy == "joint":
+        joint_dataset = OmniPretrainingDatasets(
+            dataset_train_list,
+            num_classes_list,
+        )
+        joint_sampler = DistributedSampler(
+            joint_dataset,
             num_replicas=accelerator.world_size,
             rank=accelerator.rank,
             shuffle=True,
             seed=args.seed,
         ) if accelerator.distributed else None
-        train_sampler_list.append(train_sampler)
-        data_loader_list_train.append(DataLoader(dataset=d, batch_size=train_batch_size, shuffle=train_sampler is None,
-                                        sampler=train_sampler,
-                                        num_workers=args.workers, pin_memory=accelerator.pin_memory))
+        data_loader_joint = DataLoader(
+            dataset=joint_dataset,
+            batch_size=train_batch_size,
+            shuffle=joint_sampler is None,
+            sampler=joint_sampler,
+            num_workers=args.workers,
+            pin_memory=accelerator.pin_memory,
+        )
+    else:
+        for d in dataset_train_list:
+            train_sampler = DistributedSampler(
+                d,
+                num_replicas=accelerator.world_size,
+                rank=accelerator.rank,
+                shuffle=True,
+                seed=args.seed,
+            ) if accelerator.distributed else None
+            train_sampler_list.append(train_sampler)
+            data_loader_list_train.append(DataLoader(dataset=d, batch_size=train_batch_size, shuffle=train_sampler is None,
+                                            sampler=train_sampler,
+                                            num_workers=args.workers, pin_memory=accelerator.pin_memory))
     data_loader_list_val = []
     val_sampler_list = []
     for dv in dataset_val_list:
@@ -1538,8 +1579,6 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 dataset_test_list,
             )
         ]
-
-    num_classes_list = [len(datasets_config[dataset]['diseases']) for dataset in dataset_list]
     if accelerator.is_main_process:
         if args.mode == "train":
             print_training_configuration(
@@ -1628,7 +1667,13 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     optimizer = None
     lr_scheduler = None
     if args.mode == "train":
-        if args.ema_mode == "epoch":
+        if training_strategy == "joint" and args.ema_mode == "epoch":
+            momentum_schedule = cosine_scheduler(args.momentum_teacher, 1,
+                                                   args.pretrain_epochs, 1)
+        elif training_strategy == "joint" and args.ema_mode == "iteration":
+            momentum_schedule = cosine_scheduler(args.momentum_teacher, 1,
+                                                   args.pretrain_epochs, len(data_loader_joint))
+        elif args.ema_mode == "epoch":
             momentum_schedule = cosine_scheduler(args.momentum_teacher, 1,
                                                    args.pretrain_epochs, len(dataset_list))
         elif args.ema_mode == "iteration":
@@ -1846,8 +1891,12 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         #         }
         #     )
 
-        it = start_epoch * len(dataset_list)
-        global_step = start_epoch * sum(len(data_loader) for data_loader in data_loader_list_train)
+        if training_strategy == "joint":
+            it = start_epoch if args.ema_mode == "epoch" else start_epoch * len(data_loader_joint)
+            global_step = start_epoch * len(data_loader_joint)
+        else:
+            it = start_epoch * len(dataset_list)
+            global_step = start_epoch * sum(len(data_loader) for data_loader in data_loader_list_train)
         
         for epoch in range(start_epoch, args.pretrain_epochs):
             lr_scheduler.step(epoch)
@@ -1862,18 +1911,16 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     train_log,
                 )
             val_loss_list = None
-            for i, data_loader in enumerate(data_loader_list_train): 
-                if train_sampler_list[i] is not None:
-                    train_sampler_list[i].set_epoch(epoch)
-                criterion = torch.nn.CrossEntropyLoss() if datasets_config[dataset_list[i]]['task_type'] == "multi-class classification" else torch.nn.BCEWithLogitsLoss()
+            if training_strategy == "joint":
+                if joint_sampler is not None:
+                    joint_sampler.set_epoch(epoch)
                 momentum = momentum_schedule[it]
                 coff = (momentum - 0.9) * 5
                 if accelerator.is_main_process:
                     _print_and_log(
-                        "Dataset {} ({}): momentum = {:.6f}, "
+                        "Joint datasets {}: momentum = {:.6f}, "
                         "classification/consistency = {:.4f}/{:.4f} ({:.1f}%/{:.1f}%)".format(
-                            i + 1,
-                            dataset_list[i],
+                            dataset_list,
                             momentum,
                             1 - coff,
                             coff,
@@ -1886,52 +1933,59 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     model_path,
                     "snapshots",
                     "cycle_{:04d}".format(epoch + 1),
-                    dataset_list[i],
                 )
                 if accelerator.is_main_process:
                     os.makedirs(snapshot_directory, exist_ok=True)
-                task_metrics = train_one_epoch(
+                it, task_metrics = train_one_epoch_joint(
                     model,
-                    i,
-                    dataset_list[i],
-                    data_loader,
+                    data_loader_joint,
+                    num_classes_list,
+                    task_types,
                     device,
-                    criterion,
                     optimizer,
                     epoch,
                     args.ema_mode,
                     teacher,
                     momentum_schedule,
                     it,
-                    accelerator.is_main_process,
-                    accelerator,
-                    global_step,
-                    momentum,
-                    train_log,
-                    loss_writer,
-                    loss_file,
-                    snapshot_directory,
-                    args.print_freq,
-                    training_start_time,
+                    accelerator=accelerator,
+                    is_main_process=accelerator.is_main_process,
+                    global_step=global_step,
+                    momentum=momentum,
+                    train_log=train_log,
+                    loss_writer=loss_writer,
+                    loss_file=loss_file,
+                    snapshot_directory=snapshot_directory,
                 )
                 if accelerator.is_main_process:
+                    joint_total_loss = task_metrics["total_loss"]
+                    if joint_total_loss:
+                        joint_cls_percent = (
+                            100 * task_metrics["classification_loss"]
+                            / joint_total_loss
+                        )
+                        joint_cons_percent = (
+                            100 * task_metrics["consistency_loss"]
+                            / joint_total_loss
+                        )
+                    else:
+                        joint_cls_percent = 0.0
+                        joint_cons_percent = 0.0
                     _print_and_log(
-                        "Finished {} Cycle={}: Loss={:.4f} "
+                        "Finished joint Cycle={}: Loss={:.4f} "
                         "Cls={:.4f} [{:.1f}%] Cons={:.4f} [{:.1f}%] m={:.5f}"
                         .format(
-                            dataset_list[i],
                             epoch + 1,
-                            task_metrics["total_loss"],
+                            joint_total_loss,
                             task_metrics["classification_loss"],
-                            task_metrics["classification_percent"],
+                            joint_cls_percent,
                             task_metrics["consistency_loss"],
-                            task_metrics["consistency_percent"],
+                            joint_cons_percent,
                             momentum,
                         ),
                         train_log,
                     )
-                it += 1
-                global_step += len(data_loader)
+                global_step += len(data_loader_joint)
                 _evaluate_test_sets(
                     student_model,
                     teacher,
@@ -1943,7 +1997,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     evaluation_directory,
                     epoch + 1,
                     epoch,
-                    "after_{}".format(dataset_list[i]),
+                    "after_joint",
                     shared_val_test_splits,
                     train_log,
                 )
@@ -1959,10 +2013,112 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     evaluation_directory,
                     epoch + 1,
                     epoch,
-                    "after_{}".format(dataset_list[i]),
+                    "after_joint",
                     shared_val_test_splits,
                     train_log,
                 )
+            else:
+                for i, data_loader in enumerate(data_loader_list_train):
+                    if train_sampler_list[i] is not None:
+                        train_sampler_list[i].set_epoch(epoch)
+                    criterion = torch.nn.CrossEntropyLoss() if datasets_config[dataset_list[i]]['task_type'] == "multi-class classification" else torch.nn.BCEWithLogitsLoss()
+                    momentum = momentum_schedule[it]
+                    coff = (momentum - 0.9) * 5
+                    if accelerator.is_main_process:
+                        _print_and_log(
+                            "Dataset {} ({}): momentum = {:.6f}, "
+                            "classification/consistency = {:.4f}/{:.4f} ({:.1f}%/{:.1f}%)".format(
+                                i + 1,
+                                dataset_list[i],
+                                momentum,
+                                1 - coff,
+                                coff,
+                                100 * (1 - coff),
+                                100 * coff,
+                            ),
+                            train_log,
+                        )
+                    snapshot_directory = os.path.join(
+                        model_path,
+                        "snapshots",
+                        "cycle_{:04d}".format(epoch + 1),
+                        dataset_list[i],
+                    )
+                    if accelerator.is_main_process:
+                        os.makedirs(snapshot_directory, exist_ok=True)
+                    task_metrics = train_one_epoch(
+                        model,
+                        i,
+                        dataset_list[i],
+                        data_loader,
+                        device,
+                        criterion,
+                        optimizer,
+                        epoch,
+                        args.ema_mode,
+                        teacher,
+                        momentum_schedule,
+                        it,
+                        accelerator.is_main_process,
+                        accelerator,
+                        global_step,
+                        momentum,
+                        train_log,
+                        loss_writer,
+                        loss_file,
+                        snapshot_directory,
+                        args.print_freq,
+                        training_start_time,
+                    )
+                    if accelerator.is_main_process:
+                        _print_and_log(
+                            "Finished {} Cycle={}: Loss={:.4f} "
+                            "Cls={:.4f} [{:.1f}%] Cons={:.4f} [{:.1f}%] m={:.5f}"
+                            .format(
+                                dataset_list[i],
+                                epoch + 1,
+                                task_metrics["total_loss"],
+                                task_metrics["classification_loss"],
+                                task_metrics["classification_percent"],
+                                task_metrics["consistency_loss"],
+                                task_metrics["consistency_percent"],
+                                momentum,
+                            ),
+                            train_log,
+                        )
+                    it += 1
+                    global_step += len(data_loader)
+                    _evaluate_test_sets(
+                        student_model,
+                        teacher,
+                        dataset_list,
+                        datasets_config,
+                        data_loader_list_test,
+                        device,
+                        accelerator,
+                        evaluation_directory,
+                        epoch + 1,
+                        epoch,
+                        "after_{}".format(dataset_list[i]),
+                        shared_val_test_splits,
+                        train_log,
+                    )
+                    val_loss_list = _evaluate_validation_sets(
+                        student_model,
+                        teacher,
+                        dataset_list,
+                        datasets_config,
+                        data_loader_list_val,
+                        val_sampler_list,
+                        device,
+                        accelerator,
+                        evaluation_directory,
+                        epoch + 1,
+                        epoch,
+                        "after_{}".format(dataset_list[i]),
+                        shared_val_test_splits,
+                        train_log,
+                    )
 
             accelerator.mark_step()
             cycle = epoch + 1
