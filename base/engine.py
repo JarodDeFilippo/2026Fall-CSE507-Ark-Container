@@ -307,6 +307,22 @@ def _copy_run_through_cycle(source_directory, target_directory, max_cycle):
     _discard_outputs_after_cycle(target_directory, max_cycle)
 
 
+def _run_main_process_resume_setup(accelerator, device, setup):
+    setup_status = torch.zeros(1, dtype=torch.int32, device=device)
+    if accelerator.is_main_process:
+        try:
+            setup()
+        except Exception as error:
+            print("Resume setup failed: {}".format(error))
+        else:
+            setup_status[0] = 1
+    accelerator.broadcast(setup_status)
+    if setup_status.item() == 0:
+        raise RuntimeError(
+            "Resume setup failed on rank 0; see rank 0 output for details"
+        )
+
+
 def _raw_label_counts(dataset, split_key, file_path, num_classes):
     categories = ("positive", "negative", "uncertain", "missing")
     label_counts = [dict.fromkeys(categories, 0) for _ in range(num_classes)]
@@ -444,15 +460,19 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         model_path = os.path.join(model_path, args.exp_name)
     elif resume_requested and getattr(args, "resume_from", None) is not None:
         source_checkpoint = os.path.realpath(os.path.abspath(args.resume_from))
-        source_run_directory = os.path.realpath(_checkpoint_run_directory(source_checkpoint))
         target_run_directory = os.path.realpath(os.path.abspath(model_path))
-        selected_cycle = _checkpoint_cycle(source_checkpoint)
-        if selected_cycle is None or not os.path.isfile(source_checkpoint):
-            raise FileNotFoundError(
-                "Cannot resume because checkpoint does not exist or is not a cycle checkpoint: {}"
-                .format(source_checkpoint)
+        resume_cycle_tensor = torch.full((1,), -1, dtype=torch.int64, device=device)
+
+        def setup_explicit_resume():
+            source_run_directory = os.path.realpath(
+                _checkpoint_run_directory(source_checkpoint)
             )
-        if accelerator.is_main_process:
+            selected_cycle = _checkpoint_cycle(source_checkpoint)
+            if selected_cycle is None or not os.path.isfile(source_checkpoint):
+                raise FileNotFoundError(
+                    "Cannot resume because checkpoint does not exist or is not a cycle checkpoint: {}"
+                    .format(source_checkpoint)
+                )
             selected_checkpoint = _load_checkpoint_metadata(source_checkpoint)
             _validate_checkpoint_total_cycles(selected_checkpoint, source_checkpoint, args)
             if selected_cycle >= selected_checkpoint['total_cycles']:
@@ -460,16 +480,11 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     "Cannot resume from completed checkpoint '{}'".format(source_checkpoint)
                 )
 
-        if target_run_directory == source_run_directory:
-            run_status = torch.zeros(1, dtype=torch.int32, device=device)
-            if accelerator.is_main_process:
-                run_status[0] = int(os.path.isdir(model_path))
-            accelerator.broadcast(run_status)
-            if run_status.item() == 0:
-                raise FileNotFoundError(
-                    "Cannot resume training because run directory does not exist: {}".format(model_path)
-                )
-            if accelerator.is_main_process:
+            if target_run_directory == source_run_directory:
+                if not os.path.isdir(model_path):
+                    raise FileNotFoundError(
+                        "Cannot resume training because run directory does not exist: {}".format(model_path)
+                    )
                 _, latest_cycle = _find_latest_valid_checkpoint(
                     os.path.join(model_path, "models", "checkpoints")
                 )
@@ -478,40 +493,37 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         "Resuming from a checkpoint before the latest requires a new --exp_name"
                     )
                 _discard_outputs_after_cycle(model_path, selected_cycle)
-            accelerator.barrier()
-        else:
-            run_status = torch.zeros(1, dtype=torch.int32, device=device)
-            if accelerator.is_main_process:
-                run_status[0] = int(not os.path.exists(model_path))
-            accelerator.broadcast(run_status)
-            if run_status.item() == 0:
-                raise FileExistsError(
-                    "Training run directory already exists: {}".format(model_path)
-                )
-            if accelerator.is_main_process:
+            else:
+                if os.path.exists(model_path):
+                    raise FileExistsError(
+                        "Training run directory already exists: {}".format(model_path)
+                    )
                 _copy_run_through_cycle(
                     source_run_directory,
                     model_path,
                     selected_cycle,
                 )
-            accelerator.barrier()
-        resume_cycle = selected_cycle
+
+            resume_cycle_tensor[0] = selected_cycle
+
+        _run_main_process_resume_setup(accelerator, device, setup_explicit_resume)
+        accelerator.broadcast(resume_cycle_tensor)
+        resume_cycle = int(resume_cycle_tensor.item())
         resume_checkpoint_path = os.path.join(
             model_path,
             "models",
             "checkpoints",
             "cycle_{:04d}.pth.tar".format(resume_cycle),
         )
+        accelerator.barrier()
     elif resume_requested:
-        run_status = torch.zeros(1, dtype=torch.int32, device=device)
-        if accelerator.is_main_process:
-            run_status[0] = int(os.path.isdir(model_path))
-        accelerator.broadcast(run_status)
-        if run_status.item() == 0:
-            raise FileNotFoundError(
-                "Cannot resume training because run directory does not exist: {}".format(model_path)
-            )
-        if accelerator.is_main_process:
+        resume_cycle_tensor = torch.full((1,), -1, dtype=torch.int64, device=device)
+
+        def setup_latest_resume():
+            if not os.path.isdir(model_path):
+                raise FileNotFoundError(
+                    "Cannot resume training because run directory does not exist: {}".format(model_path)
+                )
             latest_checkpoint, latest_cycle = _find_latest_valid_checkpoint(
                 os.path.join(model_path, "models", "checkpoints")
             )
@@ -522,10 +534,9 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     "Cannot resume completed run '{}'".format(model_path)
                 )
             _discard_outputs_after_cycle(model_path, latest_cycle)
-            resume_cycle = latest_cycle
-        resume_cycle_tensor = torch.full((1,), -1, dtype=torch.int64, device=device)
-        if accelerator.is_main_process:
-            resume_cycle_tensor[0] = resume_cycle
+            resume_cycle_tensor[0] = latest_cycle
+
+        _run_main_process_resume_setup(accelerator, device, setup_latest_resume)
         accelerator.broadcast(resume_cycle_tensor)
         resume_cycle = int(resume_cycle_tensor.item())
         resume_checkpoint_path = os.path.join(
