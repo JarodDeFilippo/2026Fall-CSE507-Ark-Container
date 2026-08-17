@@ -234,6 +234,18 @@ def _remove_checkpoints_after(directory, max_cycle):
             os.remove(path)
 
 
+def _remove_stale_latest_checkpoints(directory, current_cycle, checkpoint_frequency):
+    if not os.path.isdir(directory):
+        return
+    for path in glob.glob(os.path.join(directory, "cycle_*.pth.tar")):
+        cycle = _checkpoint_cycle(path)
+        if (
+                cycle is not None
+                and cycle != current_cycle
+                and cycle % checkpoint_frequency != 0):
+            os.remove(path)
+
+
 def _discard_outputs_after_cycle(run_directory, max_cycle):
     _remove_cycle_directories_after(
         os.path.join(run_directory, "snapshots"),
@@ -334,8 +346,6 @@ def _copy_run_through_cycle(source_directory, target_directory, max_cycle):
                     source_path = os.path.join(source_dataset_directory, file_name)
                     target_path = os.path.join(target_dataset_directory, file_name)
                     shutil.copy2(source_path, target_path)
-
-    _discard_outputs_after_cycle(target_directory, max_cycle)
 
 
 def _run_main_process_resume_setup(accelerator, device, setup):
@@ -756,6 +766,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     model_path,
                     selected_cycle,
                 )
+                _discard_outputs_after_cycle(model_path, selected_cycle)
 
             resume_cycle_tensor[0] = selected_cycle
 
@@ -866,6 +877,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             num_replicas=accelerator.world_size,
             rank=accelerator.rank,
             shuffle=True,
+            seed=args.seed,
         ) if accelerator.distributed else None
         train_sampler_list.append(train_sampler)
         data_loader_list_train.append(DataLoader(dataset=d, batch_size=train_batch_size, shuffle=train_sampler is None,
@@ -1403,10 +1415,6 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     )
 
             cycle = epoch + 1
-            checkpoint_this_cycle = (
-                cycle % checkpoint_frequency == 0
-                or cycle == args.pretrain_epochs
-            )
             if accelerator.is_main_process:
                 weight_directory = os.path.join(
                     weights_directory,
@@ -1437,25 +1445,29 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         "teacher_{}.pth".format(_checkpoint_stem(args, cycle)),
                     ),
                 )
-                if checkpoint_this_cycle:
-                    checkpoint = metadata.copy()
-                    checkpoint.update({
-                        'epoch': epoch,
-                        'lossMIN': val_loss_list,
-                        'state_dict': student_model.state_dict(),
-                        'teacher': teacher.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'scheduler': lr_scheduler.state_dict(),
-                        'total_cycles': args.pretrain_epochs,
-                        'scheduler_config': _scheduler_config(args),
-                    })
-                    save_checkpoint(
-                        checkpoint,
-                        filename=os.path.join(
-                            checkpoint_directory,
-                            _checkpoint_stem(args, cycle),
-                        ),
-                    )
+                checkpoint = metadata.copy()
+                checkpoint.update({
+                    'epoch': epoch,
+                    'lossMIN': val_loss_list,
+                    'state_dict': student_model.state_dict(),
+                    'teacher': teacher.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': lr_scheduler.state_dict(),
+                    'total_cycles': args.pretrain_epochs,
+                    'scheduler_config': _scheduler_config(args),
+                })
+                save_checkpoint(
+                    checkpoint,
+                    filename=os.path.join(
+                        checkpoint_directory,
+                        _checkpoint_stem(args, cycle),
+                    ),
+                )
+                _remove_stale_latest_checkpoints(
+                    checkpoint_directory,
+                    cycle,
+                    checkpoint_frequency,
+                )
             accelerator.barrier()
 
         accelerator.barrier()
