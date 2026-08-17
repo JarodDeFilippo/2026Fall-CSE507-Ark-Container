@@ -24,7 +24,7 @@ def get_args_parser():
                       callback=vararg_callback_int)
     parser.add_option("--model", dest="model_name", help="swin_base|swin_large|swin_large_384|swin_large_768|conv_base", default="swin_base", type="string")
     parser.add_option("--init", dest="init",help="Random| ImageNet_1k| ImageNet_21k| SAM| DeiT| BEiT| DINO| MoCo_V3| MoBY | MAE| SimMIM", default="Random", type="string")
-    parser.add_option("--pretrained_weights", dest="pretrained_weights", help="Path to the Pretrained model", default=None, type="string")
+    parser.add_option("--pretrained_weights", dest="pretrained_weights", help="Path to a checkpoint or saved-weights directory", default=None, type="string")
     parser.add_option("--num_class", dest="num_class", help="number of the classes in the downstream task",
                       default=14, type="int")
     parser.add_option("--data_set", dest="dataset_list", help="ChestXray14|CheXpert|Shenzhen|VinDrCXR|RSNAPneumonia",  action="append")
@@ -122,6 +122,13 @@ def main(args):
             raise ValueError("--seed is required for training")
         if args.resume and args.resume_from is not None:
             raise ValueError("Use either --resume or --resume_from, not both")
+    elif args.mode == "test":
+        if not args.pretrained_weights:
+            raise ValueError("--pretrained_weights is required for testing")
+        if not os.path.isfile(args.pretrained_weights) and not os.path.isdir(args.pretrained_weights):
+            raise FileNotFoundError(
+                "Test checkpoint or weights directory does not exist: {}".format(args.pretrained_weights)
+            )
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -138,9 +145,9 @@ def main(args):
         model_path = run_path
         output_path = run_path
     else:
-        exp_name = args.model_name + "_" + args.exp_name
-        model_path = os.path.join("./Models",exp_name)
-        output_path = os.path.join("./Outputs",exp_name)
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        model_path = repo_root
+        output_path = repo_root
 
     datasets_config = get_config('datasets_config.yaml')
     for dataset in args.dataset_list:
@@ -150,12 +157,13 @@ def main(args):
     dataset_val_list = []
     dataset_test_list = []
     for dataset in args.dataset_list:
-        dataset_train_list.append(
-            dict_dataloarder[dataset](images_path=datasets_config[dataset]['data_dir'], file_path=datasets_config[dataset]['train_list'], crop_size=args.crop_size, resize=args.resize, augment=None)
-        )
-        dataset_val_list.append(
-            dict_dataloarder[dataset](images_path=datasets_config[dataset]['data_dir'], file_path=datasets_config[dataset]['val_list'], crop_size=args.crop_size, resize=args.resize, augment=build_transform_classification(normalize=args.normalization, crop_size=args.crop_size, resize=args.resize, mode="valid"))
-        )
+        if args.mode == "train":
+            dataset_train_list.append(
+                dict_dataloarder[dataset](images_path=datasets_config[dataset]['data_dir'], file_path=datasets_config[dataset]['train_list'], crop_size=args.crop_size, resize=args.resize, augment=None)
+            )
+            dataset_val_list.append(
+                dict_dataloarder[dataset](images_path=datasets_config[dataset]['data_dir'], file_path=datasets_config[dataset]['val_list'], crop_size=args.crop_size, resize=args.resize, augment=build_transform_classification(normalize=args.normalization, crop_size=args.crop_size, resize=args.resize, mode="valid"))
+            )
         dataset_test_list.append(
             dict_dataloarder[dataset](images_path=datasets_config[dataset]['data_dir'], file_path=datasets_config[dataset]['test_list'], crop_size=args.crop_size, resize=args.resize, augment=build_transform_classification(normalize=args.normalization, crop_size=args.crop_size, resize=args.resize, mode="test"))
         )
@@ -165,4 +173,3 @@ def main(args):
 if __name__ == '__main__':
     args = get_args_parser()
     main(args)
-

@@ -323,6 +323,47 @@ def _run_main_process_resume_setup(accelerator, device, setup):
         )
 
 
+def _test_output_path(output_directory, checkpoint_path):
+    checkpoint_name = os.path.basename(os.path.normpath(checkpoint_path))
+    if os.path.isdir(checkpoint_path):
+        return os.path.join(output_directory, checkpoint_name + '.csv')
+    if checkpoint_name.endswith('.pth.tar'):
+        result_name = checkpoint_name[:-len('.pth.tar')] + '.csv'
+    else:
+        result_name = os.path.splitext(checkpoint_name)[0] + '.csv'
+    return os.path.join(output_directory, result_name)
+
+
+def _load_test_state_dicts(weights_path):
+    if os.path.isdir(weights_path):
+        student_path = os.path.join(weights_path, 'student.pth')
+        teacher_path = os.path.join(weights_path, 'teacher.pth')
+        if not os.path.isfile(student_path) or not os.path.isfile(teacher_path):
+            raise FileNotFoundError(
+                "Test weights directory must contain student.pth and teacher.pth: {}"
+                .format(weights_path)
+            )
+        student_state_dict = torch.load(
+            student_path,
+            map_location='cpu',
+            weights_only=False,
+        )
+        teacher_state_dict = torch.load(
+            teacher_path,
+            map_location='cpu',
+            weights_only=False,
+        )
+        return student_state_dict, teacher_state_dict
+
+    checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
+    for key in ('state_dict', 'teacher'):
+        if key not in checkpoint:
+            raise ValueError(
+                "Test checkpoint '{}' is missing '{}'".format(weights_path, key)
+            )
+    return checkpoint['state_dict'], checkpoint['teacher']
+
+
 def _raw_label_counts(dataset, split_key, file_path, num_classes):
     categories = ("positive", "negative", "uncertain", "missing")
     label_counts = [dict.fromkeys(categories, 0) for _ in range(num_classes)]
@@ -455,7 +496,18 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     )
     resume_checkpoint_path = None
     resume_cycle = None
-    if args.mode != "train":
+    test_output_path = None
+    if args.mode == "test":
+        test_output_path = _test_output_path(output_path, args.pretrained_weights)
+        result_status = torch.zeros(1, dtype=torch.int32, device=device)
+        if accelerator.is_main_process:
+            result_status[0] = int(not os.path.exists(test_output_path))
+        accelerator.broadcast(result_status)
+        if result_status.item() == 0:
+            raise FileExistsError(
+                "Test results file already exists: {}".format(test_output_path)
+            )
+    elif args.mode != "train":
         model_path = os.path.join(model_path, exp)
         model_path = os.path.join(model_path, args.exp_name)
     elif resume_requested and getattr(args, "resume_from", None) is not None:
@@ -661,8 +713,23 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
 
 
     # training setups
-    model = build_omni_model(args, num_classes_list)
-    teacher = build_omni_model(args, num_classes_list)     
+    model_args = args
+    test_state_dicts = None
+    if args.mode == "test":
+        model_args = copy.copy(args)
+        model_args.pretrained_weights = None
+        test_state_dicts = _load_test_state_dicts(args.pretrained_weights)
+    model = build_omni_model(model_args, num_classes_list)
+    teacher = build_omni_model(model_args, num_classes_list)
+    if test_state_dicts is not None:
+        model.load_state_dict(
+            accelerator.strip_module_prefix(test_state_dicts[0]),
+            strict=True,
+        )
+        teacher.load_state_dict(
+            accelerator.strip_module_prefix(test_state_dicts[1]),
+            strict=True,
+        )
     model.to(device)
     teacher.to(device)
     model = accelerator.wrap_model(model)
@@ -677,24 +744,100 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         )
 
     # momentum parameter is increased to 1. during training with a cosine schedule
-    if args.ema_mode == "epoch":
-        momentum_schedule = cosine_scheduler(args.momentum_teacher, 1,
-                                               args.pretrain_epochs, len(dataset_list))
-    elif args.ema_mode == "iteration":
-        iters_per_epoch = 0
-        for d in data_loader_list_train:
-            iters_per_epoch += len(d)
-        momentum_schedule = cosine_scheduler(args.momentum_teacher, 1,
-                                               args.pretrain_epochs, iters_per_epoch)
-    optimizer = create_optimizer(args, model)
-    lr_scheduler, _ = create_scheduler(args, optimizer)
+    momentum_schedule = None
+    optimizer = None
+    lr_scheduler = None
+    if args.mode == "train":
+        if args.ema_mode == "epoch":
+            momentum_schedule = cosine_scheduler(args.momentum_teacher, 1,
+                                                   args.pretrain_epochs, len(dataset_list))
+        elif args.ema_mode == "iteration":
+            iters_per_epoch = 0
+            for d in data_loader_list_train:
+                iters_per_epoch += len(d)
+            momentum_schedule = cosine_scheduler(args.momentum_teacher, 1,
+                                                   args.pretrain_epochs, iters_per_epoch)
+        optimizer = create_optimizer(args, model)
+        lr_scheduler, _ = create_scheduler(args, optimizer)
 
     start_epoch = 0
     init_loss = 999999
     best_val_loss = init_loss
     checkpoint_frequency = 10
 
-    if args.mode == "train":
+    if args.mode == "test":
+        result_rows = []
+        for dataset_index, dataset in enumerate(dataset_list):
+            diseases = datasets_config[dataset]['diseases']
+            multiclass = datasets_config[dataset]['task_type'] == "multi-class classification"
+            y_test, p_test = test_classification(
+                student_model,
+                dataset_index,
+                data_loader_list_test[dataset_index],
+                device,
+                multiclass,
+                len(diseases),
+            )
+            y_test_teacher, p_test_teacher = test_classification(
+                teacher,
+                dataset_index,
+                data_loader_list_test[dataset_index],
+                device,
+                multiclass,
+                len(diseases),
+            )
+            y_test = torch.cat(accelerator.gather_tensor(y_test), 0)
+            p_test = torch.cat(accelerator.gather_tensor(p_test), 0)
+            y_test_teacher = torch.cat(accelerator.gather_tensor(y_test_teacher), 0)
+            p_test_teacher = torch.cat(accelerator.gather_tensor(p_test_teacher), 0)
+
+            if dataset == "CheXpert":
+                performance_diseases = datasets_config[dataset]['test_diseases_name']
+                test_disease_indices = [diseases.index(name) for name in performance_diseases]
+                y_test = y_test[:, test_disease_indices]
+                p_test = p_test[:, test_disease_indices]
+                y_test_teacher = y_test_teacher[:, test_disease_indices]
+                p_test_teacher = p_test_teacher[:, test_disease_indices]
+            else:
+                performance_diseases = diseases
+
+            for model_name, targets, outputs in (
+                    ("student", y_test, p_test),
+                    ("teacher", y_test_teacher, p_test_teacher)):
+                if multiclass:
+                    accuracy = accuracy_score(
+                        np.argmax(targets.cpu().numpy(), axis=1),
+                        np.argmax(outputs.cpu().numpy(), axis=1),
+                    )
+                    result_rows.append([dataset, model_name, "accuracy", "", accuracy])
+                individual_results = metric_AUROC(
+                    targets,
+                    outputs,
+                    len(performance_diseases),
+                )
+                for disease, auc in zip(performance_diseases, individual_results):
+                    result_rows.append([dataset, model_name, "AUC", disease, auc])
+                mean_auc = np.mean(individual_results) if individual_results else np.nan
+                result_rows.append([dataset, model_name, "mAUC", "", mean_auc])
+
+        write_status = torch.zeros(1, dtype=torch.int32, device=device)
+        if accelerator.is_main_process:
+            try:
+                with open(test_output_path, 'x', newline='') as result_file:
+                    writer = csv.writer(result_file)
+                    writer.writerow(["dataset", "model", "metric", "class", "value"])
+                    writer.writerows(result_rows)
+            except Exception as error:
+                print("Test results could not be written: {}".format(error))
+            else:
+                write_status[0] = 1
+        accelerator.broadcast(write_status)
+        if write_status.item() == 0:
+            raise RuntimeError(
+                "Test results could not be written on rank 0; see rank 0 output for details"
+            )
+        accelerator.barrier()
+    elif args.mode == "train":
         if resume_requested:
             resume = resume_checkpoint_path
             if not os.path.isfile(resume):
