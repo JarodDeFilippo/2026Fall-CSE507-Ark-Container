@@ -46,6 +46,21 @@ def _print_and_log(message, log_file=None):
         log_file.flush()
 
 
+def _copy_to_cpu(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {
+            key: _copy_to_cpu(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_copy_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_to_cpu(item) for item in value)
+    return value
+
+
 def _append_evaluation_rows(file_path, rows):
     file_exists = os.path.exists(file_path) and os.path.getsize(file_path) > 0
     with open(file_path, 'a', newline='') as file_descriptor:
@@ -1431,15 +1446,18 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         os.path.join(weight_directory, "manifest.json"),
                         'w') as manifest_file:
                     json.dump(metadata, manifest_file, indent=2, sort_keys=True)
+                student_state_dict = _copy_to_cpu(student_model.state_dict())
+                teacher_state_dict = _copy_to_cpu(teacher.state_dict())
+                optimizer_state_dict = _copy_to_cpu(optimizer.state_dict())
                 torch.save(
-                    student_model.state_dict(),
+                    student_state_dict,
                     os.path.join(
                         weight_directory,
                         "student_{}.pth".format(_checkpoint_stem(args, cycle)),
                     ),
                 )
                 torch.save(
-                    teacher.state_dict(),
+                    teacher_state_dict,
                     os.path.join(
                         weight_directory,
                         "teacher_{}.pth".format(_checkpoint_stem(args, cycle)),
@@ -1448,11 +1466,11 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 checkpoint = metadata.copy()
                 checkpoint.update({
                     'epoch': epoch,
-                    'lossMIN': val_loss_list,
-                    'state_dict': student_model.state_dict(),
-                    'teacher': teacher.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': lr_scheduler.state_dict(),
+                    'lossMIN': None,
+                    'state_dict': student_state_dict,
+                    'teacher': teacher_state_dict,
+                    'optimizer': optimizer_state_dict,
+                    'scheduler': _copy_to_cpu(lr_scheduler.state_dict()),
                     'total_cycles': args.pretrain_epochs,
                     'scheduler_config': _scheduler_config(args),
                 })
