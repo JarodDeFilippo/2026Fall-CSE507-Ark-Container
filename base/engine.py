@@ -1466,7 +1466,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 checkpoint = metadata.copy()
                 checkpoint.update({
                     'epoch': epoch,
-                    'lossMIN': None,
+                    'lossMIN': val_loss_list,
                     'state_dict': student_state_dict,
                     'teacher': teacher_state_dict,
                     'optimizer': optimizer_state_dict,
