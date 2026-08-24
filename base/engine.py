@@ -1337,6 +1337,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     accelerator.synchronize_model(teacher)
     for p in teacher.parameters():
         p.requires_grad = False
+    teacher.eval()
     if accelerator.is_main_process:
         _print_and_log(
             "Student and Teacher are built: they are both {} network.".format(args.model_name),

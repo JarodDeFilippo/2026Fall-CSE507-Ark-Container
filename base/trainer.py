@@ -19,6 +19,7 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
         training_start_time = time.time()
 
     model.train()
+    teacher.eval()
     MSE = torch.nn.MSELoss()
     coff = (momentum_schedule[it] - 0.9) * 5
     if momentum is None:
