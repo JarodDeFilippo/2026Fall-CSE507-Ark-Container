@@ -90,6 +90,35 @@ def _copy_to_cpu(value):
     return value
 
 
+def _dataset_sample_signature(dataset):
+    image_paths = getattr(dataset, 'img_list', None)
+    labels = getattr(dataset, 'img_label', None)
+    if image_paths is None or labels is None or len(image_paths) != len(labels):
+        return None
+
+    records = []
+    for image_path, label in zip(image_paths, labels):
+        label_array = np.asarray(label)
+        records.append((
+            os.path.normcase(os.path.realpath(image_path)),
+            label_array.dtype.str,
+            tuple(label_array.shape),
+            label_array.tobytes(),
+        ))
+    return sorted(records)
+
+
+def _datasets_have_identical_samples(validation_dataset, test_dataset):
+    if len(validation_dataset) != len(test_dataset):
+        return False
+    validation_signature = _dataset_sample_signature(validation_dataset)
+    test_signature = _dataset_sample_signature(test_dataset)
+    return (
+        validation_signature is not None
+        and validation_signature == test_signature
+    )
+
+
 def _append_evaluation_rows(file_path, rows):
     evaluation_header = [
         "cycle",
@@ -149,6 +178,7 @@ def _evaluate_test_sets(
         cycle,
         epoch,
         evaluation_point,
+        shared_val_test_splits,
         train_log):
     student_means = []
     teacher_means = []
@@ -267,6 +297,15 @@ def _evaluate_test_sets(
             ),
             rows,
         )
+        if shared_val_test_splits[dataset_index]:
+            _append_evaluation_rows(
+                os.path.join(
+                    evaluation_directory,
+                    dataset,
+                    "val_performance.csv",
+                ),
+                rows,
+            )
         _print_and_log(
             "Test {} {}: student_mean_auroc={:.6f} "
             "teacher_mean_auroc={:.6f}{}"
@@ -307,6 +346,7 @@ def _evaluate_validation_sets(
         cycle,
         epoch,
         evaluation_point,
+        shared_val_test_splits,
         train_log):
     val_loss_list = []
     val_mean_aurocs = []
@@ -318,6 +358,17 @@ def _evaluate_validation_sets(
         )
 
     for dataset_index, dataset in enumerate(dataset_list):
+        if shared_val_test_splits[dataset_index]:
+            val_loss_list.append(None)
+            if accelerator.is_main_process:
+                _print_and_log(
+                    "Skipping separate validation evaluation for {} at {}; "
+                    "validation and test samples are identical"
+                    .format(dataset, evaluation_point),
+                    train_log,
+                )
+            continue
+
         diseases = datasets_config[dataset]['diseases']
         multiclass = (
             datasets_config[dataset]['task_type']
@@ -1401,6 +1452,16 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                                         sampler=test_sampler,
                                         num_workers=args.workers, pin_memory=accelerator.pin_memory))
 
+    shared_val_test_splits = [False] * len(dataset_list)
+    if args.mode == "train":
+        shared_val_test_splits = [
+            _datasets_have_identical_samples(validation_dataset, test_dataset)
+            for validation_dataset, test_dataset in zip(
+                dataset_val_list,
+                dataset_test_list,
+            )
+        ]
+
     num_classes_list = [len(datasets_config[dataset]['diseases']) for dataset in dataset_list]
     if accelerator.is_main_process:
         if args.mode == "train":
@@ -1424,6 +1485,20 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 dataset_test_list,
                 train_log,
             )
+            for dataset, splits_are_shared in zip(
+                    dataset_list, shared_val_test_splits):
+                _print_and_log(
+                    "Dataset {}: validation/test samples identical = {}{}"
+                    .format(
+                        dataset,
+                        splits_are_shared,
+                        (
+                            "; test evaluation will also be recorded as validation"
+                            if splits_are_shared else ""
+                        ),
+                    ),
+                    train_log,
+                )
         else:
             _print_and_log("Class Counts: {}".format(num_classes_list), train_log)
 
@@ -1790,6 +1865,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     epoch + 1,
                     epoch,
                     "after_{}".format(dataset_list[i]),
+                    shared_val_test_splits,
                     train_log,
                 )
                 val_loss_list = _evaluate_validation_sets(
@@ -1804,6 +1880,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     epoch + 1,
                     epoch,
                     "after_{}".format(dataset_list[i]),
+                    shared_val_test_splits,
                     train_log,
                 )
 
