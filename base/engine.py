@@ -336,6 +336,7 @@ def _evaluate_test_sets(
 
 def _evaluate_validation_sets(
         student_model,
+        teacher,
         dataset_list,
         datasets_config,
         data_loader_list_val,
@@ -348,18 +349,21 @@ def _evaluate_validation_sets(
         evaluation_point,
         shared_val_test_splits,
         train_log):
-    val_loss_list = []
-    val_mean_aurocs = []
+    student_val_losses = []
+    teacher_val_losses = []
+    student_mean_aurocs = []
+    teacher_mean_aurocs = []
     if accelerator.is_main_process:
         _print_and_log(
-            "Evaluating student validation sets at {} in Cycle {}"
+            "Evaluating student and teacher validation sets at {} in Cycle {}"
             .format(evaluation_point, cycle),
             train_log,
         )
 
     for dataset_index, dataset in enumerate(dataset_list):
         if shared_val_test_splits[dataset_index]:
-            val_loss_list.append(None)
+            student_val_losses.append(None)
+            teacher_val_losses.append(None)
             if accelerator.is_main_process:
                 _print_and_log(
                     "Skipping separate validation evaluation for {} at {}; "
@@ -389,26 +393,60 @@ def _evaluate_validation_sets(
             multiclass=multiclass,
             num_classes=len(diseases),
         )
+        teacher_val_loss, y_teacher_val, p_teacher_val = evaluate(
+            teacher,
+            dataset_index,
+            data_loader_list_val[dataset_index],
+            device,
+            criterion,
+            dataset,
+            return_outputs=True,
+            multiclass=multiclass,
+            num_classes=len(diseases),
+        )
         if accelerator.distributed:
             sample_count = len(val_sampler_list[dataset_index])
             val_loss_stats = torch.tensor(
-                [val_loss * sample_count, sample_count],
+                [
+                    val_loss * sample_count,
+                    teacher_val_loss * sample_count,
+                    sample_count,
+                ],
                 dtype=torch.float32,
                 device=device,
             )
             accelerator.all_reduce(val_loss_stats)
-            val_loss = (val_loss_stats[0] / val_loss_stats[1]).item()
+            val_loss = (val_loss_stats[0] / val_loss_stats[2]).item()
+            teacher_val_loss = (
+                val_loss_stats[1] / val_loss_stats[2]
+            ).item()
         y_val = torch.cat(accelerator.gather_tensor(y_val), 0)
         p_val = torch.cat(accelerator.gather_tensor(p_val), 0)
-        val_loss_list.append(val_loss)
+        y_teacher_val = torch.cat(
+            accelerator.gather_tensor(y_teacher_val), 0
+        )
+        p_teacher_val = torch.cat(
+            accelerator.gather_tensor(p_teacher_val), 0
+        )
+        student_val_losses.append(val_loss)
+        teacher_val_losses.append(teacher_val_loss)
 
         if not accelerator.is_main_process:
             continue
 
         val_auc_values = metric_AUROC(y_val, p_val, len(diseases))
+        teacher_val_auc_values = metric_AUROC(
+            y_teacher_val,
+            p_teacher_val,
+            len(diseases),
+        )
         val_mean_auc = (
             _mean_defined_metrics(val_auc_values)
             if val_auc_values else float("nan")
+        )
+        teacher_val_mean_auc = (
+            _mean_defined_metrics(teacher_val_auc_values)
+            if teacher_val_auc_values else float("nan")
         )
         val_rows = [[
             cycle,
@@ -416,7 +454,7 @@ def _evaluate_validation_sets(
             evaluation_point,
             "validation_loss",
             val_loss,
-            "",
+            teacher_val_loss,
         ]]
         val_rows.extend([
             [
@@ -424,19 +462,23 @@ def _evaluate_validation_sets(
                 epoch,
                 evaluation_point,
                 "AUC_{}".format(disease),
-                auc,
-                "",
+                student_auc,
+                teacher_auc,
             ]
-            for disease, auc in zip(diseases, val_auc_values)
+            for disease, student_auc, teacher_auc in zip(
+                diseases,
+                val_auc_values,
+                teacher_val_auc_values,
+            )
         ])
-        if val_auc_values:
+        if val_auc_values and teacher_val_auc_values:
             val_rows.append([
                 cycle,
                 epoch,
                 evaluation_point,
                 "mAUC",
                 val_mean_auc,
-                "",
+                teacher_val_mean_auc,
             ])
         _append_evaluation_rows(
             os.path.join(
@@ -447,30 +489,37 @@ def _evaluate_validation_sets(
             val_rows,
         )
         _print_and_log(
-            "Student validation {} {}: loss={:.6f} mean_auroc={:.6f}"
+            "Validation {} {}: student_loss={:.6f} teacher_loss={:.6f} "
+            "student_mean_auroc={:.6f} teacher_mean_auroc={:.6f}"
             .format(
                 evaluation_point,
                 dataset,
                 val_loss,
+                teacher_val_loss,
                 val_mean_auc,
+                teacher_val_mean_auc,
             ),
             train_log,
         )
-        val_mean_aurocs.append(val_mean_auc)
+        student_mean_aurocs.append(val_mean_auc)
+        teacher_mean_aurocs.append(teacher_val_mean_auc)
 
     if accelerator.is_main_process:
         _print_and_log(
-            "Validation summary {} Cycle={}: losses={} mean_aurocs={}"
+            "Validation summary {} Cycle={}: student_losses={} "
+            "teacher_losses={} student_mean_aurocs={} teacher_mean_aurocs={}"
             .format(
                 evaluation_point,
                 cycle,
-                val_loss_list,
-                val_mean_aurocs,
+                student_val_losses,
+                teacher_val_losses,
+                student_mean_aurocs,
+                teacher_mean_aurocs,
             ),
             train_log,
         )
     accelerator.barrier()
-    return val_loss_list
+    return student_val_losses
 
 
 def _checkpoint_cycle(file_path):
@@ -1206,7 +1255,10 @@ def print_training_configuration(args, model_path, dataset_list,
     _print_and_log("Warmup Cycles: {}".format(args.warmup_epochs), log_file)
     _print_and_log("Teacher Momentum Base: {}".format(args.momentum_teacher), log_file)
     _print_and_log("Teacher EMA Mode: {}".format(args.ema_mode), log_file)
-    _print_and_log("Validation Evaluation: after every dataset", log_file)
+    _print_and_log(
+        "Validation Evaluation: student and teacher after every dataset",
+        log_file,
+    )
     _print_and_log("Test Evaluation: after every dataset", log_file)
     _print_and_log("Saved Weights: every cycle", log_file)
     _print_and_log(
@@ -1870,6 +1922,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 )
                 val_loss_list = _evaluate_validation_sets(
                     student_model,
+                    teacher,
                     dataset_list,
                     datasets_config,
                     data_loader_list_val,
