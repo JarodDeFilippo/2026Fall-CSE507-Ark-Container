@@ -7,7 +7,6 @@ import re
 import numpy as np
 from optparse import OptionParser
 from shutil import copyfile
-from tqdm import tqdm
 
 from utils import vararg_callback_bool, vararg_callback_int, get_config
 from dataloader import  *
@@ -45,7 +44,9 @@ def get_args_parser():
         parameter for teacher update. The value is increased to 1 during training with cosine schedule.
         We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""")
     parser.add_option("--pretrain_epochs", dest="pretrain_epochs", help="num of omni-pretraining epoches", default=10, type="int")
-    parser.add_option("--test_epoch", dest="test_epoch", help="whether test after every epoch", default=1, type="int")                
+    parser.add_option("--test_epoch", dest="test_epoch",
+                      help="deprecated; test evaluation runs after every dataset",
+                      default=1, type="int")
     parser.add_option("--val_loss_metric", dest="val_loss_metric", help="which validation loss for early stop and model save (average | [dataset])", default="average", type="string")                  
     parser.add_option("--projector_features", dest="projector_features", help="num of projector features", default=None, type="int")
     parser.add_option("--use_mlp", dest="use_mlp", help="whether use mlp for projector", default=False, action="callback",
@@ -141,8 +142,6 @@ def main(args):
         random.seed(args.seed)
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
-
-    print(args)
 
     if args.mode == "train":
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

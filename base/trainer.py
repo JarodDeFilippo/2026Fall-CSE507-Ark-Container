@@ -1,26 +1,34 @@
-from utils import MetricLogger, ProgressLogger, save_image, save_snapshot
+import datetime
 import os
 import time
-import torch
-from tqdm import tqdm
 
-def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, criterion, optimizer, epoch, ema_mode, teacher, momentum_schedule, it, is_main_process=True, accelerator=None, global_step=0, momentum=None, train_log=None, loss_writer=None, loss_file=None, snapshot_directory=None):
+import torch
+
+from utils import MetricLogger, save_image
+
+
+def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, criterion, optimizer, epoch, ema_mode, teacher, momentum_schedule, it, is_main_process=True, accelerator=None, global_step=0, momentum=None, train_log=None, loss_writer=None, loss_file=None, snapshot_directory=None, print_freq=50, training_start_time=None):
+    raw_losses_cls = MetricLogger('Raw loss_'+dataset+' cls', ':.4e')
+    raw_losses_mse = MetricLogger('Raw loss_'+dataset+' mse', ':.4e')
     losses_cls = MetricLogger('Loss_'+dataset+' cls', ':.4e')
     losses_mse = MetricLogger('Loss_'+dataset+' mse', ':.4e')
     losses_total = MetricLogger('Loss_'+dataset+' total', ':.4e')
-    progress = tqdm(
-        data_loader_train,
-        desc="Train {}".format(dataset),
-        disable=not is_main_process,
-    )
+    batch_time = MetricLogger('Batch time', ':6.3f')
+    data_time = MetricLogger('Data time', ':6.3f')
+    if training_start_time is None:
+        training_start_time = time.time()
 
     model.train()
     MSE = torch.nn.MSELoss()
     coff = (momentum_schedule[it] - 0.9) * 5
     if momentum is None:
         momentum = momentum_schedule[it]
+    cls_percent = 0
+    const_percent = 0
     #print(momentum_schedule[it],it, coff)
-    for i, (samples1, samples2, targets) in enumerate(progress):
+    end = time.time()
+    for i, (samples1, samples2, targets) in enumerate(data_loader_train):
+        data_time.update(time.time() - end)
         samples1, samples2, targets = samples1.float().to(device), samples2.float().to(device), targets.float().to(device)
         
         with torch.no_grad():
@@ -47,6 +55,8 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
         batch_size = samples1.size(0)
         loss_stats = torch.tensor(
             [
+                loss_cls.item() * batch_size,
+                loss_const.item() * batch_size,
                 loss_cls_value * batch_size,
                 loss_const_value * batch_size,
                 loss.item() * batch_size,
@@ -57,10 +67,14 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
         )
         if accelerator is not None and accelerator.distributed:
             accelerator.all_reduce(loss_stats)
-        global_batch_size = int(loss_stats[3].item())
-        global_cls_value = (loss_stats[0] / loss_stats[3]).item()
-        global_const_value = (loss_stats[1] / loss_stats[3]).item()
-        global_total_value = (loss_stats[2] / loss_stats[3]).item()
+        global_batch_size = int(loss_stats[5].item())
+        global_raw_cls_value = (loss_stats[0] / loss_stats[5]).item()
+        global_raw_const_value = (loss_stats[1] / loss_stats[5]).item()
+        global_cls_value = (loss_stats[2] / loss_stats[5]).item()
+        global_const_value = (loss_stats[3] / loss_stats[5]).item()
+        global_total_value = (loss_stats[4] / loss_stats[5]).item()
+        raw_losses_cls.update(global_raw_cls_value, global_batch_size)
+        raw_losses_mse.update(global_raw_const_value, global_batch_size)
         losses_cls.update(global_cls_value, global_batch_size)
         losses_mse.update(global_const_value, global_batch_size)
         losses_total.update(global_total_value, global_batch_size)
@@ -109,32 +123,51 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
                 os.path.join(snapshot_directory, "teacher"),
             )
 
-        if (i + 1) % 50 == 0 or i + 1 == len(data_loader_train):
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if (i + 1) % print_freq == 0 or i + 1 == len(data_loader_train):
             if is_main_process:
-                progress.set_postfix(
-                    classification="{:.4e} ({:.1f}%)".format(losses_cls.avg, cls_percent),
-                    consistency="{:.4e} ({:.1f}%)".format(losses_mse.avg, const_percent),
-                    total="{:.4e} (100.0%)".format(total_loss),
+                elapsed = str(
+                    datetime.timedelta(
+                        seconds=int(time.time() - training_start_time),
+                    )
                 )
                 message = (
-                    "Cycle {:04d} | Dataset {} | Batch {:04d}/{:04d} | "
-                    "classification={:.4e} ({:.1f}%) | "
-                    "consistency={:.4e} ({:.1f}%) | total={:.4e} (100.0%)"
+                    "Ark+ {} head={} Cycle={} g_step={} [B {}/{}] "
+                    "BT={:.2f}({:.2f}) DT={:.2f}({:.2f}) "
+                    "LR={:.2e} m={:.5f} w_cons={:.3f} "
+                    "Loss={:.4f}({:.4f}) "
+                    "Cls={:.4f}({:.4f}) [{:.1f}%] "
+                    "Cons={:.4f}({:.4f}) [{:.1f}%] Elapsed={}"
                 ).format(
-                    epoch + 1,
                     dataset,
+                    use_head_n,
+                    epoch + 1,
+                    global_step + i + 1,
                     i + 1,
                     len(data_loader_train),
-                    losses_cls.avg,
-                    cls_percent,
-                    losses_mse.avg,
-                    const_percent,
+                    batch_time.val,
+                    batch_time.avg,
+                    data_time.val,
+                    data_time.avg,
+                    optimizer.param_groups[0]["lr"],
+                    momentum,
+                    coff,
+                    global_total_value,
                     total_loss,
+                    global_raw_cls_value,
+                    raw_losses_cls.avg,
+                    cls_percent,
+                    global_raw_const_value,
+                    raw_losses_mse.avg,
+                    const_percent,
+                    elapsed,
                 )
-                print(message)
                 if train_log is not None:
-                    train_log.write(message + "\n")
-                    train_log.flush()
+                    train_log.info(message)
+                else:
+                    print(message)
 
         if ema_mode == "iteration":
             ema_update_teacher(model, teacher, momentum_schedule, it)
@@ -144,8 +177,14 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
         ema_update_teacher(model, teacher, momentum_schedule, it)
         it += 1
 
-    progress.close()
-    
+    return {
+        "total_loss": losses_total.avg,
+        "classification_loss": raw_losses_cls.avg,
+        "consistency_loss": raw_losses_mse.avg,
+        "classification_percent": cls_percent,
+        "consistency_percent": const_percent,
+    }
+
 
 def ema_update_teacher(model, teacher, momentum_schedule, it):
     with torch.no_grad():
@@ -158,15 +197,10 @@ def evaluate(model, use_head_n, data_loader_val, device, criterion, dataset, ret
     model.eval()
 
     with torch.no_grad():
-        batch_time = MetricLogger('Time', ':6.3f')
         losses = MetricLogger('Loss', ':.4e')
         targets_list = []
         outputs_list = []
-        progress = ProgressLogger(
-        len(data_loader_val),
-        [batch_time, losses], prefix='Val_'+dataset+': ')
 
-        end = time.time()
         for i, (samples, _, targets) in enumerate(data_loader_val):
             samples, targets = samples.float().to(device), targets.float().to(device)
 
@@ -177,11 +211,6 @@ def evaluate(model, use_head_n, data_loader_val, device, criterion, dataset, ret
             if return_outputs:
                 targets_list.append(targets)
                 outputs_list.append(torch.softmax(outputs, dim=1) if multiclass else torch.sigmoid(outputs))
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if i % 50 == 0:
-                progress.display(i)
 
     if not return_outputs:
         return losses.avg
@@ -201,7 +230,7 @@ def test_classification(model, use_head_n, data_loader_test, device, multiclass 
     p_test = torch.empty((0, num_classes), device=device)
 
     with torch.no_grad():
-        for i, (samples, _, targets) in enumerate(tqdm(data_loader_test)):
+        for i, (samples, _, targets) in enumerate(data_loader_test):
             targets = targets.to(device)
             y_test = torch.cat((y_test, targets), 0)
 

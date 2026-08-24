@@ -8,9 +8,9 @@ import glob
 import re
 import tempfile
 import json
+import logging
 import numpy as np
 from optparse import OptionParser
-from tqdm import tqdm
 import copy
 
 
@@ -40,10 +40,40 @@ sys.setrecursionlimit(40000)
 
 
 def _print_and_log(message, log_file=None):
-    print(message)
     if log_file is not None:
-        log_file.write(message + "\n")
-        log_file.flush()
+        log_file.info(message)
+    else:
+        print(message)
+
+
+def _configure_logger(log_file=None):
+    logger = logging.getLogger("ark")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
+
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    if log_file is not None:
+        file_handler = logging.FileHandler(log_file, mode='a')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    return logger
+
+
+def _close_logger(logger):
+    if logger is None:
+        return
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
 
 
 def _copy_to_cpu(value):
@@ -62,12 +92,208 @@ def _copy_to_cpu(value):
 
 
 def _append_evaluation_rows(file_path, rows):
+    evaluation_header = [
+        "cycle",
+        "epoch",
+        "evaluation_point",
+        "metric",
+        "student",
+        "teacher",
+    ]
     file_exists = os.path.exists(file_path) and os.path.getsize(file_path) > 0
+    if file_exists:
+        with open(file_path, 'r', newline='') as file_descriptor:
+            existing_rows = list(csv.reader(file_descriptor))
+        if existing_rows and existing_rows[0] == [
+                "cycle",
+                "epoch",
+                "metric",
+                "student",
+                "teacher",
+        ]:
+            with tempfile.NamedTemporaryFile(
+                    mode='w',
+                    dir=os.path.dirname(file_path),
+                    newline='',
+                    delete=False) as temporary_file:
+                writer = csv.writer(temporary_file)
+                writer.writerow(evaluation_header)
+                for existing_row in existing_rows[1:]:
+                    if len(existing_row) == 5:
+                        existing_row = [
+                            existing_row[0],
+                            existing_row[1],
+                            "",
+                            existing_row[2],
+                            existing_row[3],
+                            existing_row[4],
+                        ]
+                    writer.writerow(existing_row)
+                temporary_path = temporary_file.name
+            os.replace(temporary_path, file_path)
     with open(file_path, 'a', newline='') as file_descriptor:
         writer = csv.writer(file_descriptor)
         if not file_exists:
-            writer.writerow(["cycle", "epoch", "metric", "student", "teacher"])
+            writer.writerow(evaluation_header)
         writer.writerows(rows)
+
+
+def _evaluate_test_sets(
+        student_model,
+        teacher,
+        dataset_list,
+        datasets_config,
+        data_loader_list_test,
+        device,
+        accelerator,
+        evaluation_directory,
+        cycle,
+        epoch,
+        evaluation_point,
+        train_log):
+    student_means = []
+    teacher_means = []
+    if accelerator.is_main_process:
+        _print_and_log(
+            "Evaluating student and teacher test sets at {} in Cycle {}"
+            .format(evaluation_point, cycle),
+            train_log,
+        )
+
+    for dataset_index, dataset in enumerate(dataset_list):
+        diseases = datasets_config[dataset]['diseases']
+        multiclass = (
+            datasets_config[dataset]['task_type']
+            == "multi-class classification"
+        )
+        y_student, p_student = test_classification(
+            student_model,
+            dataset_index,
+            data_loader_list_test[dataset_index],
+            device,
+            multiclass,
+            len(diseases),
+        )
+        y_teacher, p_teacher = test_classification(
+            teacher,
+            dataset_index,
+            data_loader_list_test[dataset_index],
+            device,
+            multiclass,
+            len(diseases),
+        )
+        y_student = torch.cat(accelerator.gather_tensor(y_student), 0)
+        p_student = torch.cat(accelerator.gather_tensor(p_student), 0)
+        y_teacher = torch.cat(accelerator.gather_tensor(y_teacher), 0)
+        p_teacher = torch.cat(accelerator.gather_tensor(p_teacher), 0)
+        if not accelerator.is_main_process:
+            continue
+
+        if dataset == "CheXpert":
+            performance_diseases = datasets_config[dataset]['test_diseases_name']
+            performance_indices = [
+                diseases.index(name) for name in performance_diseases
+            ]
+            y_student = y_student[:, performance_indices]
+            p_student = p_student[:, performance_indices]
+            y_teacher = y_teacher[:, performance_indices]
+            p_teacher = p_teacher[:, performance_indices]
+        else:
+            performance_diseases = diseases
+
+        student_auc = metric_AUROC(
+            y_student,
+            p_student,
+            len(performance_diseases),
+        )
+        teacher_auc = metric_AUROC(
+            y_teacher,
+            p_teacher,
+            len(performance_diseases),
+        )
+        rows = []
+        accuracy_message = ""
+        if multiclass:
+            student_accuracy = accuracy_score(
+                np.argmax(y_student.cpu().numpy(), axis=1),
+                np.argmax(p_student.cpu().numpy(), axis=1),
+            )
+            teacher_accuracy = accuracy_score(
+                np.argmax(y_teacher.cpu().numpy(), axis=1),
+                np.argmax(p_teacher.cpu().numpy(), axis=1),
+            )
+            rows.append([
+                cycle,
+                epoch,
+                evaluation_point,
+                "accuracy",
+                student_accuracy,
+                teacher_accuracy,
+            ])
+            accuracy_message = (
+                " student_accuracy={:.6f} teacher_accuracy={:.6f}"
+                .format(student_accuracy, teacher_accuracy)
+            )
+
+        rows.extend([
+            [
+                cycle,
+                epoch,
+                evaluation_point,
+                "AUC_{}".format(disease),
+                student_value,
+                teacher_value,
+            ]
+            for disease, student_value, teacher_value in zip(
+                performance_diseases,
+                student_auc,
+                teacher_auc,
+            )
+        ])
+        student_mean = _mean_defined_metrics(student_auc)
+        teacher_mean = _mean_defined_metrics(teacher_auc)
+        rows.append([
+            cycle,
+            epoch,
+            evaluation_point,
+            "mAUC",
+            student_mean,
+            teacher_mean,
+        ])
+        _append_evaluation_rows(
+            os.path.join(
+                evaluation_directory,
+                dataset,
+                "test_performance.csv",
+            ),
+            rows,
+        )
+        _print_and_log(
+            "Test {} {}: student_mean_auroc={:.6f} "
+            "teacher_mean_auroc={:.6f}{}"
+            .format(
+                evaluation_point,
+                dataset,
+                student_mean,
+                teacher_mean,
+                accuracy_message,
+            ),
+            train_log,
+        )
+        student_means.append(student_mean)
+        teacher_means.append(teacher_mean)
+
+    if accelerator.is_main_process:
+        _print_and_log(
+            "Test summary {} Cycle={}: Student={} Teacher={}".format(
+                evaluation_point,
+                cycle,
+                student_means,
+                teacher_means,
+            ),
+            train_log,
+        )
+    accelerator.barrier()
 
 
 def _checkpoint_cycle(file_path):
@@ -216,7 +442,11 @@ def _trim_train_log_through_cycle(file_path, max_cycle):
         lines = file_descriptor.readlines()
     filtered_lines = []
     for line in lines:
-        match = re.match(r"^Cycle\s+(\d+)(?::|\s+\|)", line)
+        match = re.match(
+            r"^(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} INFO )?"
+            r"Cycle\s+(\d+)(?::|\s+\|)",
+            line,
+        )
         if match and int(match.group(1)) > max_cycle:
             break
         filtered_lines.append(line)
@@ -705,7 +935,63 @@ def print_label_summary(dataset_list, datasets_config, dataset_train_list, datas
                     )
 
 
+def print_training_configuration(args, model_path, dataset_list,
+                                 dataset_train_list, dataset_val_list,
+                                 dataset_test_list, num_classes_list,
+                                 train_batch_size, accelerator, log_file=None):
+    separator = "=" * 80
+    _print_and_log(separator, log_file)
+    _print_and_log("ARK+ PRETRAINING CONFIGURATION", log_file)
+    _print_and_log(separator, log_file)
+    _print_and_log("Run Name: {}".format(args.exp_name), log_file)
+    _print_and_log("Seed: {}".format(args.seed), log_file)
+    _print_and_log("Output Directory: {}".format(os.path.abspath(model_path)), log_file)
+    _print_and_log("Backbone: {}".format(args.model_name), log_file)
+    _print_and_log("Initialization: {}".format(args.init), log_file)
+    _print_and_log("Pretrained Weights: {}".format(bool(args.pretrained_weights)), log_file)
+    _print_and_log("Projector Features: {}".format(args.projector_features), log_file)
+    _print_and_log("Datasets: {}".format(dataset_list), log_file)
+    _print_and_log("Class Counts: {}".format(num_classes_list), log_file)
+    _print_and_log("Global Batch Size: {}".format(args.batch_size), log_file)
+    _print_and_log("Per-rank Batch Size: {}".format(train_batch_size), log_file)
+    _print_and_log("Distributed World Size: {}".format(accelerator.world_size), log_file)
+    _print_and_log("Data Loader Workers Per Rank: {}".format(args.workers), log_file)
+    _print_and_log("Cycles: {}".format(args.pretrain_epochs), log_file)
+    _print_and_log("Optimizer: {}".format(args.opt), log_file)
+    _print_and_log("Configured Learning Rate: {}".format(args.lr), log_file)
+    _print_and_log("Warmup Cycles: {}".format(args.warmup_epochs), log_file)
+    _print_and_log("Teacher Momentum Base: {}".format(args.momentum_teacher), log_file)
+    _print_and_log("Teacher EMA Mode: {}".format(args.ema_mode), log_file)
+    _print_and_log("Validation Evaluation: every cycle", log_file)
+    _print_and_log("Test Evaluation: after every dataset", log_file)
+    _print_and_log("Saved Weights: every cycle", log_file)
+    _print_and_log(
+        "Resumable Checkpoints: every 10 cycles plus the latest completed cycle",
+        log_file,
+    )
+    _print_and_log("Precision: fp32", log_file)
+    _print_and_log("Device: {}".format(accelerator.device), log_file)
+    for dataset, train_dataset, val_dataset, test_dataset, num_classes in zip(
+            dataset_list,
+            dataset_train_list,
+            dataset_val_list,
+            dataset_test_list,
+            num_classes_list):
+        _print_and_log(
+            "Dataset {}: train={:,} val={:,} test={:,} labels={}".format(
+                dataset,
+                len(train_dataset),
+                len(val_dataset),
+                len(test_dataset),
+                num_classes,
+            ),
+            log_file,
+        )
+    _print_and_log(separator, log_file)
+
+
 def omni_engine(args, model_path, output_path, dataset_list, datasets_config, dataset_train_list, dataset_val_list, dataset_test_list):
+    training_start_time = time.time()
     accelerator = Accelerator(args.device)
     accelerator.initialize_distributed()
     device = accelerator.device
@@ -851,9 +1137,9 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     train_log = None
     loss_file = None
     loss_writer = None
+    if accelerator.is_main_process:
+        train_log = _configure_logger(log_file if args.mode == "train" else None)
     if args.mode == "train" and accelerator.is_main_process:
-        train_log = open(log_file, 'a', buffering=1)
-        train_log.write(str(args) + "\n")
         loss_csv_path = os.path.join(output_path, "loss.csv")
         loss_csv_exists = os.path.exists(loss_csv_path) and os.path.getsize(loss_csv_path) > 0
         loss_file = open(loss_csv_path, 'a', newline='')
@@ -924,8 +1210,19 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
 
     num_classes_list = [len(datasets_config[dataset]['diseases']) for dataset in dataset_list]
     if accelerator.is_main_process:
-        _print_and_log("num_classes_list: {}".format(num_classes_list), train_log)
         if args.mode == "train":
+            print_training_configuration(
+                args,
+                model_path,
+                dataset_list,
+                dataset_train_list,
+                dataset_val_list,
+                dataset_test_list,
+                num_classes_list,
+                train_batch_size,
+                accelerator,
+                train_log,
+            )
             print_label_summary(
                 dataset_list,
                 datasets_config,
@@ -934,6 +1231,8 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 dataset_test_list,
                 train_log,
             )
+        else:
+            _print_and_log("Class Counts: {}".format(num_classes_list), train_log)
 
 
     # training setups
@@ -1192,7 +1491,6 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         #         }
         #     )
 
-        test_results,test_results_teacher = [],[]
         it = start_epoch * len(dataset_list)
         global_step = start_epoch * sum(len(data_loader) for data_loader in data_loader_list_train)
         
@@ -1235,7 +1533,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 )
                 if accelerator.is_main_process:
                     os.makedirs(snapshot_directory, exist_ok=True)
-                train_one_epoch(
+                task_metrics = train_one_epoch(
                     model,
                     i,
                     dataset_list[i],
@@ -1256,11 +1554,48 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     loss_writer,
                     loss_file,
                     snapshot_directory,
+                    args.print_freq,
+                    training_start_time,
                 )
+                if accelerator.is_main_process:
+                    _print_and_log(
+                        "Finished {} Cycle={}: Loss={:.4f} "
+                        "Cls={:.4f} [{:.1f}%] Cons={:.4f} [{:.1f}%] m={:.5f}"
+                        .format(
+                            dataset_list[i],
+                            epoch + 1,
+                            task_metrics["total_loss"],
+                            task_metrics["classification_loss"],
+                            task_metrics["classification_percent"],
+                            task_metrics["consistency_loss"],
+                            task_metrics["consistency_percent"],
+                            momentum,
+                        ),
+                        train_log,
+                    )
                 it += 1
                 global_step += len(data_loader)
+                _evaluate_test_sets(
+                    student_model,
+                    teacher,
+                    dataset_list,
+                    datasets_config,
+                    data_loader_list_test,
+                    device,
+                    accelerator,
+                    evaluation_directory,
+                    epoch + 1,
+                    epoch,
+                    "after_{}".format(dataset_list[i]),
+                    train_log,
+                )
 
             accelerator.barrier()
+            if accelerator.is_main_process:
+                _print_and_log(
+                    "Evaluating validation sets after Cycle {}".format(epoch + 1),
+                    train_log,
+                )
             val_loss_list = []
             for i, dv in enumerate(data_loader_list_val):
                 dataset = dataset_list[i]
@@ -1291,14 +1626,49 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 p_val = torch.cat(accelerator.gather_tensor(p_val), 0)
                 if accelerator.is_main_process:
                     val_auc_values = metric_AUROC(y_val, p_val, len(diseases))
-                    val_rows = [[epoch + 1, epoch, "validation_loss", val_loss, ""]]
+                    val_mean_auc = (
+                        _mean_defined_metrics(val_auc_values)
+                        if val_auc_values else float("nan")
+                    )
+                    val_rows = [[
+                        epoch + 1,
+                        epoch,
+                        "epoch",
+                        "validation_loss",
+                        val_loss,
+                        "",
+                    ]]
                     for disease, auc in zip(diseases, val_auc_values):
-                        val_rows.append([epoch + 1, epoch, "AUC_{}".format(disease), auc, ""])
+                        val_rows.append([
+                            epoch + 1,
+                            epoch,
+                            "epoch",
+                            "AUC_{}".format(disease),
+                            auc,
+                            "",
+                        ])
                     if val_auc_values:
-                        val_rows.append([epoch + 1, epoch, "mAUC", _mean_defined_metrics(val_auc_values), ""])
+                        val_rows.append([
+                            epoch + 1,
+                            epoch,
+                            "epoch",
+                            "mAUC",
+                            val_mean_auc,
+                            "",
+                        ])
                     _append_evaluation_rows(
                         os.path.join(evaluation_directory, dataset, "val_performance.csv"),
                         val_rows,
+                    )
+                    _print_and_log(
+                        "Student validation Cycle={} {}: loss={:.6f} "
+                        "mean_auroc={:.6f}".format(
+                            epoch + 1,
+                            dataset,
+                            val_loss,
+                            val_mean_auc,
+                        ),
+                        train_log,
                     )
                 val_loss_list.append(val_loss)
             
@@ -1320,115 +1690,9 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     train_log,
                 )
 
-                if train_log is not None:
-                    train_log.write("     Datasets  : " + str(dataset_list) + "\n")
-                    train_log.write("     Val Losses: " + str(val_loss_list) + "\n")
-                    train_log.flush()
+                _print_and_log("Datasets: {}".format(dataset_list), train_log)
+                _print_and_log("Validation Losses: {}".format(val_loss_list), train_log)
   
-            if epoch % args.test_epoch == 0 or epoch+1 == args.pretrain_epochs:
-                t_res, t_res_teacher = [],[]
-                for i, dataset in enumerate(dataset_list):
-                    diseases = datasets_config[dataset]['diseases']
-
-                    multiclass =  datasets_config[dataset]['task_type'] == "multi-class classification"
-                    y_test, p_test = test_classification(student_model, i, data_loader_list_test[i], device, multiclass, len(diseases))
-                    y_test_teacher, p_test_teacher = test_classification(teacher, i, data_loader_list_test[i], device, multiclass, len(diseases))
-                    y_test = torch.cat(accelerator.gather_tensor(y_test), 0)
-                    p_test = torch.cat(accelerator.gather_tensor(p_test), 0)
-                    y_test_teacher = torch.cat(accelerator.gather_tensor(y_test_teacher), 0)
-                    p_test_teacher = torch.cat(accelerator.gather_tensor(p_test_teacher), 0)
-                    if not accelerator.is_main_process:
-                        continue
-                    if multiclass:
-                        acc = accuracy_score(np.argmax(y_test.cpu().numpy(),axis=1),np.argmax(p_test.cpu().numpy(),axis=1))
-                        acc_teacher = accuracy_score(np.argmax(y_test_teacher.cpu().numpy(),axis=1),np.argmax(p_test_teacher.cpu().numpy(),axis=1))
-                        _print_and_log(
-                            ">>{}:Student ACCURACY = {}, \nTeacher ACCURACY = {}\n".format(
-                                dataset,
-                                acc,
-                                acc_teacher,
-                            ),
-                            train_log,
-                        )
-                        _append_evaluation_rows(
-                            os.path.join(evaluation_directory, dataset, "test_performance.csv"),
-                            [[epoch + 1, epoch, "accuracy", acc, acc_teacher]],
-                        )
-                        t_res.append(acc)
-                        t_res_teacher.append(acc_teacher)
-
-                    if dataset == "CheXpert":
-                        test_diseases_name = datasets_config['CheXpert']['test_diseases_name']
-                        test_diseases = [diseases.index(c) for c in test_diseases_name]
-                        performance_diseases = test_diseases_name
-                        y_test = copy.deepcopy(y_test[:,test_diseases])
-                        p_test = copy.deepcopy(p_test[:, test_diseases])
-                        individual_results = metric_AUROC(y_test, p_test, len(test_diseases))
-                        y_test_teacher = copy.deepcopy(y_test_teacher[:,test_diseases])
-                        p_test_teacher = copy.deepcopy(p_test_teacher[:, test_diseases])
-                        individual_results_teacher = metric_AUROC(y_test_teacher, p_test_teacher, len(test_diseases))
-                    else:
-                        performance_diseases = diseases
-                        individual_results = metric_AUROC(y_test, p_test, len(diseases))
-                        individual_results_teacher = metric_AUROC(y_test_teacher, p_test_teacher, len(diseases))
-                    _print_and_log(
-                        ">>{}:Student AUC = {}, \nTeacher AUC = {}\n".format(
-                            dataset,
-                            np.array2string(np.array(individual_results), precision=4, separator='\t'),
-                            np.array2string(np.array(individual_results_teacher), precision=4, separator='\t'),
-                        ),
-                        train_log,
-                    )
-                    test_rows = [
-                        [
-                            epoch + 1,
-                            epoch,
-                            "AUC_{}".format(disease),
-                            student_auc,
-                            teacher_auc,
-                        ]
-                        for disease, student_auc, teacher_auc in zip(
-                            performance_diseases,
-                            individual_results,
-                            individual_results_teacher,
-                        )
-                    ]
-                    mean_over_all_classes = _mean_defined_metrics(individual_results)
-                    mean_over_all_classes_teacher = _mean_defined_metrics(individual_results_teacher)
-                    _print_and_log(
-                        ">>{}: Student mAUC = {:.4f}, Teacher mAUC = {:.4f}".format(
-                            dataset,
-                            mean_over_all_classes,
-                            mean_over_all_classes_teacher,
-                        ),
-                        train_log,
-                    )
-                    test_rows.append([
-                        epoch + 1,
-                        epoch,
-                        "mAUC",
-                        mean_over_all_classes,
-                        mean_over_all_classes_teacher,
-                    ])
-                    _append_evaluation_rows(
-                        os.path.join(evaluation_directory, dataset, "test_performance.csv"),
-                        test_rows,
-                    )
-                    t_res.append(mean_over_all_classes)
-                    t_res_teacher.append(mean_over_all_classes_teacher)
-
-                if accelerator.is_main_process:
-                    test_results.append(t_res)
-                    test_results_teacher.append(t_res_teacher)
-        
-                    _print_and_log(
-                        "Omni-pretraining stage: \nStudent meanAUC = \n{} \nTeacher meanAUC = \n{}\n".format(
-                            test_results,
-                            test_results_teacher,
-                        ),
-                        train_log,
-                    )
-
             cycle = epoch + 1
             if accelerator.is_main_process:
                 weight_directory = os.path.join(
@@ -1491,8 +1755,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         accelerator.barrier()
     if loss_file is not None:
         loss_file.close()
-    if train_log is not None:
-        train_log.close()
+    _close_logger(train_log)
     accelerator.destroy_distributed()
 
     

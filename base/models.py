@@ -1,3 +1,5 @@
+import logging
+
 import torch
 import torch.nn as nn
 from functools import partial
@@ -10,6 +12,9 @@ from convnext import ConvNeXt
 from timm.models.helpers import load_state_dict
 
 from utils import remap_pretrained_keys_swin
+
+
+logger = logging.getLogger("ark")
 
 
 class ArkSwinTransformer(swin.SwinTransformer):
@@ -98,7 +103,7 @@ def build_omni_model_from_checkpoint(args, num_classes_list, key):
                     state_dict = {k.replace('module.', ''): v for k, v in state_dict.items() if k.startswith('module.')}
 
         msg = model.load_state_dict(state_dict, strict=False)
-        print('Loaded with msg: {}'.format(msg))     
+        logger.info('Loaded with msg: {}'.format(msg))
            
     return model
 
@@ -131,12 +136,12 @@ def build_omni_model(args, num_classes_list):
         for k in state_dict.keys():
             if "attn_mask" in k:
                 k_del.append(k)
-        print(f"Removing key {k_del} from pretrained checkpoint")
+        logger.info("Removing key {} from pretrained checkpoint".format(k_del))
         for k in k_del:
             del state_dict[k]
             
         msg = model.load_state_dict(state_dict, strict=False)
-        print('Loaded with msg: {}'.format(msg))
+        logger.info('Loaded with msg: {}'.format(msg))
 
     return model
 
