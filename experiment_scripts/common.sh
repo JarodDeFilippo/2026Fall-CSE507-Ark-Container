@@ -107,7 +107,6 @@ ark_launch_experiment() {
     local training_args=(
         --opt sgd
         --warmup-epochs 20
-        --lr 0.3
         --batch_size 200
         --model swin_base
         --init imagenet

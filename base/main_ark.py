@@ -47,7 +47,9 @@ def get_args_parser():
     parser.add_option("--test_epoch", dest="test_epoch",
                       help="deprecated; test evaluation runs after every dataset",
                       default=1, type="int")
-    parser.add_option("--val_loss_metric", dest="val_loss_metric", help="which validation loss for early stop and model save (average | [dataset])", default="average", type="string")                  
+    parser.add_option("--val_loss_metric", dest="val_loss_metric",
+                      help="deprecated; validation loss does not control the LR schedule",
+                      default="average", type="string")
     parser.add_option("--projector_features", dest="projector_features", help="num of projector features", default=None, type="int")
     parser.add_option("--use_mlp", dest="use_mlp", help="whether use mlp for projector", default=False, action="callback",
                       callback=vararg_callback_bool)
@@ -66,24 +68,24 @@ def get_args_parser():
                         help='weight decay (default: 0.05)')
     # Learning rate schedule parameters
     parser.add_option('--sched', default='cosine', type=str, metavar='SCHEDULER',
-                        help='LR scheduler (default: "cosine"')
+                        help='deprecated; LR uses linear warmup and cosine decay')
     parser.add_option('--lr', type=float, default=1e-2, metavar='LR',
-                        help='learning rate (default: 5e-4)')
+                        help='peak learning rate (default: 0.01)')
     parser.add_option('--lr-noise', type=float, nargs='+', default=None, metavar='pct, pct',
                         help='learning rate noise on/off epoch percentages')
     parser.add_option('--lr-noise-pct', type=float, default=0.67, metavar='PERCENT',
                         help='learning rate noise limit percent (default: 0.67)')
     parser.add_option('--lr-noise-std', type=float, default=1.0, metavar='STDDEV',
                         help='learning rate noise std-dev (default: 1.0)')
-    parser.add_option('--warmup-lr', type=float, default=1e-6, metavar='LR',
-                        help='warmup learning rate (default: 1e-6)')
+    parser.add_option('--warmup-lr', type=float, default=1e-4, metavar='LR',
+                        help='initial learning rate (default: 0.0001)')
     parser.add_option('--min-lr', type=float, default=1e-5, metavar='LR',
-                        help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
+                        help='final learning rate (default: 0.00001)')
 
     parser.add_option('--decay-epochs', type=float, default=30, metavar='N',
                         help='epoch interval to decay LR')
-    parser.add_option('--warmup-epochs', type=int, default=0, metavar='N',
-                        help='epochs to warmup LR, if scheduler supports')
+    parser.add_option('--warmup-epochs', type=int, default=2, metavar='N',
+                        help='cycles for linear LR warmup (default: 2)')
     parser.add_option('--cooldown-epochs', type=int, default=10, metavar='N',
                         help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
     parser.add_option('--decay-rate', '--dr', type=float, default=0.5, metavar='RATE',

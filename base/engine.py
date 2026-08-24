@@ -27,7 +27,6 @@ from trainer import train_one_epoch, test_classification, evaluate
 #import segmentation_models_pytorch as smp
 from utils import cosine_anneal_schedule,dice,mean_dice_coef
 
-from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
@@ -377,23 +376,88 @@ def _checkpoint_run_directory(checkpoint_path):
 
 def _scheduler_config(args):
     return {
+        'schedule': 'linear_warmup_cosine_decay',
         'pretrain_epochs': args.pretrain_epochs,
-        'sched': args.sched,
-        'lr': args.lr,
-        'lr_noise': args.lr_noise,
-        'lr_noise_pct': args.lr_noise_pct,
-        'lr_noise_std': args.lr_noise_std,
+        'peak_lr': args.lr,
         'warmup_lr': args.warmup_lr,
         'min_lr': args.min_lr,
-        'decay_epochs': args.decay_epochs,
         'warmup_epochs': args.warmup_epochs,
-        'cooldown_epochs': args.cooldown_epochs,
-        'decay_rate': args.decay_rate,
-        'patience_epochs': args.patience_epochs,
-        'ema_mode': args.ema_mode,
-        'momentum_teacher': args.momentum_teacher,
-        'batch_size': args.batch_size,
     }
+
+
+class WarmupCosineScheduler:
+    """Cycle-based linear warmup followed by cosine learning-rate decay."""
+
+    def __init__(self, optimizer, total_cycles, warmup_cycles, start_lr,
+                 peak_lr, end_lr):
+        if total_cycles < 3:
+            raise ValueError("The learning-rate schedule requires at least 3 cycles")
+        if warmup_cycles < 2 or warmup_cycles >= total_cycles:
+            raise ValueError(
+                "warmup_epochs must be at least 2 and less than pretrain_epochs"
+            )
+        if start_lr > peak_lr or end_lr > peak_lr:
+            raise ValueError(
+                "warmup_lr and min_lr must not exceed the peak learning rate"
+            )
+
+        self.optimizer = optimizer
+        self.total_cycles = total_cycles
+        self.warmup_cycles = warmup_cycles
+        self.start_lr = start_lr
+        self.peak_lr = peak_lr
+        self.end_lr = end_lr
+        self.last_cycle = -1
+
+    def learning_rate(self, cycle):
+        if cycle < 0 or cycle >= self.total_cycles:
+            raise ValueError(
+                "Cycle {} is outside the configured range [0, {})".format(
+                    cycle, self.total_cycles
+                )
+            )
+
+        if cycle < self.warmup_cycles:
+            warmup_progress = cycle / float(self.warmup_cycles - 1)
+            return self.start_lr + (
+                self.peak_lr - self.start_lr
+            ) * warmup_progress
+
+        decay_cycles = self.total_cycles - self.warmup_cycles
+        decay_progress = (
+            cycle - self.warmup_cycles + 1
+        ) / float(decay_cycles)
+        return self.end_lr + 0.5 * (
+            self.peak_lr - self.end_lr
+        ) * (1.0 + np.cos(np.pi * decay_progress))
+
+    def step(self, cycle):
+        learning_rate = self.learning_rate(cycle)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = learning_rate
+        self.last_cycle = cycle
+        return learning_rate
+
+    def state_dict(self):
+        return {
+            'last_cycle': self.last_cycle,
+            'total_cycles': self.total_cycles,
+            'warmup_cycles': self.warmup_cycles,
+            'start_lr': self.start_lr,
+            'peak_lr': self.peak_lr,
+            'end_lr': self.end_lr,
+        }
+
+    def load_state_dict(self, state_dict):
+        expected = self.state_dict()
+        for key in (
+                'total_cycles', 'warmup_cycles', 'start_lr', 'peak_lr',
+                'end_lr'):
+            if state_dict.get(key) != expected[key]:
+                raise ValueError(
+                    "Learning-rate scheduler state has incompatible {}".format(key)
+                )
+        self.last_cycle = state_dict.get('last_cycle', -1)
 
 
 def _validate_checkpoint_total_cycles(checkpoint, file_path, args):
@@ -958,7 +1022,9 @@ def print_training_configuration(args, model_path, dataset_list,
     _print_and_log("Data Loader Workers Per Rank: {}".format(args.workers), log_file)
     _print_and_log("Cycles: {}".format(args.pretrain_epochs), log_file)
     _print_and_log("Optimizer: {}".format(args.opt), log_file)
-    _print_and_log("Configured Learning Rate: {}".format(args.lr), log_file)
+    _print_and_log("Initial Learning Rate: {}".format(args.warmup_lr), log_file)
+    _print_and_log("Peak Learning Rate: {}".format(args.lr), log_file)
+    _print_and_log("Final Learning Rate: {}".format(args.min_lr), log_file)
     _print_and_log("Warmup Cycles: {}".format(args.warmup_epochs), log_file)
     _print_and_log("Teacher Momentum Base: {}".format(args.momentum_teacher), log_file)
     _print_and_log("Teacher EMA Mode: {}".format(args.ema_mode), log_file)
@@ -1292,7 +1358,14 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             momentum_schedule = cosine_scheduler(args.momentum_teacher, 1,
                                                    args.pretrain_epochs, iters_per_epoch)
         optimizer = create_optimizer(args, model)
-        lr_scheduler, _ = create_scheduler(args, optimizer)
+        lr_scheduler = WarmupCosineScheduler(
+            optimizer,
+            total_cycles=args.pretrain_epochs,
+            warmup_cycles=args.warmup_epochs,
+            start_lr=args.warmup_lr,
+            peak_lr=args.lr,
+            end_lr=args.min_lr,
+        )
 
     start_epoch = 0
     init_loss = 999999
@@ -1495,6 +1568,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         global_step = start_epoch * sum(len(data_loader) for data_loader in data_loader_list_train)
         
         for epoch in range(start_epoch, args.pretrain_epochs):
+            lr_scheduler.step(epoch)
             if accelerator.is_main_process:
                 learning_rates = [
                     "{:.8e}".format(param_group["lr"])
@@ -1673,11 +1747,6 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 val_loss_list.append(val_loss)
             
             avg_val_loss = np.average(val_loss_list)
-            if args.val_loss_metric == "average":
-                val_loss_metric = avg_val_loss
-            else:
-                val_loss_metric = val_loss_list[dataset_list.index(args.val_loss_metric)]
-            lr_scheduler.step(val_loss_metric)
             
             # wandb.log({"avg_val_loss": avg_val_loss})
             
