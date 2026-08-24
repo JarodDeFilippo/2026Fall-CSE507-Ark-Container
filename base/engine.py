@@ -295,6 +295,133 @@ def _evaluate_test_sets(
     accelerator.barrier()
 
 
+def _evaluate_validation_sets(
+        student_model,
+        dataset_list,
+        datasets_config,
+        data_loader_list_val,
+        val_sampler_list,
+        device,
+        accelerator,
+        evaluation_directory,
+        cycle,
+        epoch,
+        evaluation_point,
+        train_log):
+    val_loss_list = []
+    val_mean_aurocs = []
+    if accelerator.is_main_process:
+        _print_and_log(
+            "Evaluating student validation sets at {} in Cycle {}"
+            .format(evaluation_point, cycle),
+            train_log,
+        )
+
+    for dataset_index, dataset in enumerate(dataset_list):
+        diseases = datasets_config[dataset]['diseases']
+        multiclass = (
+            datasets_config[dataset]['task_type']
+            == "multi-class classification"
+        )
+        criterion = (
+            torch.nn.CrossEntropyLoss()
+            if multiclass else torch.nn.BCEWithLogitsLoss()
+        )
+        val_loss, y_val, p_val = evaluate(
+            student_model,
+            dataset_index,
+            data_loader_list_val[dataset_index],
+            device,
+            criterion,
+            dataset,
+            return_outputs=True,
+            multiclass=multiclass,
+            num_classes=len(diseases),
+        )
+        if accelerator.distributed:
+            sample_count = len(val_sampler_list[dataset_index])
+            val_loss_stats = torch.tensor(
+                [val_loss * sample_count, sample_count],
+                dtype=torch.float32,
+                device=device,
+            )
+            accelerator.all_reduce(val_loss_stats)
+            val_loss = (val_loss_stats[0] / val_loss_stats[1]).item()
+        y_val = torch.cat(accelerator.gather_tensor(y_val), 0)
+        p_val = torch.cat(accelerator.gather_tensor(p_val), 0)
+        val_loss_list.append(val_loss)
+
+        if not accelerator.is_main_process:
+            continue
+
+        val_auc_values = metric_AUROC(y_val, p_val, len(diseases))
+        val_mean_auc = (
+            _mean_defined_metrics(val_auc_values)
+            if val_auc_values else float("nan")
+        )
+        val_rows = [[
+            cycle,
+            epoch,
+            evaluation_point,
+            "validation_loss",
+            val_loss,
+            "",
+        ]]
+        val_rows.extend([
+            [
+                cycle,
+                epoch,
+                evaluation_point,
+                "AUC_{}".format(disease),
+                auc,
+                "",
+            ]
+            for disease, auc in zip(diseases, val_auc_values)
+        ])
+        if val_auc_values:
+            val_rows.append([
+                cycle,
+                epoch,
+                evaluation_point,
+                "mAUC",
+                val_mean_auc,
+                "",
+            ])
+        _append_evaluation_rows(
+            os.path.join(
+                evaluation_directory,
+                dataset,
+                "val_performance.csv",
+            ),
+            val_rows,
+        )
+        _print_and_log(
+            "Student validation {} {}: loss={:.6f} mean_auroc={:.6f}"
+            .format(
+                evaluation_point,
+                dataset,
+                val_loss,
+                val_mean_auc,
+            ),
+            train_log,
+        )
+        val_mean_aurocs.append(val_mean_auc)
+
+    if accelerator.is_main_process:
+        _print_and_log(
+            "Validation summary {} Cycle={}: losses={} mean_aurocs={}"
+            .format(
+                evaluation_point,
+                cycle,
+                val_loss_list,
+                val_mean_aurocs,
+            ),
+            train_log,
+        )
+    accelerator.barrier()
+    return val_loss_list
+
+
 def _checkpoint_cycle(file_path):
     match = re.fullmatch(r"cycle_(\d+)(?:_[^/]+)?\.pth\.tar", os.path.basename(file_path))
     return int(match.group(1)) if match else None
@@ -1028,7 +1155,7 @@ def print_training_configuration(args, model_path, dataset_list,
     _print_and_log("Warmup Cycles: {}".format(args.warmup_epochs), log_file)
     _print_and_log("Teacher Momentum Base: {}".format(args.momentum_teacher), log_file)
     _print_and_log("Teacher EMA Mode: {}".format(args.ema_mode), log_file)
-    _print_and_log("Validation Evaluation: every cycle", log_file)
+    _print_and_log("Validation Evaluation: after every dataset", log_file)
     _print_and_log("Test Evaluation: after every dataset", log_file)
     _print_and_log("Saved Weights: every cycle", log_file)
     _print_and_log(
@@ -1580,6 +1707,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         epoch + 1, ", ".join(learning_rates)),
                     train_log,
                 )
+            val_loss_list = None
             for i, data_loader in enumerate(data_loader_list_train): 
                 if train_sampler_list[i] is not None:
                     train_sampler_list[i].set_epoch(epoch)
@@ -1664,105 +1792,21 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     "after_{}".format(dataset_list[i]),
                     train_log,
                 )
-
-            accelerator.barrier()
-            if accelerator.is_main_process:
-                _print_and_log(
-                    "Evaluating validation sets after Cycle {}".format(epoch + 1),
-                    train_log,
-                )
-            val_loss_list = []
-            for i, dv in enumerate(data_loader_list_val):
-                dataset = dataset_list[i]
-                diseases = datasets_config[dataset]['diseases']
-                multiclass = datasets_config[dataset]['task_type'] == "multi-class classification"
-                criterion = torch.nn.CrossEntropyLoss() if multiclass else torch.nn.BCEWithLogitsLoss()
-                val_loss, y_val, p_val = evaluate(
+                val_loss_list = _evaluate_validation_sets(
                     student_model,
-                    i,
-                    dv,
+                    dataset_list,
+                    datasets_config,
+                    data_loader_list_val,
+                    val_sampler_list,
                     device,
-                    criterion,
-                    dataset,
-                    return_outputs=True,
-                    multiclass=multiclass,
-                    num_classes=len(diseases),
-                )
-                if accelerator.distributed:
-                    sample_count = len(val_sampler_list[i])
-                    val_loss_stats = torch.tensor(
-                        [val_loss * sample_count, sample_count],
-                        dtype=torch.float32,
-                        device=device,
-                    )
-                    accelerator.all_reduce(val_loss_stats)
-                    val_loss = (val_loss_stats[0] / val_loss_stats[1]).item()
-                y_val = torch.cat(accelerator.gather_tensor(y_val), 0)
-                p_val = torch.cat(accelerator.gather_tensor(p_val), 0)
-                if accelerator.is_main_process:
-                    val_auc_values = metric_AUROC(y_val, p_val, len(diseases))
-                    val_mean_auc = (
-                        _mean_defined_metrics(val_auc_values)
-                        if val_auc_values else float("nan")
-                    )
-                    val_rows = [[
-                        epoch + 1,
-                        epoch,
-                        "epoch",
-                        "validation_loss",
-                        val_loss,
-                        "",
-                    ]]
-                    for disease, auc in zip(diseases, val_auc_values):
-                        val_rows.append([
-                            epoch + 1,
-                            epoch,
-                            "epoch",
-                            "AUC_{}".format(disease),
-                            auc,
-                            "",
-                        ])
-                    if val_auc_values:
-                        val_rows.append([
-                            epoch + 1,
-                            epoch,
-                            "epoch",
-                            "mAUC",
-                            val_mean_auc,
-                            "",
-                        ])
-                    _append_evaluation_rows(
-                        os.path.join(evaluation_directory, dataset, "val_performance.csv"),
-                        val_rows,
-                    )
-                    _print_and_log(
-                        "Student validation Cycle={} {}: loss={:.6f} "
-                        "mean_auroc={:.6f}".format(
-                            epoch + 1,
-                            dataset,
-                            val_loss,
-                            val_mean_auc,
-                        ),
-                        train_log,
-                    )
-                val_loss_list.append(val_loss)
-            
-            avg_val_loss = np.average(val_loss_list)
-            
-            # wandb.log({"avg_val_loss": avg_val_loss})
-            
-            if accelerator.is_main_process:
-                _print_and_log(
-                    "Cycle {:04d}: avg_val_loss {:.5f}".format(
-                        epoch + 1,
-                        avg_val_loss,
-                    ),
+                    accelerator,
+                    evaluation_directory,
+                    epoch + 1,
+                    epoch,
+                    "after_{}".format(dataset_list[i]),
                     train_log,
                 )
 
-                _print_and_log("Datasets: {}".format(dataset_list), train_log)
-                _print_and_log("Validation Losses: {}".format(val_loss_list), train_log)
-  
             cycle = epoch + 1
             if accelerator.is_main_process:
                 weight_directory = os.path.join(
