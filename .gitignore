@@ -2,8 +2,9 @@
 .container-runtime/
 
 # Generated training artifacts
-/*_seed_*/
+/*_seed_*/models/
+/*_seed_*/snapshots/
 base/Models/
-base/Outputs/
-*.pth
-*.pth.tar
+
+# Python bytecode caches
+__pycache__/
