@@ -1264,6 +1264,13 @@ def print_training_configuration(args, model_path, dataset_list,
         log_file,
     )
     _print_and_log("Test Evaluation: after every dataset", log_file)
+    _print_and_log(
+        "Test-time Augmentation: {}".format(
+            "enabled (ten-crop)" if args.test_augment
+            else "disabled (center crop)",
+        ),
+        log_file,
+    )
     _print_and_log("Saved Weights: every cycle", log_file)
     _print_and_log(
         "Resumable Checkpoints: every 10 cycles plus the latest completed cycle",
