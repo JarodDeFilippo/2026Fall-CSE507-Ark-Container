@@ -29,7 +29,8 @@ args=(
     --env "TORCH_HOME=/runtime/cache/torch"
     --env "MPLCONFIGDIR=/runtime/cache/matplotlib"
     --env "HABANA_LOGS=/runtime/habana_logs"
-    --env "PT_HPU_LAZY_MODE=${PT_HPU_LAZY_MODE:-0}"
+    # Lazy mode is the default; set PT_HPU_LAZY_MODE=0 for eager execution.
+    --env "PT_HPU_LAZY_MODE=${PT_HPU_LAZY_MODE:-1}"
     --env "OMPI_MCA_btl_vader_single_copy_mechanism=none"
 )
 

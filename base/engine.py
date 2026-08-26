@@ -202,6 +202,7 @@ def _evaluate_test_sets(
             device,
             multiclass,
             len(diseases),
+            accelerator=accelerator,
         )
         y_teacher, p_teacher = test_classification(
             teacher,
@@ -210,6 +211,7 @@ def _evaluate_test_sets(
             device,
             multiclass,
             len(diseases),
+            accelerator=accelerator,
         )
         y_student = torch.cat(accelerator.gather_tensor(y_student), 0)
         p_student = torch.cat(accelerator.gather_tensor(p_student), 0)
@@ -392,6 +394,7 @@ def _evaluate_validation_sets(
             return_outputs=True,
             multiclass=multiclass,
             num_classes=len(diseases),
+            accelerator=accelerator,
         )
         teacher_val_loss, y_teacher_val, p_teacher_val = evaluate(
             teacher,
@@ -403,6 +406,7 @@ def _evaluate_validation_sets(
             return_outputs=True,
             multiclass=multiclass,
             num_classes=len(diseases),
+            accelerator=accelerator,
         )
         if accelerator.distributed:
             sample_count = len(val_sampler_list[dataset_index])
@@ -1267,6 +1271,12 @@ def print_training_configuration(args, model_path, dataset_list,
     )
     _print_and_log("Precision: fp32", log_file)
     _print_and_log("Device: {}".format(accelerator.device), log_file)
+    _print_and_log(
+        "Execution Mode: {}".format(
+            "lazy" if accelerator.lazy_mode else "eager",
+        ),
+        log_file,
+    )
     for dataset, train_dataset, val_dataset, test_dataset, num_classes in zip(
             dataset_list,
             dataset_train_list,
@@ -1639,6 +1649,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 device,
                 multiclass,
                 len(diseases),
+                accelerator=accelerator,
             )
             y_test_teacher, p_test_teacher = test_classification(
                 teacher,
@@ -1647,6 +1658,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 device,
                 multiclass,
                 len(diseases),
+                accelerator=accelerator,
             )
             y_test = torch.cat(accelerator.gather_tensor(y_test), 0)
             p_test = torch.cat(accelerator.gather_tensor(p_test), 0)
@@ -1937,6 +1949,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     train_log,
                 )
 
+            accelerator.mark_step()
             cycle = epoch + 1
             if accelerator.is_main_process:
                 weight_directory = os.path.join(

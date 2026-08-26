@@ -49,7 +49,11 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
 
         optimizer.zero_grad()
         loss.backward()
+        if accelerator is not None:
+            accelerator.mark_step()
         optimizer.step()
+        if accelerator is not None:
+            accelerator.mark_step()
 
         loss_cls_value = (1 - coff) * loss_cls.item()
         loss_const_value = coff * loss_const.item()
@@ -171,11 +175,11 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
                     print(message)
 
         if ema_mode == "iteration":
-            ema_update_teacher(model, teacher, momentum_schedule, it)
+            ema_update_teacher(model, teacher, momentum_schedule, it, accelerator)
             it += 1
 
     if ema_mode == "epoch":
-        ema_update_teacher(model, teacher, momentum_schedule, it)
+        ema_update_teacher(model, teacher, momentum_schedule, it, accelerator)
         it += 1
 
     return {
@@ -187,14 +191,16 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
     }
 
 
-def ema_update_teacher(model, teacher, momentum_schedule, it):
+def ema_update_teacher(model, teacher, momentum_schedule, it, accelerator=None):
     with torch.no_grad():
         m = momentum_schedule[it]  # momentum parameter
         for param_q, param_k in zip(model.parameters(), teacher.parameters()):
             param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+    if accelerator is not None:
+        accelerator.mark_step()
 
 
-def evaluate(model, use_head_n, data_loader_val, device, criterion, dataset, return_outputs=False, multiclass=False, num_classes=None):
+def evaluate(model, use_head_n, data_loader_val, device, criterion, dataset, return_outputs=False, multiclass=False, num_classes=None, accelerator=None):
     model.eval()
 
     with torch.no_grad():
@@ -207,11 +213,18 @@ def evaluate(model, use_head_n, data_loader_val, device, criterion, dataset, ret
 
             _, outputs = model(samples, use_head_n)
             loss = criterion(outputs, targets)
+            if return_outputs:
+                processed_outputs = (
+                    torch.softmax(outputs, dim=1)
+                    if multiclass else torch.sigmoid(outputs)
+                )
+            if accelerator is not None:
+                accelerator.mark_step()
 
             losses.update(loss.item(), samples.size(0))
             if return_outputs:
                 targets_list.append(targets)
-                outputs_list.append(torch.softmax(outputs, dim=1) if multiclass else torch.sigmoid(outputs))
+                outputs_list.append(processed_outputs)
 
     if not return_outputs:
         return losses.avg
@@ -223,7 +236,7 @@ def evaluate(model, use_head_n, data_loader_val, device, criterion, dataset, ret
     return losses.avg, empty_outputs, empty_outputs
 
 
-def test_classification(model, use_head_n, data_loader_test, device, multiclass = False, num_classes = None):
+def test_classification(model, use_head_n, data_loader_test, device, multiclass=False, num_classes=None, accelerator=None):
        
     model.eval()
 
@@ -250,6 +263,8 @@ def test_classification(model, use_head_n, data_loader_test, device, multiclass 
                 out = torch.sigmoid(out)
             outMean = out.view(bs, n_crops, -1).mean(1)
             p_test = torch.cat((p_test, outMean.data), 0)
+            if accelerator is not None:
+                accelerator.mark_step()
 
     return y_test, p_test
     

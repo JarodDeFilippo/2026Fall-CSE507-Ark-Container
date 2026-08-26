@@ -31,13 +31,17 @@ class Accelerator:
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
         self.distributed = self.world_size > 1
+        self.lazy_mode = False
+        self._htcore = None
 
         if self.name == "hpu":
-            os.environ.setdefault("PT_HPU_LAZY_MODE", "0")
+            os.environ.setdefault("PT_HPU_LAZY_MODE", "1")
+            self.lazy_mode = os.environ.get("PT_HPU_LAZY_MODE") == "1"
             try:
-                import habana_frameworks.torch.core  # noqa: F401
+                import habana_frameworks.torch.core as htcore
             except ImportError as exc:
                 raise RuntimeError("The Gaudi runtime is not available") from exc
+            self._htcore = htcore
 
         if self.name == "cuda":
             device_index = self.local_rank if self.distributed else 0
@@ -103,6 +107,11 @@ class Accelerator:
     def barrier(self):
         if self.distributed:
             dist.barrier()
+
+    def mark_step(self):
+        """Flush the current HPU lazy graph; this is a no-op elsewhere."""
+        if self.lazy_mode:
+            self._htcore.mark_step()
 
     def synchronize_model(self, model):
         if self.distributed:
