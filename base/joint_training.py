@@ -12,7 +12,7 @@ from dataloader import (
     build_transform_classification,
     dict_dataloarder,
 )
-from utils import MetricLogger, ProgressLogger, save_image
+from utils import MetricLogger, save_image
 
 
 # Based on the copied implementation from:
@@ -180,11 +180,6 @@ def train_one_epoch_joint(
     losses_cls = MetricLogger('Loss_cls', ':.4e')
     losses_mse = MetricLogger('Loss_mse', ':.4e')
     losses_total = MetricLogger('Loss_total', ':.4e')
-    progress = ProgressLogger(
-        len(data_loader_train),
-        [batch_time, losses_cls, losses_mse, losses_total],
-        prefix="Epoch: [{}]".format(epoch))
-
     model.train()
     MSE = torch.nn.MSELoss()
     criteria = [
@@ -294,7 +289,6 @@ def train_one_epoch_joint(
                 loss_file.flush()
 
         if is_main_process and ((i + 1) % 50 == 0 or i + 1 == len(data_loader_train)):
-            progress.display(i + 1)
             message = (
                 "Cycle {:04d} | Dataset joint | Batch {:04d}/{:04d} | "
                 "classification={:.4e} ({:.1f}%) | "
@@ -309,10 +303,10 @@ def train_one_epoch_joint(
                 mse_percent,
                 total_loss,
             )
-            print(message)
             if train_log is not None:
-                train_log.write(message + "\n")
-                train_log.flush()
+                train_log.info(message)
+            else:
+                print(message)
         if ema_mode == "iteration":
             ema_update_teacher(model, teacher, momentum_schedule, it, accelerator)
             it += 1
