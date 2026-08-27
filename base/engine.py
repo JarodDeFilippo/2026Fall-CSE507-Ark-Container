@@ -1548,10 +1548,17 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             if joint_sampling == 'equal'
             else OmniPretrainingDatasets
         )
-        joint_dataset = joint_dataset_class(
-            dataset_train_list,
-            num_classes_list,
-        )
+        if joint_sampling == 'equal':
+            joint_dataset = joint_dataset_class(
+                dataset_train_list,
+                num_classes_list,
+                seed=args.seed,
+            )
+        else:
+            joint_dataset = joint_dataset_class(
+                dataset_train_list,
+                num_classes_list,
+            )
         joint_sampler = DistributedSampler(
             joint_dataset,
             num_replicas=accelerator.world_size,
@@ -1948,6 +1955,8 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             if training_strategy == "joint":
                 if joint_sampler is not None:
                     joint_sampler.set_epoch(epoch)
+                if hasattr(joint_dataset, "set_epoch"):
+                    joint_dataset.set_epoch(epoch)
                 momentum = momentum_schedule[it]
                 coff = (momentum - 0.9) * 5
                 if accelerator.is_main_process:

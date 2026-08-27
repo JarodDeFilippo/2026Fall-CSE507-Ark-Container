@@ -113,9 +113,10 @@ class OmniPretrainingDatasets_EqualSampling(Dataset):
 # joint-training dataset. It keeps the current dataset objects and returns
 # the same per-sample interface as OmniPretrainingDatasets.
 class OmniPretrainingDatasetsEqualSampling(Dataset):
-  def __init__(self, dataset_train_list, num_classes_list):
+  def __init__(self, dataset_train_list, num_classes_list, seed=0):
     self.datasets = dataset_train_list
     self.num_classes_list = list(num_classes_list)
+    self.seed = 0 if seed is None else int(seed)
     if len(self.datasets) != len(self.num_classes_list):
       raise ValueError("Expected one class count for each training dataset")
     if not self.datasets:
@@ -126,10 +127,25 @@ class OmniPretrainingDatasetsEqualSampling(Dataset):
       raise ValueError("Equal sampling requires non-empty training datasets")
     self.max_dataset_size = max(self.dataset_sizes)
     self.max_class_num = max(self.num_classes_list)
+    self.sample_permutations = []
+    self.set_epoch(0)
+
+  def set_epoch(self, epoch):
+    """Regenerate per-dataset sample permutations for the requested epoch."""
+    epoch = int(epoch)
+    self.sample_permutations = []
+    for dataset_index, dataset_size in enumerate(self.dataset_sizes):
+      permutation = list(range(dataset_size))
+      permutation_seed = self.seed + epoch * len(self.datasets) + dataset_index
+      random.Random(permutation_seed).shuffle(permutation)
+      self.sample_permutations.append(permutation)
 
   def __getitem__(self, index):
     dataset_index = index % len(self.datasets)
-    sample_index = (index // len(self.datasets)) % self.dataset_sizes[dataset_index]
+    logical_sample_index = (
+        (index // len(self.datasets)) % self.dataset_sizes[dataset_index]
+    )
+    sample_index = self.sample_permutations[dataset_index][logical_sample_index]
     student_img, teacher_img, image_label = self.datasets[dataset_index][sample_index]
     image_label = torch.as_tensor(image_label, dtype=torch.float32)
     if image_label.shape[0] < self.max_class_num:
