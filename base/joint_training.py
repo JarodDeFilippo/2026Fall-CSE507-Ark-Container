@@ -220,6 +220,11 @@ def train_one_epoch_joint(
                     targets[dataset_mask, :num_classes_list[dataset_index_value]],
                 )
                 loss_cls += dataset_loss * dataset_mask.sum()
+            else:
+                # Every head is returned by the forward pass. Keep absent
+                # heads connected to the loss graph so DDP observes a zero
+                # gradient instead of waiting for a missing reduction.
+                loss_cls += pred_s_lst[dataset_index_value].sum() * 0.0
         loss_cls = loss_cls / targets.shape[0]
 
         loss = (1-coff) * loss_cls + coff * loss_const
