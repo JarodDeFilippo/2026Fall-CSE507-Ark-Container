@@ -11,10 +11,10 @@ fi
 
 ark_launch_experiment \
     "$1" \
-    vindr_cxr_chestxray14_concurrent \
+    vindr_cxr_chestxray14_concurrent_equal_sampling \
     "$2" \
     false \
     --data_set VinDrCXR \
     --data_set ChestXray14 \
     --training_strategy joint \
-    --joint_sampling proportional
+    --joint_sampling equal

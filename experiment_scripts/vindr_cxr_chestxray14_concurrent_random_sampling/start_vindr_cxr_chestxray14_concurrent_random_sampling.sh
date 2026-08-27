@@ -11,9 +11,9 @@ fi
 
 ark_launch_experiment \
     "$1" \
-    vindr_cxr_chestxray14_concurrent \
+    vindr_cxr_chestxray14_concurrent_random_sampling \
     "$2" \
-    true \
+    false \
     --data_set VinDrCXR \
     --data_set ChestXray14 \
     --training_strategy joint \
