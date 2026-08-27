@@ -1259,6 +1259,13 @@ def print_training_configuration(args, model_path, dataset_list,
                                  dataset_train_list, dataset_val_list,
                                  dataset_test_list, num_classes_list,
                                  train_batch_size, accelerator, log_file=None):
+    training_strategy = getattr(args, "training_strategy", "cyclic")
+    joint_sampling = getattr(args, "joint_sampling", "proportional")
+    evaluation_interval = (
+        "after every joint cycle"
+        if training_strategy == "joint"
+        else "after every dataset"
+    )
     separator = "=" * 80
     _print_and_log(separator, log_file)
     _print_and_log("ARK+ PRETRAINING CONFIGURATION", log_file)
@@ -1277,6 +1284,9 @@ def print_training_configuration(args, model_path, dataset_list,
     _print_and_log("Distributed World Size: {}".format(accelerator.world_size), log_file)
     _print_and_log("Data Loader Workers Per Rank: {}".format(args.workers), log_file)
     _print_and_log("Cycles: {}".format(args.pretrain_epochs), log_file)
+    _print_and_log("Training Strategy: {}".format(training_strategy), log_file)
+    if training_strategy == "joint":
+        _print_and_log("Joint Sampling: {}".format(joint_sampling), log_file)
     _print_and_log("Optimizer: {}".format(args.opt), log_file)
     _print_and_log("Initial Learning Rate: {}".format(args.warmup_lr), log_file)
     _print_and_log("Peak Learning Rate: {}".format(args.lr), log_file)
@@ -1285,10 +1295,15 @@ def print_training_configuration(args, model_path, dataset_list,
     _print_and_log("Teacher Momentum Base: {}".format(args.momentum_teacher), log_file)
     _print_and_log("Teacher EMA Mode: {}".format(args.ema_mode), log_file)
     _print_and_log(
-        "Validation Evaluation: student and teacher after every dataset",
+        "Validation Evaluation: student and teacher {}".format(
+            evaluation_interval,
+        ),
         log_file,
     )
-    _print_and_log("Test Evaluation: after every dataset", log_file)
+    _print_and_log(
+        "Test Evaluation: student and teacher {}".format(evaluation_interval),
+        log_file,
+    )
     _print_and_log(
         "Train Augmentation: {}".format(
             "enabled (stochastic student transforms)"

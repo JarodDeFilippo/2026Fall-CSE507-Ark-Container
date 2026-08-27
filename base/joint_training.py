@@ -231,7 +231,11 @@ def train_one_epoch_joint(
 
         optimizer.zero_grad()
         loss.backward()
+        if accelerator is not None:
+            accelerator.mark_step()
         optimizer.step()
+        if accelerator is not None:
+            accelerator.mark_step()
 
         loss_stats = torch.tensor(
             [
@@ -310,11 +314,11 @@ def train_one_epoch_joint(
                 train_log.write(message + "\n")
                 train_log.flush()
         if ema_mode == "iteration":
-            ema_update_teacher(model, teacher, momentum_schedule, it)
+            ema_update_teacher(model, teacher, momentum_schedule, it, accelerator)
             it += 1
             
     if ema_mode == "epoch":
-        ema_update_teacher(model, teacher, momentum_schedule, it)
+        ema_update_teacher(model, teacher, momentum_schedule, it, accelerator)
         it += 1
 
     return it, {
@@ -324,8 +328,10 @@ def train_one_epoch_joint(
     }
 
 
-def ema_update_teacher(model, teacher, momentum_schedule, it):
+def ema_update_teacher(model, teacher, momentum_schedule, it, accelerator=None):
     with torch.no_grad():
         m = momentum_schedule[it]  # momentum parameter
         for param_q, param_k in zip(model.parameters(), teacher.parameters()):
             param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+    if accelerator is not None:
+        accelerator.mark_step()
