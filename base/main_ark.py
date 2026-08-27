@@ -100,8 +100,10 @@ def get_args_parser():
                       default=None, type="string")
     parser.add_option("--workers", dest="workers", help="number of CPU workers", default=8, type="int")
     parser.add_option("--print_freq", dest="print_freq", help="print frequency", default=50, type="int")
+    parser.add_option("--train_augment", dest="train_augment", help="whether use training augmentations",
+                      default=True, action="callback", callback=vararg_callback_bool)
     parser.add_option("--test_augment", dest="test_augment", help="whether use test time augmentation",
-                      default=False, action="callback", callback=vararg_callback_bool)
+                      default=True, action="callback", callback=vararg_callback_bool)
     parser.add_option("--anno_percent", dest="anno_percent", help="data percent", default=100, type="int")
     parser.add_option("--device", dest="device", help="cpu|cuda|hpu", default=os.environ.get("PROJECT_ACCELERATOR", "cuda"), type="string")
     parser.add_option("--reinit_heads", dest="reinit_heads", help="reinitialize task heads when resuming", default=False, action="callback", callback=vararg_callback_bool)
@@ -166,8 +168,16 @@ def main(args):
     dataset_test_list = []
     for dataset in args.dataset_list:
         if args.mode == "train":
+            train_transform = None
+            if not args.train_augment:
+                train_transform = build_transform_classification(
+                    normalize=args.normalization,
+                    crop_size=args.crop_size,
+                    resize=args.resize,
+                    mode="valid",
+                )
             dataset_train_list.append(
-                dict_dataloarder[dataset](images_path=datasets_config[dataset]['data_dir'], file_path=datasets_config[dataset]['train_list'], crop_size=args.crop_size, resize=args.resize, augment=None)
+                dict_dataloarder[dataset](images_path=datasets_config[dataset]['data_dir'], file_path=datasets_config[dataset]['train_list'], crop_size=args.crop_size, resize=args.resize, augment=train_transform)
             )
             dataset_val_list.append(
                 dict_dataloarder[dataset](images_path=datasets_config[dataset]['data_dir'], file_path=datasets_config[dataset]['val_list'], crop_size=args.crop_size, resize=args.resize, augment=build_transform_classification(normalize=args.normalization, crop_size=args.crop_size, resize=args.resize, mode="valid"))

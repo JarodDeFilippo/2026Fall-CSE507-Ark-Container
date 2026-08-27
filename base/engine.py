@@ -1265,6 +1265,14 @@ def print_training_configuration(args, model_path, dataset_list,
     )
     _print_and_log("Test Evaluation: after every dataset", log_file)
     _print_and_log(
+        "Train Augmentation: {}".format(
+            "enabled (stochastic student transforms)"
+            if args.train_augment
+            else "disabled (center crop for student and teacher)",
+        ),
+        log_file,
+    )
+    _print_and_log(
         "Test-time Augmentation: {}".format(
             "enabled (ten-crop)" if args.test_augment
             else "disabled (center crop)",
