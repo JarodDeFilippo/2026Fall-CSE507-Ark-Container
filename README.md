@@ -10,7 +10,7 @@ After downloading the above container, you can run experiments using the followi
 
 ## Experiment Scripts
 
-The experiment_scripts directory provides scripts for running experiments. Scripts are provided for easily running the following four experiments:
+The experiment_scripts directory provides scripts for running experiments. Scripts are provided for easily running the following five experiments:
 
 - vindr_cxr_only: Train a student/teacher Ark model on VinDr-CXR only.
 - chestxray14_only: Train a student/teacher Ark model on ChestX-ray14 only.
@@ -31,6 +31,8 @@ A start and resume script are provided for each of the experiments, and they bot
 # Resume experiment (use the same seed as when you started the experiment)
 ./experiment_scripts/vindr_cxr_only/resume_vindr_cxr_only.sh 100
 ```
+
+The resume scripts will resume training from the latest completed epoch/cycle.
 
 ## Experiment Output
 
