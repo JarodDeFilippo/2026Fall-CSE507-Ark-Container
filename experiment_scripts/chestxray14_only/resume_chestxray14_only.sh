@@ -4,14 +4,17 @@ set -euo pipefail
 SCRIPT_DIRECTORY=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIRECTORY/../common.sh"
 
-if [[ $# -ne 2 ]]; then
-    echo "Usage: $0 <nvidia|gaudi> <seed>" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    echo "Usage: $0 <seed> [nvidia|gaudi]" >&2
     exit 2
 fi
 
+seed="$1"
+container="${2:-nvidia}"
+
 ark_launch_experiment \
-    "$1" \
+    "$container" \
     chestxray14_only \
-    "$2" \
+    "$seed" \
     true \
     --data_set ChestXray14
