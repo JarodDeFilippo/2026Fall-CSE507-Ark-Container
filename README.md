@@ -15,7 +15,7 @@ sbatch gaudi_smoke.sh         # 1-card smoke test, about 30 minutes
 sbatch run_d1_8a_gaudi.sh     # DINOv3 arm B on 4 cards; sbatch resume_d1_8a_gaudi.sh to continue
 ```
 
-Guide: [porting A100 container code to Sol Gaudi2 (PDF)](<PDF link>)
+Guides: [Getting our training onto Gaudi (short, PDF)](docs/gaudi-vs-a100.pdf) and [the step-by-step port with every number's provenance (long, PDF)](docs/sol-gaudi-guide.pdf); Markdown sources sit next to them in docs/.
 
 Companion repo: https://github.com/JarodDeFilippo/UniMiSS-code (UniMiSS+ on Gaudi)
 
