@@ -1,3 +1,4 @@
+# Modified from the course Ark+ container (see NOTICE)
 
 import os
 import sys
@@ -9,13 +10,14 @@ import re
 import tempfile
 import json
 import logging
+import math
 import numpy as np
 from optparse import OptionParser
 import copy
 
 
 from accelerator import Accelerator, DistributedEvaluationSampler
-from models import build_omni_model, save_checkpoint
+from models import build_omni_model, save_checkpoint, vit_param_groups
 from utils import metric_AUROC, cosine_scheduler
 from sklearn.metrics import accuracy_score
 
@@ -612,6 +614,13 @@ def _checkpoint_run_directory(checkpoint_path):
     return os.path.dirname(os.path.dirname(checkpoint_directory))
 
 
+def _should_evaluate(args, epoch):
+    """Evaluate on every Nth cycle (--eval_every) and always on the final cycle."""
+    every = max(1, int(getattr(args, 'eval_every', 1) or 1))
+    cycle = epoch + 1
+    return cycle % every == 0 or cycle >= args.pretrain_epochs
+
+
 def _scheduler_config(args):
     return {
         'schedule': 'linear_warmup_cosine_decay',
@@ -672,7 +681,7 @@ class WarmupCosineScheduler:
     def step(self, cycle):
         learning_rate = self.learning_rate(cycle)
         for param_group in self.optimizer.param_groups:
-            param_group['lr'] = learning_rate
+            param_group['lr'] = learning_rate * param_group.get('lr_scale', 1.0)
         self.last_cycle = cycle
         return learning_rate
 
@@ -696,6 +705,70 @@ class WarmupCosineScheduler:
                     "Learning-rate scheduler state has incompatible {}".format(key)
                 )
         self.last_cycle = state_dict.get('last_cycle', -1)
+
+
+def _create_vit_finetune_optimizer(args, model):
+    """Optimizer over vit_param_groups (layer-wise LR decay, no-decay groups); WarmupCosineScheduler applies each group's lr_scale."""
+    if args.model_name != "vit_base_dinov3":
+        raise ValueError("--layer-decay and --patch-embed-lr-mult are only implemented for --model vit_base_dinov3")
+    groups = vit_param_groups(model, args.weight_decay, args.layer_decay, args.patch_embed_lr_mult)
+    opt = args.opt.lower()
+    if opt == "adamw":
+        adamw_args = {}
+        if getattr(args, "opt_betas", None) is not None:  # like timm's create_optimizer; unset keeps torch's default betas
+            adamw_args["betas"] = tuple(args.opt_betas)
+        return torch.optim.AdamW(groups, lr=args.lr, eps=args.opt_eps, **adamw_args)
+    if opt in ("sgd", "momentum"):
+        # same names as timm 0.5.4: "sgd" is Nesterov momentum, "momentum" is plain momentum
+        return torch.optim.SGD(groups, lr=args.lr, momentum=args.momentum, nesterov=(opt == "sgd"))
+    raise ValueError("--layer-decay and --patch-embed-lr-mult support --opt adamw, sgd or momentum, not '{}'".format(args.opt))
+
+
+def _validate_grouped_optimizer_resume(optimizer, saved_state):
+    """Raise ValueError unless the saved optimizer state matches the grouped optimizer this run built.
+
+    Call it with the fresh optimizer and checkpoint['optimizer'], before optimizer.load_state_dict: that copies every saved
+    group (lr_scale, weight_decay, betas, ...) over the fresh one, so a resume with another --opt, --layer-decay,
+    --patch-embed-lr-mult or --weight-decay would silently train on the original run's settings, or die inside
+    load_state_dict / at the first step on a KeyError.
+    """
+    def signature(group):  # lr_scale is nan for a group that carries none, e.g. from the default optimizer
+        return group.get('lr_scale', float('nan')), group['weight_decay'], len(group['params'])
+
+    advice = "The resume arguments (--opt, --layer-decay, --patch-embed-lr-mult, --weight-decay) must match the original run."
+    built_groups, saved_groups = optimizer.param_groups, saved_state['param_groups']
+    built_class = type(optimizer).__name__
+    saved_class = 'AdamW' if 'betas' in saved_groups[0] else 'SGD' if 'momentum' in saved_groups[0] else 'an unrecognised optimizer'
+    if saved_class != built_class:
+        raise ValueError("The checkpoint's optimizer is {}, but this run built {}. {}".format(saved_class, built_class, advice))
+    if len(saved_groups) != len(built_groups):
+        raise ValueError("The checkpoint has {} optimizer param groups, but this run built {}. {}".format(
+            len(saved_groups), len(built_groups), advice))
+    for index, (built, saved) in enumerate(zip(built_groups, saved_groups)):
+        want, got = signature(built), signature(saved)
+        # rel_tol: layer_decay ** n may differ in the last bit between libm builds
+        if not all(math.isclose(a, b, rel_tol=1e-9) for a, b in zip(want, got)):
+            raise ValueError(
+                "Optimizer param group {} is (lr_scale, weight_decay, n_params) = {} in the checkpoint, but this run built {}. {}"
+                .format(index, got, want, advice))
+
+
+def _param_group_summary(optimizer):
+    groups = optimizer.param_groups
+    decayed = [p for group in groups if group['weight_decay'] for p in group['params']]
+    plain = [p for group in groups if not group['weight_decay'] for p in group['params']]
+    return (
+        "Optimizer param groups: {} groups, lr_scale {:.4g} to {:.4g}, "
+        "with weight decay: {} tensors ({:,} params), without: {} tensors ({:,} params)".format(
+            len(groups),
+            min(group['lr_scale'] for group in groups),
+            max(group['lr_scale'] for group in groups),
+            len(decayed),
+            sum(p.numel() for p in decayed),
+            len(plain),
+            sum(p.numel() for p in plain),
+        )
+    )
 
 
 def _validate_checkpoint_total_cycles(checkpoint, file_path, args):
@@ -1305,6 +1378,11 @@ def print_training_configuration(args, model_path, dataset_list,
         log_file,
     )
     _print_and_log(
+        "Evaluation Cadence: every {} cycle(s), plus the final cycle".format(
+            max(1, int(getattr(args, 'eval_every', 1) or 1))),
+        log_file,
+    )
+    _print_and_log(
         "Train Augmentation: {}".format(
             "enabled (stochastic student transforms)"
             if args.train_augment
@@ -1723,7 +1801,12 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 iters_per_epoch += len(d)
             momentum_schedule = cosine_scheduler(args.momentum_teacher, 1,
                                                    args.pretrain_epochs, iters_per_epoch)
-        optimizer = create_optimizer(args, model)
+        if args.layer_decay is not None or args.patch_embed_lr_mult != 1.0:
+            optimizer = _create_vit_finetune_optimizer(args, model)
+            if accelerator.is_main_process:
+                _print_and_log(_param_group_summary(optimizer), train_log)
+        else:
+            optimizer = create_optimizer(args, model)
         lr_scheduler = WarmupCosineScheduler(
             optimizer,
             total_cycles=args.pretrain_epochs,
@@ -1895,6 +1978,8 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         .format(resume)
                     )
                 lr_scheduler.load_state_dict(checkpoint['scheduler'])
+                if args.layer_decay is not None or args.patch_embed_lr_mult != 1.0:  # the grouped optimizer built above
+                    _validate_grouped_optimizer_resume(optimizer, checkpoint['optimizer'])
                 optimizer.load_state_dict(checkpoint['optimizer'])
                 if args.reinit_heads:
                     for name, parameter in student_model.named_parameters():
@@ -2001,6 +2086,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     loss_writer=loss_writer,
                     loss_file=loss_file,
                     snapshot_directory=snapshot_directory,
+                    clip_grad=args.clip_grad,
                 )
                 if accelerator.is_main_process:
                     joint_total_loss = task_metrics["total_loss"]
@@ -2031,37 +2117,38 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         train_log,
                     )
                 global_step += len(data_loader_joint)
-                _evaluate_test_sets(
-                    student_model,
-                    teacher,
-                    dataset_list,
-                    datasets_config,
-                    data_loader_list_test,
-                    device,
-                    accelerator,
-                    evaluation_directory,
-                    epoch + 1,
-                    epoch,
-                    "after_joint",
-                    shared_val_test_splits,
-                    train_log,
-                )
-                val_loss_list = _evaluate_validation_sets(
-                    student_model,
-                    teacher,
-                    dataset_list,
-                    datasets_config,
-                    data_loader_list_val,
-                    val_sampler_list,
-                    device,
-                    accelerator,
-                    evaluation_directory,
-                    epoch + 1,
-                    epoch,
-                    "after_joint",
-                    shared_val_test_splits,
-                    train_log,
-                )
+                if _should_evaluate(args, epoch):
+                    _evaluate_test_sets(
+                        student_model,
+                        teacher,
+                        dataset_list,
+                        datasets_config,
+                        data_loader_list_test,
+                        device,
+                        accelerator,
+                        evaluation_directory,
+                        epoch + 1,
+                        epoch,
+                        "after_joint",
+                        shared_val_test_splits,
+                        train_log,
+                    )
+                    val_loss_list = _evaluate_validation_sets(
+                        student_model,
+                        teacher,
+                        dataset_list,
+                        datasets_config,
+                        data_loader_list_val,
+                        val_sampler_list,
+                        device,
+                        accelerator,
+                        evaluation_directory,
+                        epoch + 1,
+                        epoch,
+                        "after_joint",
+                        shared_val_test_splits,
+                        train_log,
+                    )
             else:
                 for i, data_loader in enumerate(data_loader_list_train):
                     if train_sampler_list[i] is not None:
@@ -2114,6 +2201,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         snapshot_directory,
                         args.print_freq,
                         training_start_time,
+                        clip_grad=args.clip_grad,
                     )
                     if accelerator.is_main_process:
                         _print_and_log(
@@ -2133,37 +2221,38 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         )
                     it += 1
                     global_step += len(data_loader)
-                    _evaluate_test_sets(
-                        student_model,
-                        teacher,
-                        dataset_list,
-                        datasets_config,
-                        data_loader_list_test,
-                        device,
-                        accelerator,
-                        evaluation_directory,
-                        epoch + 1,
-                        epoch,
-                        "after_{}".format(dataset_list[i]),
-                        shared_val_test_splits,
-                        train_log,
-                    )
-                    val_loss_list = _evaluate_validation_sets(
-                        student_model,
-                        teacher,
-                        dataset_list,
-                        datasets_config,
-                        data_loader_list_val,
-                        val_sampler_list,
-                        device,
-                        accelerator,
-                        evaluation_directory,
-                        epoch + 1,
-                        epoch,
-                        "after_{}".format(dataset_list[i]),
-                        shared_val_test_splits,
-                        train_log,
-                    )
+                    if _should_evaluate(args, epoch):
+                        _evaluate_test_sets(
+                            student_model,
+                            teacher,
+                            dataset_list,
+                            datasets_config,
+                            data_loader_list_test,
+                            device,
+                            accelerator,
+                            evaluation_directory,
+                            epoch + 1,
+                            epoch,
+                            "after_{}".format(dataset_list[i]),
+                            shared_val_test_splits,
+                            train_log,
+                        )
+                        val_loss_list = _evaluate_validation_sets(
+                            student_model,
+                            teacher,
+                            dataset_list,
+                            datasets_config,
+                            data_loader_list_val,
+                            val_sampler_list,
+                            device,
+                            accelerator,
+                            evaluation_directory,
+                            epoch + 1,
+                            epoch,
+                            "after_{}".format(dataset_list[i]),
+                            shared_val_test_splits,
+                            train_log,
+                        )
 
             accelerator.mark_step()
             cycle = epoch + 1

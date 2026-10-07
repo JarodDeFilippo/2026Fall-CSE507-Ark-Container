@@ -8,3 +8,11 @@ base/Models/
 
 # Python bytecode caches
 __pycache__/
+
+# Model weights (DINOv3 weights are gated by Meta; download them into weights/ yourself) and local cruft
+weights/
+*.pth
+*.pt
+*.safetensors
+.DS_Store
+*.log

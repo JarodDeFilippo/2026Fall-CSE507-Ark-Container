@@ -1,3 +1,4 @@
+# Modified from the course Ark+ container (see NOTICE)
 """Joint-training helpers based on the original Ark+ concurrent code."""
 
 from bisect import bisect_right
@@ -12,7 +13,7 @@ from dataloader import (
     build_transform_classification,
     dict_dataloarder,
 )
-from utils import MetricLogger, save_image
+from utils import MetricLogger, clip_or_measure_grad_norm, save_image
 
 
 # Based on the copied implementation from:
@@ -191,12 +192,15 @@ def train_one_epoch_joint(
         loss_writer=None,
         loss_file=None,
         snapshot_directory=None,
+        clip_grad=None,
 ):
     batch_time = MetricLogger('Time', ':6.3f')
     losses_cls = MetricLogger('Loss_cls', ':.4e')
     losses_mse = MetricLogger('Loss_mse', ':.4e')
     losses_total = MetricLogger('Loss_total', ':.4e')
+    grad_norms = MetricLogger('GN', ':.4f')
     model.train()
+    student_params = list(model.parameters())
     MSE = torch.nn.MSELoss()
     criteria = [
         torch.nn.CrossEntropyLoss()
@@ -249,6 +253,7 @@ def train_one_epoch_joint(
         loss.backward()
         if accelerator is not None:
             accelerator.mark_step()
+        grad_norms.update(clip_or_measure_grad_norm(student_params, clip_grad))
         optimizer.step()
         if accelerator is not None:
             accelerator.mark_step()
@@ -313,7 +318,8 @@ def train_one_epoch_joint(
             message = (
                 "Cycle {:04d} | Dataset joint | Batch {:04d}/{:04d} | "
                 "classification={:.4e} ({:.1f}%) | "
-                "consistency={:.4e} ({:.1f}%) | total={:.4e} (100.0%)"
+                "consistency={:.4e} ({:.1f}%) | total={:.4e} (100.0%) | "
+                "GN={:.4f} ({:.4f})"
             ).format(
                 epoch + 1,
                 i + 1,
@@ -323,6 +329,8 @@ def train_one_epoch_joint(
                 losses_mse.avg,
                 mse_percent,
                 total_loss,
+                grad_norms.val.item(),
+                grad_norms.avg.item(),
             )
             if train_log is not None:
                 train_log.info(message)
