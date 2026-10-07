@@ -1,0 +1,48 @@
+NOTICE
+Date: 2026-10-07
+
+This fork of the CSE 507 course repository (https://github.com/jliangclass-intro/2026Fall-CSE507-Ark-Container)
+modifies Ark+ code from JLiangLab/Ark (https://github.com/JLiangLab/Ark), which reaches this fork through the course
+repository (the course's Ark+ container code) and is licensed under the ASU license reproduced in LICENSE-ASU-Ark.txt;
+the course repository itself has no license file. This file describes the changes, as section 5(c) of that license
+requires. The changes are relative to the course repository's main branch at commit
+2949b2e764b11e21c31d668efcc10cf2a33acd20. The modified Python and shell sources listed below begin with a header
+comment pointing here.
+
+Modified files inherited from the course repository
+
+- base/engine.py: adds layer-wise LR decay parameter groups for the DINOv3 ViT, --eval_every, --clip-grad wiring and a grouped-optimizer resume check.
+- base/joint_training.py: the joint-training loop measures or clips the gradient norm before each optimizer step and logs it (GN).
+- base/main_ark.py: adds the vit_base_dinov3 model choice and the --eval_every, --layer-decay and --patch-embed-lr-mult options.
+- base/models.py: adds ArkViT (DINOv3 ViT-B/16 with projector and heads), vit_param_groups, and a strict check of the loaded DINOv3 checkpoint keys.
+- base/trainer.py: the cyclic training loop measures or clips the gradient norm before each optimizer step and logs it (GN).
+- base/utils.py: adds clip_or_measure_grad_norm.
+- experiment_scripts/common.sh: the shared launcher reads batch size, lr, test augmentation, evaluation cadence, workers, model, init and pretrained weights from ARK_* environment variables; the defaults reproduce the original behavior.
+- README.md: prepends "About this fork", replaces the container download command with a pointer to the course repository's README, and appends "Gaudi on Sol".
+- .gitignore: also ignores weights/, *.pth, *.pt, *.safetensors, .DS_Store and *.log.
+
+Added files
+
+New tools in base/
+- base/check_dinov3_load.py: CPU smoke test for the vit_base_dinov3 backbone.
+- base/convert_hf_dinov3_to_meta.py: converts a Hugging Face DINOv3 ViT-B/16 checkpoint to Meta's state-dict layout.
+- base/test_dinov3_finetune_recipe.py: CPU checks for the DINOv3 fine-tuning recipe (AdamW, layer-wise LR decay, grad-norm clipping).
+
+Vendored Meta code, under its own license
+- base/dinov3/: the DINOv3 ViT from https://github.com/facebookresearch/dinov3, licensed under the DINOv3 License (base/dinov3/LICENSE.md); base/dinov3/VENDORED.md records the source commit and which files were edited.
+
+Gaudi2 (HPU) path
+- containers/gaudi/: apptainer.def, requirements.txt and requirements_nodeps.txt for the Gaudi2 container.
+- gaudi.sh: runs a command inside the Gaudi container (the counterpart of nvidia.sh).
+- gaudi_hlsmi.sh, gaudi_check_cards.sh, gaudi_verify_busy.sh: the shared hl-smi reader, the fail-closed pre-launch card check, and the report-only busy check.
+- gaudi_smoke.sh: 1-card smoke test.
+- build_gaudi_image.sh: builds containers/gaudi/gaudi.sif.
+
+Experiment scripts and launchers
+- experiment_scripts/all4_concurrent_random_sampling/, all4_concurrent_random_sampling_dinov3/, all4_cyclic_dinov3_adamw/ and all4_cyclic_dinov3_v2/: start and resume scripts for the Demo 1 runs on all four datasets (VinDr-CXR, ChestX-ray14, MIMIC, CheXpert).
+- run_p1_*.sh and resume_p1_*.sh in the repository root: Slurm launchers for the Practice 1 runs.
+- run_d1_*.sh, resume_d1_*.sh and eval_d1_6.sh in the repository root: Slurm launchers for the Demo 1 runs and the d1_6 evaluation, including the Gaudi launchers run_d1_8a_gaudi.sh and resume_d1_8a_gaudi.sh.
+
+License texts
+- LICENSE-ASU-Ark.txt: the ASU license text from https://github.com/JLiangLab/Ark.
+- NOTICE: this file.

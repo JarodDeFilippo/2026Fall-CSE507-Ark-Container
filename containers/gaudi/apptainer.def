@@ -1,0 +1,36 @@
+Bootstrap: docker
+From: vault.habana.ai/gaudi-docker/1.24.0/ubuntu22.04/habanalabs/pytorch-installer-2.10.0:latest
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export TZ=UTC
+    export OMPI_MCA_btl_vader_single_copy_mechanism=none
+
+%files
+    containers/gaudi/requirements.txt /opt/requirements.txt
+    containers/gaudi/requirements_nodeps.txt /opt/requirements_nodeps.txt
+
+%post
+    set -eux
+
+    # No uv and no venv, on purpose (the lab's Gaudi_Demo template uses both). Habana's torch,
+    # torchvision, numpy and habana_* packages live in the base image's own Python, so freeze
+    # everything it ships and hand that to pip as a constraint: nothing pre-installed can be
+    # replaced, and a version conflict fails the build instead of silently swapping Habana's torch.
+    python3 -m pip list --format=freeze > /opt/base-constraints.txt
+
+    # the experiment scripts call `python`
+    if ! command -v python > /dev/null 2>&1; then
+        ln -s "$(command -v python3)" /usr/local/bin/python
+    fi
+
+    python3 -m pip install --no-cache-dir -c /opt/base-constraints.txt -r /opt/requirements.txt
+    python3 -m pip install --no-cache-dir --no-deps -c /opt/base-constraints.txt -r /opt/requirements_nodeps.txt
+
+    # fail the build on a broken install; habana_frameworks is not imported (no Gaudi driver on the build node)
+    python3 -c "import torch, torchvision, timm, cv2, albumentations, pydicom, skimage, sklearn, scipy, yaml, PIL, tqdm; print(torch.__version__, torchvision.__version__, timm.__version__)"
+
+    python3 -m pip freeze > /opt/pip-freeze.txt
+
+%runscript
+    exec /bin/bash "$@"

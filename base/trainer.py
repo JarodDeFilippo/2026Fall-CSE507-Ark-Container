@@ -1,13 +1,14 @@
+# Modified from the course Ark+ container (see NOTICE)
 import datetime
 import os
 import time
 
 import torch
 
-from utils import MetricLogger, save_image
+from utils import MetricLogger, clip_or_measure_grad_norm, save_image
 
 
-def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, criterion, optimizer, epoch, ema_mode, teacher, momentum_schedule, it, is_main_process=True, accelerator=None, global_step=0, momentum=None, train_log=None, loss_writer=None, loss_file=None, snapshot_directory=None, print_freq=50, training_start_time=None):
+def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, criterion, optimizer, epoch, ema_mode, teacher, momentum_schedule, it, is_main_process=True, accelerator=None, global_step=0, momentum=None, train_log=None, loss_writer=None, loss_file=None, snapshot_directory=None, print_freq=50, training_start_time=None, clip_grad=None):
     raw_losses_cls = MetricLogger('Raw loss_'+dataset+' cls', ':.4e')
     raw_losses_mse = MetricLogger('Raw loss_'+dataset+' mse', ':.4e')
     losses_cls = MetricLogger('Loss_'+dataset+' cls', ':.4e')
@@ -15,11 +16,13 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
     losses_total = MetricLogger('Loss_'+dataset+' total', ':.4e')
     batch_time = MetricLogger('Batch time', ':6.3f')
     data_time = MetricLogger('Data time', ':6.3f')
+    grad_norms = MetricLogger('GN', ':.4f')
     if training_start_time is None:
         training_start_time = time.time()
 
     model.train()
     teacher.eval()
+    student_params = list(model.parameters())
     MSE = torch.nn.MSELoss()
     coff = (momentum_schedule[it] - 0.9) * 5
     if momentum is None:
@@ -51,6 +54,7 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
         loss.backward()
         if accelerator is not None:
             accelerator.mark_step()
+        grad_norms.update(clip_or_measure_grad_norm(student_params, clip_grad))
         optimizer.step()
         if accelerator is not None:
             accelerator.mark_step()
@@ -144,7 +148,7 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
                     "LR={:.2e} m={:.5f} w_cons={:.3f} "
                     "Loss={:.4f}({:.4f}) "
                     "Cls={:.4f}({:.4f}) [{:.1f}%] "
-                    "Cons={:.4f}({:.4f}) [{:.1f}%] Elapsed={}"
+                    "Cons={:.4f}({:.4f}) [{:.1f}%] GN={:.4f}({:.4f}) Elapsed={}"
                 ).format(
                     dataset,
                     use_head_n,
@@ -167,6 +171,8 @@ def train_one_epoch(model, use_head_n, dataset, data_loader_train, device, crite
                     global_raw_const_value,
                     raw_losses_mse.avg,
                     const_percent,
+                    grad_norms.val.item(),
+                    grad_norms.avg.item(),
                     elapsed,
                 )
                 if train_log is not None:

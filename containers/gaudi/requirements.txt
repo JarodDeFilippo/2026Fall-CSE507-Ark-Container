@@ -1,0 +1,14 @@
+# Pinned to the A100 image's versions (containers/nvidia/requirements.txt) so both arms share the data path.
+# scipy and tqdm float on purpose: the A100 image's scipy 1.16.1 needs Python 3.11 (this base is 3.10), and tqdm
+# comes with the base image, where a pin could conflict with the constraints frozen from it (see apptainer.def).
+# numpy, torch and torchvision are deliberately absent: the base image provides them.
+# the Habana 1.24.0 base ships numpy 2.2.6 (measured in build 64599857), which opencv 4.12.0.88 (numpy>=2,<2.3) accepts
+albumentations==2.0.8
+opencv-python-headless==4.12.0.88
+pydicom==3.0.1
+scikit-image==0.25.2
+scikit-learn==1.7.1
+scipy
+PyYAML==6.0.2
+Pillow==11.3.0
+tqdm

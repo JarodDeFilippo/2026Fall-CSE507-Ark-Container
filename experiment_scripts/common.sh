@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified from the course Ark+ container (see NOTICE)
 set -euo pipefail
 
 EXPERIMENT_SCRIPTS_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -107,11 +108,15 @@ ark_launch_experiment() {
     local training_args=(
         --opt sgd
         --warmup-epochs 20
-        --batch_size 200
-        --model swin_base
-        --init imagenet
+        --batch_size "${ARK_BATCH_SIZE:-200}"
+        --lr "${ARK_LR:-0.01}"
+        --test_augment "${ARK_TEST_AUGMENT:-true}"
+        --eval_every "${ARK_EVAL_EVERY:-1}"
+        --workers "${ARK_WORKERS:-8}"
+        --model "${ARK_MODEL:-swin_base}"
+        --init "${ARK_INIT:-imagenet}"
         --pretrain_epochs 200
-        --pretrained_weights https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_patch4_window7_224_22kto1k.pth
+        --pretrained_weights "${ARK_PRETRAINED_WEIGHTS:-https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_patch4_window7_224_22kto1k.pth}"
         --momentum_teacher 0.9
         --projector_features 1376
         --ema_mode epoch

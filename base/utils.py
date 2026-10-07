@@ -1,3 +1,4 @@
+# Modified from the course Ark+ container (see NOTICE)
 from sklearn.metrics import roc_auc_score
 import torch
 import numpy as np
@@ -33,6 +34,15 @@ class MetricLogger(object):
     def __str__(self):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
         return fmtstr.format(**self.__dict__)
+
+
+def clip_or_measure_grad_norm(parameters, clip_grad=None):
+    """Total grad L2 norm as a tensor (no host sync). Clips the grads in place to `clip_grad` when it is not None
+    (0 included, which zeroes them); None leaves them untouched, so runs without clipping stay bitwise identical."""
+    parameters = list(parameters)
+    if clip_grad is not None:
+        return torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
+    return torch.nn.utils.get_total_norm([p.grad for p in parameters if p.grad is not None])
 
 
 class ProgressLogger(object):
