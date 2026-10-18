@@ -13,7 +13,7 @@ and removed again when the fit moved to the Linearprobing script; it is in the g
 are left in, as shipped.
 
 What was changed. Every change to dataloader.py is marked by a comment that starts `# ported:` and says why, on the changed line, or on the line that replaces a deleted one.
-`git diff --no-index` against the upstream file lists the changes; the vendoring guard in test_ark_finetune.py does exactly that and fails on a hunk without a marker. There are three:
+`git diff --no-index` against the upstream file lists the changes; the vendoring guard in test_ark_finetune.py does exactly that and fails on a hunk without a marker. Besides the notice of changes on the file's first line, there are three:
   * the `import SimpleITK` line is dropped: nothing in the file uses it and the container image does not have it;
   * the albumentations import is dropped: nothing in the file uses it, and the container's albumentations 2.0.8 has no RandomBrightness, RandomContrast, JpegCompression or
     IAAAdditiveGaussianNoise, so the import raises;
