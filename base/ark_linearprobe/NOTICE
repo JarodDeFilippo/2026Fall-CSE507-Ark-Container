@@ -10,6 +10,7 @@ NOTICE file: this is that file.
 What was changed. utils.py is unchanged (byte-identical). Every change to main_linearprobing.py is marked by a comment that starts `# ported:` and says why, on the changed line, or on the
 line that replaces a deleted one. `git diff --no-index` against the upstream file lists the changes; the vendoring guard in ../ark_finetune/test_ark_finetune.py does exactly that and fails
 on a hunk without a marker. In short:
+  * the first line is a notice that the file was changed, pointing to this NOTICE.
   * imports: package-relative (the name collides with the container's base/utils.py); `import pandas` is dropped (nothing uses it, the container image has none); the new dataset modules are imported.
   * options: get_args_parser takes an optional argv, so that the runner can build the options without sys.argv. What main() hard-codes becomes an option: --results_dir (the hard-coded
     /results), and for the new dataset modules --train_list, --test_list and --data_dir (the shipped ones hard-code /data/... paths in main()).
