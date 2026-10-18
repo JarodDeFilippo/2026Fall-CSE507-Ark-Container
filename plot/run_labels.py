@@ -1,8 +1,41 @@
 #!/usr/bin/env python3
-"""Build concise, collision-safe labels for compared run directories."""
+"""Build concise, collision-safe labels for compared run directories.
 
+Also maps dataset directory names to their official display names.
+"""
+
+import re
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
+
+# Human-facing dataset names. The keys are the evaluation/<directory> names,
+# which stay the machine ids (file names, folder names, CSV paths).
+DATASET_DISPLAY = {
+    "VinDrCXR": "VinDr-CXR",
+    "ChestXray14": "ChestX-ray14",
+    "MIMIC": "MIMIC-CXR",
+    "CheXpert": "CheXpert",
+}
+
+
+def dataset_display(name: str) -> str:
+    """Official display name of a dataset directory; others pass through."""
+    return DATASET_DISPLAY.get(name, name)
+
+
+# Arms whose label is fixed rather than derived: the input-size arms of sweep/wave1.tsv (the center recipe, 30 cycles, at two crop sizes; S2 is the
+# 224 px control). The one source of these strings: build_step8_report.py's run labels and titles and short_run_labels read them here.
+ARM_LABELS = {
+    "S18": "S18 (center recipe, 448 px)",
+    "S19": "S19 (center recipe, 512 px)",
+}
+_SWEEP_RUN = re.compile(r"all4_cyclic_dinov3_sweep_(.+)_seed_\d+")
+
+
+def arm_label(name: str) -> Optional[str]:
+    """The fixed label of an ARM_LABELS arm, by arm id ("S18") or by its run directory name (all4_cyclic_dinov3_sweep_S18_seed_100); None for any other run."""
+    match = _SWEEP_RUN.fullmatch(name)
+    return ARM_LABELS.get(match.group(1) if match else name)
 
 
 def _tokens(name: str) -> Tuple[str, ...]:
@@ -85,12 +118,19 @@ def short_run_labels(run_directories: Sequence[Path]) -> List[str]:
     are removed, so for example ``experiment_seed_100`` and
     ``experiment_seed_101`` become ``100`` and ``101``. If removing shared
     parts would make labels empty or ambiguous, the original name or enough
-    parent path is retained to keep every label distinct.
+    parent path is retained to keep every label distinct. A run with a fixed
+    label (arm_label) gets that label instead, unless two runs would then share one.
     """
     paths = [
         Path(directory).expanduser().resolve()
         for directory in run_directories
     ]
+    derived = _derived_labels(paths)
+    fixed = [arm_label(path.name) or label for path, label in zip(paths, derived)]
+    return fixed if _unique(fixed) else derived
+
+
+def _derived_labels(paths: Sequence[Path]) -> List[str]:
     if not paths:
         return []
 

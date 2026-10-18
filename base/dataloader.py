@@ -24,6 +24,8 @@ def build_transform_classification(normalize, crop_size=224, resize=256, mode="t
       normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     elif normalize.lower() == "chestx-ray":
       normalize = transforms.Normalize([0.5056, 0.5056, 0.5056], [0.252, 0.252, 0.252])
+    elif normalize.lower() == "raddino":  # RAD-DINO's preprocessor_config.json: grayscale mean/std, repeated on the 3 channels
+      normalize = transforms.Normalize([0.5307, 0.5307, 0.5307], [0.2583, 0.2583, 0.2583])
     elif normalize.lower() == "none":
       normalize = None
     else:

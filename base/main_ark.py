@@ -6,16 +6,26 @@ import time
 import random
 import re
 import numpy as np
-from optparse import OptionParser
+from optparse import OptionParser, OptionValueError
 from shutil import copyfile
 
 from utils import vararg_callback_bool, vararg_callback_int, get_config
 from dataloader import  *
 
 import torch
-from engine import omni_engine
+from engine import omni_engine, LEGACY_INPUT_SIZE, _recorded_input_size
 
 sys.setrecursionlimit(40000)
+
+
+def freeze_backbone_callback(option, opt_str, value, parser):
+    # vararg_callback_bool indexes an empty parser.rargs when the flag is the last token (IndexError), and swallows the next
+    # option, storing None, when that token is not a boolean word: "--freeze_backbone --opt adamw" would drop --opt and not freeze
+    if not parser.rargs:
+        raise OptionValueError("--freeze_backbone needs true or false")
+    vararg_callback_bool(option, opt_str, value, parser)
+    if parser.values.freeze_backbone is None:
+        raise OptionValueError("--freeze_backbone needs true or false")
 
 
 def get_args_parser():
@@ -23,16 +33,17 @@ def get_args_parser():
 
     parser.add_option("--GPU", dest="GPU", help="the index of gpu is used", default=None, action="callback",
                       callback=vararg_callback_int)
-    parser.add_option("--model", dest="model_name", help="swin_base|swin_large|swin_large_384|swin_large_768|conv_base|vit_base_dinov3", default="swin_base", type="string")
+    parser.add_option("--model", dest="model_name", help="swin_base|swin_large|swin_large_384|swin_large_768|conv_base|vit_base_dinov3|vit_base_dinov2|vit_base_raddino|vit_large_raydino", default="swin_base", type="string")
     parser.add_option("--init", dest="init",help="Random| ImageNet_1k| ImageNet_21k| SAM| DeiT| BEiT| DINO| MoCo_V3| MoBY | MAE| SimMIM", default="Random", type="string")
     parser.add_option("--pretrained_weights", dest="pretrained_weights", help="Path to a checkpoint or saved-weights directory", default=None, type="string")
     parser.add_option("--num_class", dest="num_class", help="number of the classes in the downstream task",
                       default=14, type="int")
     parser.add_option("--data_set", dest="dataset_list", help="ChestXray14|CheXpert|Shenzhen|VinDrCXR|RSNAPneumonia",  action="append")
-    parser.add_option("--normalization", dest="normalization", help="how to normalize data (imagenet|chestx-ray)", default="imagenet",
+    parser.add_option("--normalization", dest="normalization", help="how to normalize data (imagenet|chestx-ray|raddino|none)", default="imagenet",
                       type="string")
-    parser.add_option("--input_size", dest="crop_size", help="input resolution", default=224, type="int")
-    parser.add_option("--img_resize", dest="resize", help="resize image resolution", default=256, type="int")
+    # no optparse default, so that test mode can tell "not passed" (then the saved weights' manifest decides) from a value given; see INPUT_SIZE_FLAGS
+    parser.add_option("--input_size", dest="crop_size", help="input resolution (default 224; test mode: the saved weights' manifest.json value)", default=None, type="int")
+    parser.add_option("--img_resize", dest="resize", help="resize image resolution (default 256; test mode: the saved weights' manifest.json value)", default=None, type="int")
     parser.add_option("--img_depth", dest="img_depth", help="num of image depth", default=3, type="int")
     parser.add_option("--batch_size", dest="batch_size", help="batch size", default=32, type="int")
     parser.add_option("--epochs", dest="epochs", help="num of epoches", default=200, type="int")
@@ -67,6 +78,10 @@ def get_args_parser():
     parser.add_option("--eval_every", dest="eval_every",
                       help="run validation/test evaluation only on every Nth cycle (and the last); default 1 = every cycle",
                       default=1, type="int")
+    parser.add_option("--eval_cycle0", dest="eval_cycle0",
+                      help="true | false: on a fresh training run, save the initial weights as models/weights/epoch_0000 and evaluate them "
+                           "(cycle 0, evaluation_point init) before cycle 1; skipped on resume",
+                      default=False, action="callback", callback=vararg_callback_bool)
     parser.add_option("--val_loss_metric", dest="val_loss_metric",
                       help="deprecated; validation loss does not control the LR schedule",
                       default="average", type="string")
@@ -87,9 +102,11 @@ def get_args_parser():
     parser.add_option('--weight-decay', type=float, default=0.0,
                         help='weight decay (default: 0.05)')
     parser.add_option('--layer-decay', type=float, default=None, metavar='RATE',
-                        help='layer-wise LR decay for vit_base_dinov3 (default: None, off)')
+                        help='layer-wise LR decay for vit_base_dinov3 / vit_base_dinov2 / vit_base_raddino / vit_large_raydino (default: None, off)')
     parser.add_option('--patch-embed-lr-mult', type=float, default=1.0, metavar='MULT',
-                        help='patch-embedding LR multiplier for vit_base_dinov3 (default: 1.0)')
+                        help='patch-embedding LR multiplier for vit_base_dinov3 / vit_base_dinov2 / vit_base_raddino / vit_large_raydino (default: 1.0)')
+    parser.add_option("--freeze_backbone", dest="freeze_backbone", help="true | false: train only the projector and task heads, backbone frozen (linear-probe phase); needs the value, e.g. --freeze_backbone true",
+                      default=False, action="callback", callback=freeze_backbone_callback)
     # Learning rate schedule parameters
     parser.add_option('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='deprecated; LR uses linear warmup and cosine decay')
@@ -128,6 +145,10 @@ def get_args_parser():
                       default=True, action="callback", callback=vararg_callback_bool)
     parser.add_option("--test_augment", dest="test_augment", help="whether use test time augmentation",
                       default=True, action="callback", callback=vararg_callback_bool)
+    parser.add_option("--test_output_suffix", dest="test_output_suffix",
+                      help="test mode: put this between the result file's stem and .csv (cycle_<NNNN>_<run>_seed_<seed><suffix>.csv) so that two evaluation protocols never "
+                           "share a file; eval_d1_6.sh passes .centercrop for ARK_TEST_AUGMENT=false; letters, digits, '.', '_' and '-' only; default empty",
+                      default="", type="string")
     parser.add_option("--anno_percent", dest="anno_percent", help="data percent", default=100, type="int")
     parser.add_option("--device", dest="device", help="cpu|cuda|hpu", default=os.environ.get("PROJECT_ACCELERATOR", "cuda"), type="string")
     parser.add_option("--reinit_heads", dest="reinit_heads", help="reinitialize task heads when resuming", default=False, action="callback", callback=vararg_callback_bool)
@@ -140,8 +161,33 @@ def get_args_parser():
 
 
     (options, args) = parser.parse_args()
+    if options.mode != "test":  # test mode resolves the ones not passed in main(), from the weights' manifest (resolve_test_input_size)
+        for attribute, key, _ in INPUT_SIZE_FLAGS:
+            if getattr(options, attribute) is None:
+                setattr(options, attribute, LEGACY_INPUT_SIZE[key])
 
     return options
+
+
+# (args attribute, manifest key, flag); LEGACY_INPUT_SIZE[key] is the default, 224 / 256
+INPUT_SIZE_FLAGS = (("crop_size", "input_size", "--input_size"), ("resize", "img_resize", "--img_resize"))
+
+
+def resolve_test_input_size(args):
+    """Test mode scores saved weights at the size they were trained at (engine._recorded_input_size: the weights directory's manifest.json, or a cycle
+    checkpoint's own metadata; 224 / 256, what every run trained at then, when they predate the keys): --input_size / --img_resize not passed take the
+    recorded values, and a value passed that differs is refused, with both values in the message. A file this trainer did not write records nothing:
+    it keeps the value passed, else 224 / 256."""
+    recorded = _recorded_input_size(args.pretrained_weights)
+    for attribute, key, flag in INPUT_SIZE_FLAGS:
+        passed = getattr(args, attribute)
+        if passed is None:
+            setattr(args, attribute, LEGACY_INPUT_SIZE[key] if recorded is None else recorded[key])
+        elif recorded is not None and passed != recorded[key]:
+            raise ValueError(
+                "{} {} differs from {}={} recorded in '{}', the size these weights were trained at; drop {} (the recorded size decides)"
+                .format(flag, passed, key, recorded[key], args.pretrained_weights, flag)
+            )
 
 
 def main(args):
@@ -158,6 +204,10 @@ def main(args):
             )
         if args.resume and args.resume_from is not None:
             raise ValueError("Use either --resume or --resume_from, not both")
+        if args.normalization.lower() == "raddino" and args.train_augment:
+            # with --train_augment true the datasets augment and normalize the training images themselves, with ImageNet's
+            # mean/std hard-coded (dataloader.py), so the preset would reach validation and test only
+            raise ValueError("--normalization raddino needs --train_augment false: the training augmentation always uses ImageNet mean/std")
     elif args.mode == "test":
         if not args.pretrained_weights:
             raise ValueError("--pretrained_weights is required for testing")
@@ -165,6 +215,7 @@ def main(args):
             raise FileNotFoundError(
                 "Test checkpoint or weights directory does not exist: {}".format(args.pretrained_weights)
             )
+        resolve_test_input_size(args)
 
     if args.seed is not None:
         random.seed(args.seed)

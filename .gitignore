@@ -16,3 +16,13 @@ weights/
 *.safetensors
 .DS_Store
 *.log
+
+# Stage A SSL run dirs: full checkpoints (~2.5 GB each) and backbone exports
+/*_seed_*/ckpt/
+/*_seed_*/export/
+
+# B2 linear probe: the embedding caches (about 2.2 GB per backbone), the shipped script's per-batch log and checkpoints, and the runner's logs; results/<tag>/<dataset>.json stays visible
+/embeddings/
+/results/*/probe/*/log.txt
+/results/**/ckpt.pth
+/results/*/*.log
