@@ -107,11 +107,14 @@ ark_launch_experiment() {
 
     local training_args=(
         --opt sgd
-        --warmup-epochs 20
+        --warmup-epochs "${ARK_WARMUP_EPOCHS:-20}"
         --batch_size "${ARK_BATCH_SIZE:-200}"
         --lr "${ARK_LR:-0.01}"
         --test_augment "${ARK_TEST_AUGMENT:-true}"
         --eval_every "${ARK_EVAL_EVERY:-1}"
+        --eval_cycle0 "${ARK_EVAL_CYCLE0:-false}"
+        --input_size "${ARK_INPUT_SIZE:-224}"
+        --img_resize "${ARK_IMG_RESIZE:-256}"
         --workers "${ARK_WORKERS:-8}"
         --model "${ARK_MODEL:-swin_base}"
         --init "${ARK_INIT:-imagenet}"

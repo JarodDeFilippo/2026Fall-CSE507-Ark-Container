@@ -44,3 +44,18 @@ python plot/compare_cyclic_runs.py \
     experiment_seed_100 \
     experiment_seed_101
 ~~~
+
+`compare_cyclic_runs.py` also takes `--models teacher|student|both` (default
+`both`: a dashed student and a solid teacher line per run; `teacher` or
+`student` draws that series only, solid, with the run label alone in the
+legend) and `--full-length` (draw every run to its own last evaluated cycle
+instead of cutting all runs at the shortest run's last cycle; the title then
+drops "through cycle N"). `--colors RUN=#RRGGBB ...` and `--labels RUN=Label
+...` set a line color and a legend label per run, keyed by the run directory
+name: runs that are not named keep the default palette color and short label,
+names that match no compared run are ignored with a note, a label with spaces
+needs quotes, and the output folder name does not change. Give them after the
+run directories, or end the option list with `--`. Plotted mAUC is in percent
+(the CSV fractions times 100) and the y axis reads "Test mAUC (%)" or
+"Validation mAUC (%)", so `--y-min` and `--y-max` are in percent in both
+scripts.

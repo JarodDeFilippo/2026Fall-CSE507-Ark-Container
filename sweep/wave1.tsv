@@ -1,0 +1,15 @@
+id	opt	lr	wd	layer_decay	patch_embed_mult	warmup	cycles	model	init	weights	normalization	seed	eval_every	eval_cycle0	input_size
+S2	adamw	7e-5	0.01	0.75	1.0	2	30	vit_base_dinov3	dinov3	/workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth	imagenet	100	2	false	224
+S4	adamw	7e-5	0	0.75	1.0	2	30	vit_base_dinov3	dinov3	/workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth	imagenet	100	2	false	224
+S10	momentum	1e-3	0	0.75	1.0	2	30	vit_base_dinov3	dinov3	/workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth	imagenet	100	2	false	224
+S11	momentum	3e-3	0	0.75	1.0	2	30	vit_base_dinov3	dinov3	/workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth	imagenet	100	2	false	224
+S12	momentum	3e-3	0	0.75	0	2	30	vit_base_dinov3	dinov3	/workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth	imagenet	100	2	false	224
+S1	adamw	2.5e-5	0.01	0.75	1.0	2	30	vit_base_dinov3	dinov3	/workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth	imagenet	100	2	false	224
+S3	adamw	2e-4	0.01	0.75	1.0	2	30	vit_base_dinov3	dinov3	/workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth	imagenet	100	2	false	224
+S5	adamw	7e-5	0.05	0.75	1.0	2	30	vit_base_dinov3	dinov3	/workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth	imagenet	100	2	false	224
+S6	adamw	7e-5	0.01	0.65	1.0	2	30	vit_base_dinov3	dinov3	/workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth	imagenet	100	2	false	224
+S7	adamw	7e-5	0.01	0.9	1.0	2	30	vit_base_dinov3	dinov3	/workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth	imagenet	100	2	false	224
+S13	adamw	7e-5	0.01	0.75	1.0	2	30	vit_base_dinov3	dinov3	STAGEA_FINAL	imagenet	100	2	false	224
+S16	adamw	7e-5	0.01	0.75	1.0	2	30	vit_base_dinov3	dinov3	/workspace/ssl_dinov3_cxr_constlr_seed_100/export/teacher_backbone_epoch_0030.pth	imagenet	100	2	false	224
+S18	adamw	7e-5	0.01	0.75	1.0	2	30	vit_base_dinov3	dinov3	/workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth	imagenet	100	1	false	448
+S19	adamw	7e-5	0.01	0.75	1.0	2	30	vit_base_dinov3	dinov3	/workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth	imagenet	100	1	false	512

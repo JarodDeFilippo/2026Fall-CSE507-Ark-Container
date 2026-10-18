@@ -1,5 +1,6 @@
 # Modified from the course Ark+ container (see NOTICE)
 
+import contextlib
 import os
 import sys
 import shutil
@@ -11,13 +12,14 @@ import tempfile
 import json
 import logging
 import math
+import random
 import numpy as np
 from optparse import OptionParser
 import copy
 
 
 from accelerator import Accelerator, DistributedEvaluationSampler
-from models import build_omni_model, save_checkpoint, vit_param_groups
+from models import DINO_VIT_MODELS, build_omni_model, save_checkpoint, vit_param_groups
 from utils import metric_AUROC, cosine_scheduler
 from sklearn.metrics import accuracy_score
 
@@ -341,6 +343,7 @@ def _evaluate_test_sets(
             train_log,
         )
     accelerator.barrier()
+    return student_means, teacher_means
 
 
 def _evaluate_validation_sets(
@@ -542,6 +545,10 @@ def _checkpoint_stem(args, cycle):
     return "cycle_{:04d}_{}_seed_{}".format(cycle, args.exp_name, args.seed)
 
 
+# What a manifest or checkpoint written before input_size / img_resize were recorded trained at: main_ark.py's defaults, which no launcher overrode then
+LEGACY_INPUT_SIZE = {'input_size': 224, 'img_resize': 256}
+
+
 def _run_metadata(args, dataset_list, num_classes_list, cycle):
     return {
         'cycle': cycle,
@@ -554,7 +561,37 @@ def _run_metadata(args, dataset_list, num_classes_list, cycle):
         'seed': args.seed,
         'training_strategy': getattr(args, 'training_strategy', 'cyclic'),
         'joint_sampling': getattr(args, 'joint_sampling', 'proportional'),
+        'freeze_backbone': bool(getattr(args, 'freeze_backbone', False)),
+        'input_size': int(getattr(args, 'crop_size', LEGACY_INPUT_SIZE['input_size'])),  # --input_size, the crop
+        'img_resize': int(getattr(args, 'resize', LEGACY_INPUT_SIZE['img_resize'])),  # --img_resize, the resize before it
     }
+
+
+def _save_cycle_weights(weights_directory, args, metadata, student_model, teacher):
+    """models/weights/epoch_<NNNN>/: the student and teacher state dicts, then manifest.json, written into a sibling directory that is
+    renamed to epoch_<NNNN> once all three exist, so an epoch_<NNNN> is never partial; returns the CPU copies."""
+    cycle = metadata['cycle']
+    weight_directory = os.path.join(weights_directory, "epoch_{:04d}".format(cycle))
+    partial_directory = os.path.join(weights_directory, ".partial-epoch_{:04d}".format(cycle))  # same filesystem; no epoch_* pattern matches it
+    shutil.rmtree(partial_directory, ignore_errors=True)  # left by an attempt killed while saving this cycle
+    os.makedirs(partial_directory)
+    state_dicts = []
+    for role, network in (("student", student_model), ("teacher", teacher)):
+        state_dict = _copy_to_cpu(network.state_dict())
+        torch.save(
+            state_dict,
+            os.path.join(
+                partial_directory,
+                "{}_{}.pth".format(role, _checkpoint_stem(args, cycle)),
+            ),
+        )
+        state_dicts.append(state_dict)
+    with open(os.path.join(partial_directory, "manifest.json"), 'w') as manifest_file:
+        json.dump(metadata, manifest_file, indent=2, sort_keys=True)
+    if os.path.isdir(weight_directory):  # as before, saving a cycle again replaces its directory
+        shutil.rmtree(weight_directory)
+    os.replace(partial_directory, weight_directory)
+    return state_dicts
 
 
 def _find_checkpoint_for_cycle(checkpoint_directory, cycle):
@@ -612,6 +649,29 @@ def _checkpoint_run_directory(checkpoint_path):
             "Checkpoint must be inside <run>/models/checkpoints: {}".format(checkpoint_path)
         )
     return os.path.dirname(os.path.dirname(checkpoint_directory))
+
+
+@contextlib.contextmanager
+def _preserved_rng(device):
+    """Run an evaluation without moving the RNG streams training draws from. Every DataLoader iterator draws a base seed from the global torch RNG (and
+    without workers the datasets draw from the global RNGs themselves), so an evaluation would shift the training augmentation after it, by an amount that
+    depends on how often the run evaluates (--eval_every) and on --eval_cycle0. Saves python random, numpy, torch's CPU RNG and the device RNG (cuda; hpu
+    where torch.hpu has get_rng_state / set_rng_state) and restores them after the block; an exception leaves them as they are."""
+    kind = torch.device(device).type
+    backend = torch.cuda if kind == "cuda" else getattr(torch, "hpu", None) if kind == "hpu" else None
+    if backend is not None and not (hasattr(backend, "get_rng_state") and hasattr(backend, "set_rng_state")):
+        backend = None
+    states = (random.getstate(), np.random.get_state(), torch.get_rng_state())
+    device_state = None if backend is None else backend.get_rng_state(device) if kind == "cuda" else backend.get_rng_state()
+    yield
+    random.setstate(states[0])
+    np.random.set_state(states[1])
+    torch.set_rng_state(states[2])
+    if backend is not None:
+        if kind == "cuda":
+            backend.set_rng_state(device_state, device)
+        else:
+            backend.set_rng_state(device_state)
 
 
 def _should_evaluate(args, epoch):
@@ -709,8 +769,8 @@ class WarmupCosineScheduler:
 
 def _create_vit_finetune_optimizer(args, model):
     """Optimizer over vit_param_groups (layer-wise LR decay, no-decay groups); WarmupCosineScheduler applies each group's lr_scale."""
-    if args.model_name != "vit_base_dinov3":
-        raise ValueError("--layer-decay and --patch-embed-lr-mult are only implemented for --model vit_base_dinov3")
+    if args.model_name not in DINO_VIT_MODELS:
+        raise ValueError("--layer-decay and --patch-embed-lr-mult are only implemented for --model {}".format(" | ".join(DINO_VIT_MODELS)))
     groups = vit_param_groups(model, args.weight_decay, args.layer_decay, args.patch_embed_lr_mult)
     opt = args.opt.lower()
     if opt == "adamw":
@@ -724,15 +784,50 @@ def _create_vit_finetune_optimizer(args, model):
     raise ValueError("--layer-decay and --patch-embed-lr-mult support --opt adamw, sgd or momentum, not '{}'".format(args.opt))
 
 
+def _freeze_backbone(model):
+    """--freeze_backbone: requires_grad=False on every parameter outside projector. and omni_heads. Returns the log line.
+
+    Call it on the bare module, before accelerator.wrap_model: DDP builds its reducer buckets from the parameters that
+    require grad at construction, so the frozen backbone then stays out of the all-reduce.
+    """
+    frozen = [param for name, param in model.named_parameters() if not name.startswith(("projector.", "omni_heads."))]
+    for param in frozen:
+        param.requires_grad = False
+    trainable = [param for param in model.parameters() if param.requires_grad]
+    return "Backbone frozen: {} tensors ({:,} params) frozen, {} tensors ({:,} params) trainable".format(
+        len(frozen), sum(p.numel() for p in frozen), len(trainable), sum(p.numel() for p in trainable))
+
+
+def _create_frozen_backbone_optimizer(args, model):
+    """Optimizer for --freeze_backbone: timm's create_optimizer over the trainable parameters.
+
+    timm 0.5.4's add_weight_decay skips requires_grad=False parameters, but only when --weight-decay > 0 (with 0,
+    create_optimizer_v2 hands over model.parameters()), so verify that exactly the trainable parameters are in the optimizer.
+    Only --opt adamw, sgd and momentum, the ones _validate_grouped_optimizer_resume can tell apart: a run that could not be resumed never starts.
+    """
+    if args.layer_decay is not None or args.patch_embed_lr_mult != 1.0:
+        raise ValueError("--freeze_backbone trains only projector and heads; do not pass --layer-decay / --patch-embed-lr-mult")
+    if args.opt.lower() not in ("adamw", "sgd", "momentum"):
+        raise ValueError("--freeze_backbone supports --opt adamw, sgd or momentum, not '{}'".format(args.opt))
+    optimizer = create_optimizer(args, model)
+    in_optimizer = sum(p.numel() for group in optimizer.param_groups for p in group['params'])
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if in_optimizer != trainable:
+        raise RuntimeError(
+            "The optimizer holds {:,} params but {:,} are trainable: frozen parameters reached it (use --weight-decay > 0)"
+            .format(in_optimizer, trainable))
+    return optimizer
+
+
 def _validate_grouped_optimizer_resume(optimizer, saved_state):
-    """Raise ValueError unless the saved optimizer state matches the grouped optimizer this run built.
+    """Raise ValueError unless the saved optimizer state matches the grouped (or --freeze_backbone) optimizer this run built.
 
     Call it with the fresh optimizer and checkpoint['optimizer'], before optimizer.load_state_dict: that copies every saved
     group (lr_scale, weight_decay, betas, ...) over the fresh one, so a resume with another --opt, --layer-decay,
     --patch-embed-lr-mult or --weight-decay would silently train on the original run's settings, or die inside
     load_state_dict / at the first step on a KeyError.
     """
-    def signature(group):  # lr_scale is nan for a group that carries none, e.g. from the default optimizer
+    def signature(group):  # lr_scale is nan for a group that carries none: the default optimizer's, and --freeze_backbone's
         return group.get('lr_scale', float('nan')), group['weight_decay'], len(group['params'])
 
     advice = "The resume arguments (--opt, --layer-decay, --patch-embed-lr-mult, --weight-decay) must match the original run."
@@ -746,8 +841,8 @@ def _validate_grouped_optimizer_resume(optimizer, saved_state):
             len(saved_groups), len(built_groups), advice))
     for index, (built, saved) in enumerate(zip(built_groups, saved_groups)):
         want, got = signature(built), signature(saved)
-        # rel_tol: layer_decay ** n may differ in the last bit between libm builds
-        if not all(math.isclose(a, b, rel_tol=1e-9) for a, b in zip(want, got)):
+        # rel_tol: layer_decay ** n may differ in the last bit between libm builds; no lr_scale on either side (nan, nan) matches
+        if not all((math.isnan(a) and math.isnan(b)) or math.isclose(a, b, rel_tol=1e-9) for a, b in zip(want, got)):
             raise ValueError(
                 "Optimizer param group {} is (lr_scale, weight_decay, n_params) = {} in the checkpoint, but this run built {}. {}"
                 .format(index, got, want, advice))
@@ -799,6 +894,29 @@ def _validate_checkpoint_training_strategy(checkpoint, file_path, args):
             raise ValueError(
                 "Checkpoint '{}' uses joint sampling '{}', but this run requests '{}'"
                 .format(file_path, checkpoint_sampling, requested_sampling)
+            )
+
+
+def _validate_checkpoint_freeze_backbone(checkpoint, file_path, args):
+    checkpoint_frozen = checkpoint.get('freeze_backbone', False)
+    requested_frozen = bool(getattr(args, 'freeze_backbone', False))
+    if checkpoint_frozen != requested_frozen:
+        raise ValueError(
+            "Checkpoint '{}' was trained with freeze_backbone={}, but this run requests freeze_backbone={}; "
+            "pass --freeze_backbone {} to match"
+            .format(file_path, checkpoint_frozen, requested_frozen, str(checkpoint_frozen).lower())
+        )
+
+
+def _validate_checkpoint_input_size(checkpoint, file_path, args):
+    # a manifest / checkpoint without the keys predates them and trained at LEGACY_INPUT_SIZE (224 / 256), so a run started before this resumes as it was
+    for key, attribute, flag in (('input_size', 'crop_size', '--input_size'), ('img_resize', 'resize', '--img_resize')):
+        trained = checkpoint.get(key, LEGACY_INPUT_SIZE[key])
+        requested = getattr(args, attribute, LEGACY_INPUT_SIZE[key])
+        if trained != requested:
+            raise ValueError(
+                "Checkpoint '{}' was trained with {}={}, but this run requests {}={}; pass {} {} to match"
+                .format(file_path, key, trained, key, requested, flag, trained)
             )
 
 
@@ -915,6 +1033,28 @@ def _discard_outputs_after_cycle(run_directory, max_cycle):
         os.path.join(run_directory, "train.log"),
         max_cycle,
     )
+
+
+def _only_cycle0_saved(run_directory, args, dataset_list, datasets_config):
+    """A run that saved epoch_0000 (--eval_cycle0) but has no valid cycle checkpoint (the caller asks once
+    _find_latest_valid_checkpoint found none). epoch_0000 is written after the cycle-0 evaluation, so cycle 0 is complete and --resume
+    starts cycle 1 from those weights; the recipe has to match it as it has to match a checkpoint on resume."""
+    weights_directory = os.path.join(run_directory, "models", "weights", "epoch_0000")
+    if not os.path.isdir(weights_directory):
+        return False
+    manifest = _load_weight_manifest(weights_directory)
+    _validate_test_metadata(
+        manifest,
+        weights_directory,
+        args,
+        dataset_list,
+        [len(datasets_config[dataset]['diseases']) for dataset in dataset_list],
+        require_model_metadata=True,
+    )
+    _validate_checkpoint_training_strategy(manifest, weights_directory, args)
+    _validate_checkpoint_freeze_backbone(manifest, weights_directory, args)
+    _validate_checkpoint_input_size(manifest, weights_directory, args)
+    return True
 
 
 def _copy_cycle_directories(source_directory, target_directory, prefix, max_cycle):
@@ -1049,7 +1189,7 @@ def _load_weight_manifest(weights_directory):
             .format(manifest_path, sorted(missing_keys))
         )
     directory_cycle = _weight_cycle(weights_directory)
-    if not isinstance(manifest['cycle'], int) or manifest['cycle'] < 1:
+    if not isinstance(manifest['cycle'], int) or manifest['cycle'] < 0:
         raise ValueError(
             "Weight manifest '{}' has an invalid cycle".format(manifest_path)
         )
@@ -1073,16 +1213,40 @@ def _load_weight_manifest(weights_directory):
     return manifest
 
 
-def _test_output_path(output_directory, checkpoint_path):
+def _recorded_input_size(weights_path):
+    """{'input_size', 'img_resize'} the saved weights were trained at: a weights directory's manifest.json (a saved weight file: its directory's), or a cycle
+    checkpoint's own metadata (the trainer saves the manifest's fields in it); LEGACY_INPUT_SIZE's values for the keys a manifest or checkpoint from before them
+    lacks. None for a file this trainer did not write (no run metadata): nothing is recorded."""
+    if os.path.isfile(weights_path) and _is_saved_weight_file(weights_path):
+        weights_path = os.path.dirname(weights_path)
+    if os.path.isdir(weights_path):
+        metadata = _load_weight_manifest(weights_path)
+    else:
+        # ponytail: test mode reads a checkpoint twice (here, before the transforms are built, and in _load_test_state_dicts); only the .pth.tar path pays it,
+        # eval_d1_6.sh passes weights directories. Hand the loaded checkpoint to the engine if that ever matters.
+        metadata = torch.load(weights_path, map_location='cpu', weights_only=False)
+        if not isinstance(metadata, dict) or 'run_name' not in metadata:
+            return None
+    return {key: metadata.get(key, default) for key, default in LEGACY_INPUT_SIZE.items()}
+
+
+def _test_output_path(output_directory, checkpoint_path, suffix=''):
+    # suffix: the evaluation protocol's marker (eval_d1_6.sh passes .centercrop for center crop), put between the file's stem and .csv so that a protocol never
+    # writes into another's file; '' keeps the names the ten-crop results have always had
+    if re.fullmatch(r"[A-Za-z0-9._-]*", suffix) is None:
+        raise ValueError(
+            "--test_output_suffix may contain only letters, numbers, '.', '_' and '-': {!r}".format(suffix)
+        )
     checkpoint_name = os.path.basename(os.path.normpath(checkpoint_path))
     if os.path.isdir(checkpoint_path):
         manifest = _load_weight_manifest(checkpoint_path)
         return os.path.join(
             output_directory,
-            "cycle_{:04d}_{}_seed_{}.csv".format(
+            "cycle_{:04d}_{}_seed_{}{}.csv".format(
                 manifest['cycle'],
                 manifest['run_name'],
                 manifest['seed'],
+                suffix,
             ),
         )
     if _is_saved_weight_file(checkpoint_path):
@@ -1090,16 +1254,17 @@ def _test_output_path(output_directory, checkpoint_path):
         manifest = _load_weight_manifest(weights_directory)
         return os.path.join(
             output_directory,
-            "cycle_{:04d}_{}_seed_{}.csv".format(
+            "cycle_{:04d}_{}_seed_{}{}.csv".format(
                 manifest['cycle'],
                 manifest['run_name'],
                 manifest['seed'],
+                suffix,
             ),
         )
     if checkpoint_name.endswith('.pth.tar'):
-        result_name = checkpoint_name[:-len('.pth.tar')] + '.csv'
+        result_name = checkpoint_name[:-len('.pth.tar')] + suffix + '.csv'
     else:
-        result_name = os.path.splitext(checkpoint_name)[0] + '.csv'
+        result_name = os.path.splitext(checkpoint_name)[0] + suffix + '.csv'
     return os.path.join(output_directory, result_name)
 
 
@@ -1361,6 +1526,7 @@ def print_training_configuration(args, model_path, dataset_list,
     if training_strategy == "joint":
         _print_and_log("Joint Sampling: {}".format(joint_sampling), log_file)
     _print_and_log("Optimizer: {}".format(args.opt), log_file)
+    _print_and_log("Freeze Backbone: {}".format(bool(getattr(args, "freeze_backbone", False))), log_file)
     _print_and_log("Initial Learning Rate: {}".format(args.warmup_lr), log_file)
     _print_and_log("Peak Learning Rate: {}".format(args.lr), log_file)
     _print_and_log("Final Learning Rate: {}".format(args.min_lr), log_file)
@@ -1446,10 +1612,11 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         and (args.resume or getattr(args, "resume_from", None) is not None)
     )
     resume_checkpoint_path = None
+    ignored_checkpoints = []  # --resume at cycle 0: checkpoint files that did not load (an interrupted torch.save)
     resume_cycle = None
     test_output_path = None
     if args.mode == "test":
-        test_output_path = _test_output_path(output_path, args.pretrained_weights)
+        test_output_path = _test_output_path(output_path, args.pretrained_weights, getattr(args, 'test_output_suffix', ''))
         result_status = torch.zeros(1, dtype=torch.int32, device=device)
         if accelerator.is_main_process:
             result_status[0] = int(not os.path.exists(test_output_path))
@@ -1479,6 +1646,8 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             selected_checkpoint = _load_checkpoint_metadata(source_checkpoint)
             _validate_checkpoint_total_cycles(selected_checkpoint, source_checkpoint, args)
             _validate_checkpoint_training_strategy(selected_checkpoint, source_checkpoint, args)
+            _validate_checkpoint_freeze_backbone(selected_checkpoint, source_checkpoint, args)
+            _validate_checkpoint_input_size(selected_checkpoint, source_checkpoint, args)
             if selected_cycle >= selected_checkpoint['total_cycles']:
                 raise RuntimeError(
                     "Cannot resume from completed checkpoint '{}'".format(source_checkpoint)
@@ -1527,12 +1696,22 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 raise FileNotFoundError(
                     "Cannot resume training because run directory does not exist: {}".format(model_path)
                 )
-            latest_checkpoint, latest_cycle = _find_latest_valid_checkpoint(
-                os.path.join(model_path, "models", "checkpoints")
-            )
+            try:
+                latest_checkpoint, latest_cycle = _find_latest_valid_checkpoint(
+                    os.path.join(model_path, "models", "checkpoints")
+                )
+            except FileNotFoundError:
+                if not _only_cycle0_saved(model_path, args, dataset_list, datasets_config):
+                    raise
+                ignored_checkpoints.extend(sorted(glob.glob(os.path.join(model_path, "models", "checkpoints", "cycle_*.pth.tar"))))
+                _discard_outputs_after_cycle(model_path, 0)  # whatever the stopped attempt wrote of cycle 1, those files included
+                resume_cycle_tensor[0] = 0
+                return
             latest_metadata = _load_checkpoint_metadata(latest_checkpoint)
             _validate_checkpoint_total_cycles(latest_metadata, latest_checkpoint, args)
             _validate_checkpoint_training_strategy(latest_metadata, latest_checkpoint, args)
+            _validate_checkpoint_freeze_backbone(latest_metadata, latest_checkpoint, args)
+            _validate_checkpoint_input_size(latest_metadata, latest_checkpoint, args)
             if latest_cycle >= latest_metadata['total_cycles']:
                 raise RuntimeError(
                     "Cannot resume completed run '{}'".format(model_path)
@@ -1543,10 +1722,11 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         _run_main_process_resume_setup(accelerator, device, setup_latest_resume)
         accelerator.broadcast(resume_cycle_tensor)
         resume_cycle = int(resume_cycle_tensor.item())
-        resume_checkpoint_path = _find_checkpoint_for_cycle(
-            os.path.join(model_path, "models", "checkpoints"),
-            resume_cycle,
-        )
+        if resume_cycle > 0:  # 0: only epoch_0000 exists, no checkpoint (resume_checkpoint_path stays None)
+            resume_checkpoint_path = _find_checkpoint_for_cycle(
+                os.path.join(model_path, "models", "checkpoints"),
+                resume_cycle,
+            )
         accelerator.barrier()
     else:
         run_status = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1615,6 +1795,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
     task_types = [datasets_config[dataset]['task_type'] for dataset in dataset_list]
     training_strategy = getattr(args, 'training_strategy', 'cyclic')
     joint_sampling = getattr(args, 'joint_sampling', 'proportional')
+    freeze_backbone = args.mode == "train" and bool(getattr(args, 'freeze_backbone', False))
     data_loader_list_train = []
     train_sampler_list = []
     joint_dataset = None
@@ -1769,6 +1950,10 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         )
     model.to(device)
     teacher.to(device)
+    if freeze_backbone:  # before wrap_model: DDP builds its reducer buckets from the parameters that require grad
+        frozen_summary = _freeze_backbone(model)
+        if accelerator.is_main_process:
+            _print_and_log(frozen_summary, train_log)
     model = accelerator.wrap_model(model)
     student_model = accelerator.unwrap_model(model)
     accelerator.synchronize_model(teacher)
@@ -1801,7 +1986,15 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                 iters_per_epoch += len(d)
             momentum_schedule = cosine_scheduler(args.momentum_teacher, 1,
                                                    args.pretrain_epochs, iters_per_epoch)
-        if args.layer_decay is not None or args.patch_embed_lr_mult != 1.0:
+        if freeze_backbone:
+            optimizer = _create_frozen_backbone_optimizer(args, model)
+            if accelerator.is_main_process:
+                _print_and_log(
+                    "Optimizer holds {:,} params, equal to the trainable count".format(
+                        sum(p.numel() for group in optimizer.param_groups for p in group['params'])),
+                    train_log,
+                )
+        elif args.layer_decay is not None or args.patch_embed_lr_mult != 1.0:
             optimizer = _create_vit_finetune_optimizer(args, model)
             if accelerator.is_main_process:
                 _print_and_log(_param_group_summary(optimizer), train_log)
@@ -1896,7 +2089,22 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
             )
         accelerator.barrier()
     elif args.mode == "train":
-        if resume_requested:
+        if resume_requested and resume_checkpoint_path is None:  # cycle 0 done, no cycle finished: optimizer and scheduler start fresh
+            initial_weights = os.path.join(weights_directory, "epoch_0000")
+            student_state_dict, teacher_state_dict, _ = _load_test_state_dicts(initial_weights)
+            student_model.load_state_dict(accelerator.strip_module_prefix(student_state_dict), strict=True)
+            teacher.load_state_dict(accelerator.strip_module_prefix(teacher_state_dict), strict=True)
+            if accelerator.is_main_process:
+                _print_and_log(
+                    "=> no valid cycle checkpoint yet: cycle 1 starts from the initial weights in '{}' (cycle 0 is not re-evaluated){}"
+                    .format(
+                        initial_weights,
+                        "; ignored and removed checkpoint files that do not load: {}".format(ignored_checkpoints)
+                        if ignored_checkpoints else "",
+                    ),
+                    train_log,
+                )
+        elif resume_requested:
             resume = resume_checkpoint_path
             if not os.path.isfile(resume):
                 raise FileNotFoundError("Cannot load resume checkpoint: {}".format(resume))
@@ -1978,7 +2186,7 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                         .format(resume)
                     )
                 lr_scheduler.load_state_dict(checkpoint['scheduler'])
-                if args.layer_decay is not None or args.patch_embed_lr_mult != 1.0:  # the grouped optimizer built above
+                if freeze_backbone or args.layer_decay is not None or args.patch_embed_lr_mult != 1.0:  # the grouped / frozen-backbone optimizer built above
                     _validate_grouped_optimizer_resume(optimizer, checkpoint['optimizer'])
                 optimizer.load_state_dict(checkpoint['optimizer'])
                 if args.reinit_heads:
@@ -2016,6 +2224,66 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
         #         "epochs": args.pretrain_epochs,
         #         }
         #     )
+
+        if getattr(args, 'eval_cycle0', False) and not resume_requested:
+            cycle0_directory = os.path.join(weights_directory, "epoch_0000")
+            cycle0_status = torch.zeros(1, dtype=torch.int32, device=device)
+            if accelerator.is_main_process:
+                cycle0_status[0] = int(not os.path.exists(cycle0_directory))
+            accelerator.broadcast(cycle0_status)  # one decision for every rank: the evaluation runs collectives
+            if cycle0_status.item() == 1:
+                # every DataLoader iterator draws a base seed from the global RNG: _preserved_rng restores the RNGs afterwards, so cycle 1 onward
+                # trains exactly as it would without --eval_cycle0
+                with _preserved_rng(device):
+                    test_means = _evaluate_test_sets(
+                        student_model,
+                        teacher,
+                        dataset_list,
+                        datasets_config,
+                        data_loader_list_test,
+                        device,
+                        accelerator,
+                        evaluation_directory,
+                        0,
+                        0,
+                        "init",
+                        shared_val_test_splits,
+                        train_log,
+                    )
+                    _evaluate_validation_sets(
+                        student_model,
+                        teacher,
+                        dataset_list,
+                        datasets_config,
+                        data_loader_list_val,
+                        val_sampler_list,
+                        device,
+                        accelerator,
+                        evaluation_directory,
+                        0,
+                        0,
+                        "init",
+                        shared_val_test_splits,
+                        train_log,
+                    )
+                if accelerator.is_main_process:  # last, so an epoch_0000 means cycle 0 is complete (the --resume fallback relies on it)
+                    _save_cycle_weights(
+                        weights_directory,
+                        args,
+                        _run_metadata(args, dataset_list, num_classes_list, 0),
+                        student_model,
+                        teacher,
+                    )
+                    _print_and_log(
+                        "cycle 0 (init) evaluated: test mAUC {}; weights in {}".format(
+                            ", ".join(
+                                "{} student={:.6f} teacher={:.6f}".format(dataset, student_mean, teacher_mean)
+                                for dataset, student_mean, teacher_mean in zip(dataset_list, *test_means)
+                            ),
+                            cycle0_directory,
+                        ),
+                        train_log,
+                    )
 
         if training_strategy == "joint":
             it = start_epoch if args.ema_mode == "epoch" else start_epoch * len(data_loader_joint)
@@ -2118,37 +2386,38 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     )
                 global_step += len(data_loader_joint)
                 if _should_evaluate(args, epoch):
-                    _evaluate_test_sets(
-                        student_model,
-                        teacher,
-                        dataset_list,
-                        datasets_config,
-                        data_loader_list_test,
-                        device,
-                        accelerator,
-                        evaluation_directory,
-                        epoch + 1,
-                        epoch,
-                        "after_joint",
-                        shared_val_test_splits,
-                        train_log,
-                    )
-                    val_loss_list = _evaluate_validation_sets(
-                        student_model,
-                        teacher,
-                        dataset_list,
-                        datasets_config,
-                        data_loader_list_val,
-                        val_sampler_list,
-                        device,
-                        accelerator,
-                        evaluation_directory,
-                        epoch + 1,
-                        epoch,
-                        "after_joint",
-                        shared_val_test_splits,
-                        train_log,
-                    )
+                    with _preserved_rng(device):  # the training RNG streams do not depend on the evaluation cadence
+                        _evaluate_test_sets(
+                            student_model,
+                            teacher,
+                            dataset_list,
+                            datasets_config,
+                            data_loader_list_test,
+                            device,
+                            accelerator,
+                            evaluation_directory,
+                            epoch + 1,
+                            epoch,
+                            "after_joint",
+                            shared_val_test_splits,
+                            train_log,
+                        )
+                        val_loss_list = _evaluate_validation_sets(
+                            student_model,
+                            teacher,
+                            dataset_list,
+                            datasets_config,
+                            data_loader_list_val,
+                            val_sampler_list,
+                            device,
+                            accelerator,
+                            evaluation_directory,
+                            epoch + 1,
+                            epoch,
+                            "after_joint",
+                            shared_val_test_splits,
+                            train_log,
+                        )
             else:
                 for i, data_loader in enumerate(data_loader_list_train):
                     if train_sampler_list[i] is not None:
@@ -2222,73 +2491,56 @@ def omni_engine(args, model_path, output_path, dataset_list, datasets_config, da
                     it += 1
                     global_step += len(data_loader)
                     if _should_evaluate(args, epoch):
-                        _evaluate_test_sets(
-                            student_model,
-                            teacher,
-                            dataset_list,
-                            datasets_config,
-                            data_loader_list_test,
-                            device,
-                            accelerator,
-                            evaluation_directory,
-                            epoch + 1,
-                            epoch,
-                            "after_{}".format(dataset_list[i]),
-                            shared_val_test_splits,
-                            train_log,
-                        )
-                        val_loss_list = _evaluate_validation_sets(
-                            student_model,
-                            teacher,
-                            dataset_list,
-                            datasets_config,
-                            data_loader_list_val,
-                            val_sampler_list,
-                            device,
-                            accelerator,
-                            evaluation_directory,
-                            epoch + 1,
-                            epoch,
-                            "after_{}".format(dataset_list[i]),
-                            shared_val_test_splits,
-                            train_log,
-                        )
+                        with _preserved_rng(device):  # the training RNG streams do not depend on the evaluation cadence
+                            _evaluate_test_sets(
+                                student_model,
+                                teacher,
+                                dataset_list,
+                                datasets_config,
+                                data_loader_list_test,
+                                device,
+                                accelerator,
+                                evaluation_directory,
+                                epoch + 1,
+                                epoch,
+                                "after_{}".format(dataset_list[i]),
+                                shared_val_test_splits,
+                                train_log,
+                            )
+                            val_loss_list = _evaluate_validation_sets(
+                                student_model,
+                                teacher,
+                                dataset_list,
+                                datasets_config,
+                                data_loader_list_val,
+                                val_sampler_list,
+                                device,
+                                accelerator,
+                                evaluation_directory,
+                                epoch + 1,
+                                epoch,
+                                "after_{}".format(dataset_list[i]),
+                                shared_val_test_splits,
+                                train_log,
+                            )
 
             accelerator.mark_step()
             cycle = epoch + 1
             if accelerator.is_main_process:
-                weight_directory = os.path.join(
-                    weights_directory,
-                    "epoch_{:04d}".format(cycle),
-                )
-                os.makedirs(weight_directory, exist_ok=True)
                 metadata = _run_metadata(
                     args,
                     dataset_list,
                     num_classes_list,
                     cycle,
                 )
-                with open(
-                        os.path.join(weight_directory, "manifest.json"),
-                        'w') as manifest_file:
-                    json.dump(metadata, manifest_file, indent=2, sort_keys=True)
-                student_state_dict = _copy_to_cpu(student_model.state_dict())
-                teacher_state_dict = _copy_to_cpu(teacher.state_dict())
+                student_state_dict, teacher_state_dict = _save_cycle_weights(
+                    weights_directory,
+                    args,
+                    metadata,
+                    student_model,
+                    teacher,
+                )
                 optimizer_state_dict = _copy_to_cpu(optimizer.state_dict())
-                torch.save(
-                    student_state_dict,
-                    os.path.join(
-                        weight_directory,
-                        "student_{}.pth".format(_checkpoint_stem(args, cycle)),
-                    ),
-                )
-                torch.save(
-                    teacher_state_dict,
-                    os.path.join(
-                        weight_directory,
-                        "teacher_{}.pth".format(_checkpoint_stem(args, cycle)),
-                    ),
-                )
                 checkpoint = metadata.copy()
                 checkpoint.update({
                     'epoch': epoch,

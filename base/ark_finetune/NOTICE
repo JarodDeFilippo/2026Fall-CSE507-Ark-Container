@@ -1,0 +1,21 @@
+NOTICE for base/ark_finetune
+
+Ported code. dataloader.py in this directory is a copy of the Ark+ fine-tuning data code of the Arizona State University project Ark (https://github.com/jlianglab/Ark,
+Ark_Plus/Finetuning/dataloader.py), taken on 2026-10-10 from
+    /Users/jaroddefilippo/code/CSE494-IP/Ark-main/Ark_Plus/Finetuning/
+and ported for the CSE 507 Ark+ container (base/). It is used under the license in LICENSE, "License Text for ASU GitHub Project", for academic and other non-commercial research.
+Its section 5(c) asks for a prominent notice of changes and a description of them in a NOTICE file: this is that file.
+
+Why it is here. B2 fits the lab's embedding linear probe (Ark_Plus/Linearprobing, vendored in ../ark_linearprobe) on cached embeddings. From the Finetuning folder it still uses two things:
+the official dataset classes (ChestXray14, CheXpert, MIMIC, VinDrCXR), whose list parsing and label rules the probe's dataset modules take so that the labels are exactly the Finetuning
+loop's, and build_transform_classification, the transform the extractor applies. The rest of the Finetuning loop (main_classification.py, engine.py, trainer.py, utils.py) was vendored first
+and removed again when the fit moved to the Linearprobing script; it is in the git history. The classes of dataloader.py that nothing here uses (Shenzhen, RSNA, COVIDx, ChestDR, VinDrCXR_all)
+are left in, as shipped.
+
+What was changed. Every change to dataloader.py is marked by a comment that starts `# ported:` and says why, on the changed line, or on the line that replaces a deleted one.
+`git diff --no-index` against the upstream file lists the changes; the vendoring guard in test_ark_finetune.py does exactly that and fails on a hunk without a marker. There are three:
+  * the `import SimpleITK` line is dropped: nothing in the file uses it and the container image does not have it;
+  * the albumentations import is dropped: nothing in the file uses it, and the container's albumentations 2.0.8 has no RandomBrightness, RandomContrast, JpegCompression or
+    IAAAdditiveGaussianNoise, so the import raises;
+  * the `raddino` normalization preset (mean 0.5307, std 0.2583 on all three channels), for the RAD-DINO backbone.
+Everything else is the official code as it was.

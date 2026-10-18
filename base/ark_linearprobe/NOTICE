@@ -1,0 +1,34 @@
+NOTICE for base/ark_linearprobe
+
+Ported code. main_linearprobing.py and utils.py in this directory are copies of the embedding linear probe of the Arizona State University project Ark (https://github.com/jlianglab/Ark,
+Ark_Plus/Linearprobing), taken on 2026-10-10 from
+    /Users/jaroddefilippo/code/CSE494-IP/Ark-main/Ark_Plus/Linearprobing/
+and ported for the CSE 507 Ark+ container (base/), to run the lab's linear probe as shipped on the embeddings B2's extractor caches (CSE 494 IP, Step VIII). They are used under the license in
+LICENSE, "License Text for ASU GitHub Project", for academic and other non-commercial research. Its section 5(c) asks for a prominent notice of changes and a description of them in a
+NOTICE file: this is that file.
+
+What was changed. utils.py is unchanged (byte-identical). Every change to main_linearprobing.py is marked by a comment that starts `# ported:` and says why, on the changed line, or on the
+line that replaces a deleted one. `git diff --no-index` against the upstream file lists the changes; the vendoring guard in ../ark_finetune/test_ark_finetune.py does exactly that and fails
+on a hunk without a marker. In short:
+  * imports: package-relative (the name collides with the container's base/utils.py); `import pandas` is dropped (nothing uses it, the container image has none); the new dataset modules are imported.
+  * options: get_args_parser takes an optional argv, so that the runner can build the options without sys.argv. What main() hard-codes becomes an option: --results_dir (the hard-coded
+    /results), and for the new dataset modules --train_list, --test_list and --data_dir (the shipped ones hard-code /data/... paths in main()).
+  * CPU only: --device is new and accepts "cpu" and nothing else (cpu_only, its argparse type, refuses the rest with a message). The shipped CUDA code is removed from main(): the
+    CUDA_VISIBLE_DEVICES / "cuda" block (so --gpu now does nothing) and the DataParallel / .cuda() / cudnn block, which wrapped the model whenever CUDA was available and left the batches on
+    the host, so it could not have run. The fit is a 1536 (ViT-B) or 2048 (ViT-L) x classes layer on the CPU.
+  * DEVIATION from the shipped script, for reproducibility: --seed (default 0); run i is seeded with --seed + i (random, numpy, torch) before its data module is built.
+  * dataset modules: main() builds ChestXray14, CheXpert, MIMIC and VinDrCXR modules (embedding_datasets.py, a new file) beside the two shipped ones, and passes them --batch_size and
+    --num_workers (the shipped branches leave those to the module defaults, 512 and 4). They differ from the shipped modules in three named ways: the embeddings are in-memory arrays instead of
+    one .npy file per image; the labels come from the official Finetuning dataset classes (ark_finetune/dataloader.py) as the Finetuning loop reads them (train sets LSR-Ones, MIMIC's test set
+    "Ones"); and CheXpert is scored on its 5 competition findings, as the Finetuning branch does. Of the columns a dataset is scored on, the module keeps those with both a positive and a
+    negative example among its test images (the shipped meanAUC skips an all-negative column silently, which shifts the per-class scores against the class names, and gives an all-positive one no defined AUC: sklearn raises or returns NaN, by version; a smoke cache of the first N images can make any column single-valued), records the
+    others in dropped_columns, and refuses to be built if none is left. For that, test() takes an optional `columns` and scores only those, and main() passes it the module's test_columns.
+  * main() keeps the best epoch's per-class scores of every run and returns one record per run (best epoch, the four mean metrics, the per-class scores, and the columns the module scored and
+    dropped), for the results JSON.
+Everything else is the script as shipped, and stays so on purpose: the float64 nn.Linear (model.double(), embedding.double()), torch.sigmoid + BCELoss, Adam with lr 1e-4, batch 512,
+100 epochs, CosineAnnealingLR(T_max=1000, eta_min=1) stepped once per epoch (eta_min is above the base lr, so the lr RISES: 1e-4 at epoch 0, 0.00626 at epoch 50, 0.02409 at epoch 99),
+the per-batch log, the metrics of utils.py, and the model selection: the epoch with the best TEST mAUC is the one kept and reported (the script has no validation split, and the early stopping
+in it is commented out).
+
+Not changed, though it does not apply here: the ChestDR and VinDrCXRAll modules, the LARS optimizer and the --multiclass path, and --few_shot (the new modules refuse it). The runner
+(run_linearprobe.py) builds the options from fixed values and refuses any change to these settings; only --runs, --seed and the paths vary.

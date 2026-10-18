@@ -1,0 +1,10 @@
+# Stage A chain — one phase per line; the driver re-reads this file before every phase
+armD
+pilot_a
+probe_a
+pilot_b
+probe_b
+gate
+main
+constlr
+hires

@@ -6,7 +6,7 @@ import csv
 import math
 import re
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import matplotlib
@@ -14,6 +14,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
+
+try:
+    from run_labels import dataset_display
+except ImportError:  # pragma: no cover - supports ``python -m plot...``.
+    from .run_labels import dataset_display
 
 
 REQUIRED_COLUMNS = {
@@ -26,6 +31,8 @@ REQUIRED_COLUMNS = {
 }
 SPLITS = ("validation", "test")
 MODELS = ("student", "teacher")
+INIT_POINT = "init"  # cycle 0: the initial model before any training, drawn at x = 0; the student and the teacher each have a value of their own there. Found by evaluation_point, never by epoch (cycle 1 is epoch 0 too)
+PERCENT = 100.0  # mAUC and AUC_<class> rows are fractions; drawn in percent
 NATURE_PALETTE = (
     "#6C94AE",  # softened cyan-blue
     "#C67F6F",  # softened vermilion
@@ -112,13 +119,21 @@ def parse_args():
         "--y-min",
         type=float,
         default=None,
-        help="Optional fixed lower y-axis limit.",
+        help=(
+            "Optional fixed lower y-axis limit, in percent for mAUC and "
+            "the AUC_<class> metrics, in the metric's own units "
+            "otherwise."
+        ),
     )
     parser.add_argument(
         "--y-max",
         type=float,
         default=None,
-        help="Optional fixed upper y-axis limit.",
+        help=(
+            "Optional fixed upper y-axis limit, in percent for mAUC and "
+            "the AUC_<class> metrics, in the metric's own units "
+            "otherwise."
+        ),
     )
     return parser.parse_args()
 
@@ -198,7 +213,15 @@ def _infer_task_order(records):
             {record.evaluation_point for record in series}
         ),
     )
-    earliest_cycle = min(record.cycle for record in candidate_series)
+    # The cycle-0 "init" row names no dataset: the order comes from the first cycle that has "after_" rows.
+    earliest_cycle = min(
+        (
+            record.cycle
+            for record in candidate_series
+            if record.evaluation_point.startswith("after_")
+        ),
+        default=None,
+    )
     task_order = []
     for record in candidate_series:
         if record.cycle != earliest_cycle:
@@ -209,10 +232,31 @@ def _infer_task_order(records):
         if dataset and dataset not in task_order:
             task_order.append(dataset)
     if not task_order:
+        every = [record for series in records.values() for record in series]
+        if (
+            any(record.evaluation_point == INIT_POINT for record in every)
+            and not any(record.evaluation_point.startswith("after_") for record in every)
+        ):
+            # A fresh run: only the cycle-0 init rows exist so far, so there is
+            # no order to infer yet and only the init point is drawn.
+            return ()
         raise ValueError(
             "Could not infer evaluation order. Expected evaluation points "
             "such as 'after_VinDrCXR' or 'after_joint'."
         )
+    # A run still inside its first evaluated cycle has seen only some of its tasks. In a dataset-specific cyclic run every
+    # evaluated dataset is a task, so a cycle holds one task per dataset directory: the tasks not seen yet follow the seen
+    # ones (no record exists for them, only their number matters) and a task keeps its position in the cycle as evaluations
+    # arrive. A later cycle shows the first one whole already, and a shared event (after_joint) is no dataset: both stay as seen.
+    datasets = sorted({dataset for dataset, _ in records})
+    last_cycle = max(
+        record.cycle
+        for series in records.values()
+        for record in series
+        if record.evaluation_point.startswith("after_")
+    )
+    if last_cycle == earliest_cycle and set(task_order) <= set(datasets):
+        task_order += [dataset for dataset in datasets if dataset not in task_order]
     return tuple(task_order)
 
 
@@ -282,14 +326,19 @@ def _ordered_records(records, task_indices):
     recognized = [
         record
         for record in records
-        if record.evaluation_point.startswith("after_")
-        and _task_name(record) in task_indices
+        if record.evaluation_point == INIT_POINT
+        or (
+            record.evaluation_point.startswith("after_")
+            and _task_name(record) in task_indices
+        )
     ]
     return sorted(
         recognized,
         key=lambda record: (
             record.cycle,
-            task_indices[_task_name(record)],
+            -1
+            if record.evaluation_point == INIT_POINT
+            else task_indices[_task_name(record)],
             record.source_order,
         ),
     )
@@ -298,7 +347,9 @@ def _ordered_records(records, task_indices):
 def _series(records, model, task_indices, task_count):
     ordered = _ordered_records(records, task_indices)
     x_values = [
-        record.cycle - 1
+        float(record.cycle)  # the init point sits at x = 0: the curve starts on the y axis
+        if record.evaluation_point == INIT_POINT
+        else record.cycle - 1
         + (task_indices[_task_name(record)] + 1) / task_count
         for record in ordered
     ]
@@ -308,13 +359,19 @@ def _series(records, model, task_indices, task_count):
 
 def _focused_records(records, dataset, evaluation_order):
     focus_point = "after_{}".format(dataset)
+    # The init point is cycle 0's focused value for every dataset: it starts each focused curve.
+    init = [
+        record
+        for record in records
+        if record.evaluation_point == INIT_POINT
+    ]
     focused = [
         record
         for record in records
         if record.evaluation_point == focus_point
     ]
     if focused:
-        return focused
+        return init + focused
 
     # Joint/concurrent training evaluates after one shared event rather than
     # after a dataset-specific task. Every such point is focused for each
@@ -323,12 +380,13 @@ def _focused_records(records, dataset, evaluation_order):
     # concurrent exporters can use names such as ``after_concurrent``.
     if len(evaluation_order) == 1 and evaluation_order[0] != dataset:
         shared_point = "after_{}".format(evaluation_order[0])
-        return [
+        return init + [
             record
             for record in records
             if record.evaluation_point == shared_point
         ]
-    return []
+    # No row after a task of this dataset (yet): its curve is the init point alone.
+    return init
 
 
 def _unfocused_records(records):
@@ -339,13 +397,40 @@ def _slug(value):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_")
 
 
-def _metric_label(metric):
-    if metric == "mAUC":
-        return "Mean AUROC"
+def _scale(metric):
+    """Plot-time factor: mAUC and AUC_<class> rows are drawn in percent."""
+    return PERCENT if metric == "mAUC" or metric.startswith("AUC_") else 1.0
+
+
+def _to_plot_units(run_data, metric):
+    """Copy of run_data with values in plot units; CSV numbers untouched."""
+    scale = _scale(metric)
+    if scale == 1.0:
+        return run_data
+    return replace(
+        run_data,
+        records={
+            key: [
+                replace(
+                    record,
+                    student=record.student * scale,
+                    teacher=record.teacher * scale,
+                )
+                for record in records
+            ]
+            for key, records in run_data.records.items()
+        },
+    )
+
+
+def _metric_label(metric, split):
+    if _scale(metric) == PERCENT:
+        return "{} {} (%)".format(split.title(), metric.replace("_", " "))
     return metric.replace("_", " ").title()
 
 
-def _y_limits(run_data, requested_min, requested_max):
+def _y_limits(run_data, requested_min, requested_max, scale):
+    """Axis limits in plot units; scale is full scale (100 for percent)."""
     values = [
         value
         for records in run_data.records.values()
@@ -357,7 +442,7 @@ def _y_limits(run_data, requested_min, requested_max):
         return requested_min, requested_max
     data_min = min(values)
     data_max = max(values)
-    span = max(data_max - data_min, 0.05)
+    span = max(data_max - data_min, 0.05 * scale)
     lower = (
         data_min - 0.08 * span
         if requested_min is None
@@ -368,19 +453,43 @@ def _y_limits(run_data, requested_min, requested_max):
         if requested_max is None
         else requested_max
     )
-    if data_min >= 0.0 and data_max <= 1.0:
+    if data_min >= 0.0 and data_max <= scale:
         lower = max(0.0, lower)
-        upper = min(1.0, upper)
+        upper = min(scale, upper)
     return lower, upper
 
 
-def _configure_axis(ax, title, metric, y_limits, max_cycle):
+def xlim_from_first_point(ax, right=None):
+    """Start the x axis at the smallest x drawn in ax, the first evaluated
+    point, with no padding. right defaults to the largest x drawn. With a
+    single distinct x (one point) the range would be empty, so it is
+    [x, x + 1] and matplotlib has a range to draw. With nothing drawn the
+    old left limit (0) is kept when right is given.
+    """
+    xs = {
+        x
+        for line in ax.get_lines()
+        for x, y in zip(line.get_xdata(), line.get_ydata())
+        if math.isfinite(y)
+    }
+    if xs:
+        left = min(xs)
+        if right is None:
+            right = max(xs)
+        ax.set_xlim(left, right if right > left else left + 1)
+    elif right is not None:
+        ax.set_xlim(0, right)
+
+
+def _configure_axis(ax, title, metric, split, y_limits, max_cycle):
     ax.set_title(title, fontsize=13, pad=10)
     ax.set_xlabel("Cycle")
-    ax.set_ylabel(_metric_label(metric))
+    ax.set_ylabel(_metric_label(metric, split))
     ax.set_ylim(*y_limits)
-    ax.set_xlim(0, max_cycle + 0.05)
-    ax.xaxis.set_major_locator(MaxNLocator(nbins=12, integer=True))
+    xlim_from_first_point(ax, max_cycle + 0.05)
+    ax.xaxis.set_major_locator(
+        MaxNLocator(nbins=12, integer=True, min_n_ticks=1)
+    )
     ax.grid(axis="y", alpha=0.22, linewidth=0.8)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -416,6 +525,9 @@ def _plot_model_line(
         return False
     if alpha is None:
         alpha = 0.84 if model == "student" else 0.99
+    # One finite point draws no line: show it as a marker (a fresh run's init
+    # point), whole on the y axis.
+    lone = sum(math.isfinite(value) for value in y_values) == 1
     ax.plot(
         x_values,
         y_values,
@@ -424,6 +536,9 @@ def _plot_model_line(
         linewidth=linewidth,
         alpha=alpha,
         label=label,
+        marker="o" if lone else None,
+        markersize=6,
+        clip_on=not lone,
     )
     return True
 
@@ -489,10 +604,11 @@ def _plot_focused(
     _configure_axis(
         ax,
         "{} — Focused {} Performance".format(
-            dataset,
+            dataset_display(dataset),
             split.title(),
         ),
         args.metric,
+        split,
         y_limits,
         max_cycle,
     )
@@ -528,10 +644,11 @@ def _plot_unfocused(
     _configure_axis(
         ax,
         "{} — All {} Evaluation Performance".format(
-            dataset,
+            dataset_display(dataset),
             split.title(),
         ),
         args.metric,
+        split,
         y_limits,
         max_cycle,
     )
@@ -597,10 +714,11 @@ def _plot_focused_unfocused(
     _configure_axis(
         ax,
         "{} — Focused vs. Unfocused ({} Focus)".format(
-            dataset,
+            dataset_display(dataset),
             split.title(),
         ),
         args.metric,
+        split,
         y_limits,
         max_cycle,
     )
@@ -619,7 +737,10 @@ def create_plots(args):
             and args.y_min >= args.y_max):
         raise ValueError("--y-min must be less than --y-max")
 
-    run_data = _discover_run(args.run_directory, args.metric)
+    run_data = _to_plot_units(
+        _discover_run(args.run_directory, args.metric),
+        args.metric,
+    )
     task_indices = {
         task: index for index, task in enumerate(run_data.task_order)
     }
@@ -627,14 +748,22 @@ def create_plots(args):
         record
         for records in run_data.records.values()
         for record in records
-        if record.evaluation_point.startswith("after_")
-        and _task_name(record) in task_indices
+        if record.evaluation_point == INIT_POINT
+        or (
+            record.evaluation_point.startswith("after_")
+            and _task_name(record) in task_indices
+        )
     ]
     if not recognized_records:
         raise ValueError("No recognized after-evaluation rows found.")
 
     max_cycle = max(record.cycle for record in recognized_records)
-    y_limits = _y_limits(run_data, args.y_min, args.y_max)
+    y_limits = _y_limits(
+        run_data,
+        args.y_min,
+        args.y_max,
+        _scale(args.metric),
+    )
     output_directory = (
         args.output_root.expanduser().resolve()
         / run_data.run_directory.name
@@ -680,7 +809,18 @@ def create_plots(args):
 
     print("Run: {}".format(run_data.run_directory.name))
     print("Datasets: {}".format(", ".join(run_data.datasets)))
-    print("Evaluation order: {}".format(" -> ".join(run_data.task_order)))
+    seen_tasks = [
+        task
+        for task in run_data.task_order
+        if any(
+            _task_name(record) == task
+            for record in recognized_records
+            if record.evaluation_point != INIT_POINT
+        )
+    ]
+    print("Evaluation order: {}".format(" -> ".join(seen_tasks) or "(none yet: the init point only)"))
+    if len(seen_tasks) < len(run_data.task_order):  # a run still in its first cycle: its other tasks count in the x positions, in no known order
+        print("Not evaluated yet: {}".format(", ".join(task for task in run_data.task_order if task not in seen_tasks)))
     print("Metric: {}".format(args.metric))
     print(
         "Wrote {} plots to {}".format(
