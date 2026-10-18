@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modified from the course Ark+ container (see NOTICE)
 """Plot focused and unfocused performance from an Ark+ run."""
 
 import argparse

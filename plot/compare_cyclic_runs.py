@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modified from the course Ark+ container (see NOTICE)
 """Compare student and teacher performance across multiple Ark+ runs."""
 
 import argparse

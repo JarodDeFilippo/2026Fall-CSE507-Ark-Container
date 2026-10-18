@@ -1,5 +1,5 @@
 NOTICE
-Date: 2026-10-07
+Date: 2026-10-07 (updated 2026-10-18)
 
 This fork of the CSE 507 course repository (https://github.com/jliangclass-intro/2026Fall-CSE507-Ark-Container)
 modifies Ark+ code from JLiangLab/Ark (https://github.com/JLiangLab/Ark), which reaches this fork through the course
@@ -11,15 +11,17 @@ comment pointing here.
 
 Modified files inherited from the course repository
 
-- base/engine.py: adds layer-wise LR decay parameter groups for the DINOv3 ViT, --eval_every, --clip-grad wiring and a grouped-optimizer resume check.
+- base/engine.py: adds layer-wise LR decay parameter groups for the DINO ViTs, --eval_every, --clip-grad wiring and a grouped-optimizer resume check; the frozen-backbone phase (--freeze_backbone), the cycle-0 weights and evaluation (--eval_cycle0), the input size recorded in the saved weights and checked on resume and in test mode, and the test result file suffix of the offline evaluation protocols.
 - base/joint_training.py: the joint-training loop measures or clips the gradient norm before each optimizer step and logs it (GN).
-- base/main_ark.py: adds the vit_base_dinov3 model choice and the --eval_every, --layer-decay and --patch-embed-lr-mult options.
-- base/models.py: adds ArkViT (DINOv3 ViT-B/16 with projector and heads), vit_param_groups, and a strict check of the loaded DINOv3 checkpoint keys.
+- base/main_ark.py: adds the vit_base_dinov3, vit_base_dinov2, vit_base_raddino and vit_large_raydino model choices, the raddino and none normalizations, and the --eval_every, --layer-decay, --patch-embed-lr-mult, --eval_cycle0, --freeze_backbone and --test_output_suffix options; test mode takes --input_size and --img_resize from the saved weights.
+- base/models.py: adds ArkViT (DINOv3 ViT-B/16 with projector and heads), ArkViTDinoV2 (the DINOv2 ViT for DINOv2, RAD-DINO and RayDINO weights), vit_param_groups, and a strict check of the loaded checkpoint keys.
 - base/trainer.py: the cyclic training loop measures or clips the gradient norm before each optimizer step and logs it (GN).
 - base/utils.py: adds clip_or_measure_grad_norm.
-- experiment_scripts/common.sh: the shared launcher reads batch size, lr, test augmentation, evaluation cadence, workers, model, init and pretrained weights from ARK_* environment variables; the defaults reproduce the original behavior.
+- experiment_scripts/common.sh: the shared launcher reads batch size, lr, warmup epochs, test augmentation, evaluation cadence, cycle-0 evaluation, input size, resize, workers, model, init and pretrained weights from ARK_* environment variables; the defaults reproduce the original behavior.
+- base/dataloader.py: adds the raddino normalization preset (RAD-DINO's grayscale mean and std).
+- plot/compare_cyclic_runs.py, plot/plot_cyclic_run.py, plot/run_labels.py, plot/README.md: mAUC plotted in percent, the cycle-0 (init) point, --models, --full-length, --colors and --labels, and fixed labels for the Demo 1 and sweep arms.
 - README.md: prepends "About this fork", replaces the container download command with a pointer to the course repository's README, and appends "Gaudi on Sol".
-- .gitignore: also ignores weights/, *.pth, *.pt, *.safetensors, .DS_Store and *.log.
+- .gitignore: also ignores weights/, *.pth, *.pt, *.safetensors, .DS_Store and *.log, the SSL run checkpoints and exports, and the linear-probe embedding caches and logs.
 
 Added files
 
@@ -27,9 +29,21 @@ New tools in base/
 - base/check_dinov3_load.py: CPU smoke test for the vit_base_dinov3 backbone.
 - base/convert_hf_dinov3_to_meta.py: converts a Hugging Face DINOv3 ViT-B/16 checkpoint to Meta's state-dict layout.
 - base/test_dinov3_finetune_recipe.py: CPU checks for the DINOv3 fine-tuning recipe (AdamW, layer-wise LR decay, grad-norm clipping).
+- base/convert_safetensors_to_pth.py, base/make_cycle0_weights.py, base/weight_norms.py, base/probe_resolution_memory.py, base/probe_ssl_memory.py: a safetensors-to-.pth converter, the cycle-0 weights of runs trained before --eval_cycle0, per-block weight norms, and the one-card memory probes for the fine-tune input sizes and the SSL crop sizes.
+- base/test_*.py (chain scripts, offline evaluation, frozen backbone, DINOv2 backbone, SSL trainer, the two probes): CPU tests.
+
+Stage A SSL continued pretraining (DINO-X)
+- base/ssl_pretrain.py and base/ssl_dinov3/: DINOv3-style SSL continued pretraining of the ViT-B/16 backbone on chest X-rays (student, EMA teacher, Gram teacher), on the vendored DINOv3 loss, data and train modules.
+- chain/: the Stage A phase scripts that run_d1_8_chain_gaudi.sh runs back to back in one allocation (chain/README.md), with the gate (gate.py) and its tests.
+- sweep/: the fine-tuning sweep table (wave1.tsv) and its submitter.
+- plot/plot_linear_probes.py, plot/build_step8_report.py, plot/NAMING-RULES.md: the linear-probe figure, the DINO-X report builder (workbook, figures, deck, ledger tables) and the naming rules its outputs follow.
 
 Vendored Meta code, under its own license
-- base/dinov3/: the DINOv3 ViT from https://github.com/facebookresearch/dinov3, licensed under the DINOv3 License (base/dinov3/LICENSE.md); base/dinov3/VENDORED.md records the source commit and which files were edited.
+- base/dinov3/: the DINOv3 ViT and the SSL loss, data and train modules from https://github.com/facebookresearch/dinov3, licensed under the DINOv3 License (base/dinov3/LICENSE.md); base/dinov3/VENDORED.md records the source commit and which files were edited or are ours.
+- base/dinov2/: the DINOv2 ViT from https://github.com/facebookresearch/dinov2, licensed under the Apache License 2.0 (base/dinov2/LICENSE); base/dinov2/VENDORED.md records the source and the one edited file.
+
+Ported Ark code, under the ASU license
+- base/ark_finetune/ and base/ark_linearprobe/: ports of the Ark+ fine-tuning data code (dataloader.py) and embedding linear probe (main_linearprobing.py, utils.py) from https://github.com/jlianglab/Ark (Ark_Plus/Finetuning, Ark_Plus/Linearprobing), with our embedding extractor and probe runner around them; each directory has its own LICENSE (the ASU license) and a NOTICE that describes the changes.
 
 Gaudi2 (HPU) path
 - containers/gaudi/: apptainer.def, requirements.txt and requirements_nodeps.txt for the Gaudi2 container.
@@ -39,9 +53,9 @@ Gaudi2 (HPU) path
 - build_gaudi_image.sh: builds containers/gaudi/gaudi.sif.
 
 Experiment scripts and launchers
-- experiment_scripts/all4_concurrent_random_sampling/, all4_concurrent_random_sampling_dinov3/, all4_cyclic_dinov3_adamw/ and all4_cyclic_dinov3_v2/: start and resume scripts for the Demo 1 runs on all four datasets (VinDr-CXR, ChestX-ray14, MIMIC, CheXpert).
+- experiment_scripts/all4_concurrent_random_sampling/, all4_concurrent_random_sampling_dinov3/, all4_cyclic_dinov3_adamw/, all4_cyclic_dinov3_v2/, all4_cyclic_dinov3_short/, all4_cyclic_dinov3_frozen/, all4_cyclic_dinov3_frozen_long/, all4_cyclic_dinov3_probe/ and all4_cyclic_dinov3_sweep/: start and resume scripts for the Demo 1 runs on all four datasets (VinDr-CXR, ChestX-ray14, MIMIC, CheXpert).
 - run_p1_*.sh and resume_p1_*.sh in the repository root: Slurm launchers for the Practice 1 runs.
-- run_d1_*.sh, resume_d1_*.sh and eval_d1_6.sh in the repository root: Slurm launchers for the Demo 1 runs and the d1_6 evaluation, including the Gaudi launchers run_d1_8a_gaudi.sh and resume_d1_8a_gaudi.sh.
+- run_d1_*.sh, resume_d1_*.sh and eval_d1_6.sh in the repository root: Slurm launchers for the Demo 1 runs and the d1_6 evaluation, including the Gaudi launchers (run_d1_8*_gaudi.sh, resume_d1_8a_gaudi.sh, resume_d1_8c_gaudi.sh: the arms, the Stage A chain driver, the sweep arms on 2, 4 and 8 cards, the DINO-X ConstLR 512 px Gram-512 twin, a timing job), run_emb_gaudi.sh (the linear probe), run_probe_resolution_gaudi.sh and run_probe_ssl_gaudi.sh (the memory probes), and weight_norms.sh.
 
 License texts
 - LICENSE-ASU-Ark.txt: the ASU license text from https://github.com/JLiangLab/Ark.
