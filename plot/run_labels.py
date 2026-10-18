@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modified from the course Ark+ container (see NOTICE)
 """Build concise, collision-safe labels for compared run directories.
 
 Also maps dataset directory names to their official display names.
