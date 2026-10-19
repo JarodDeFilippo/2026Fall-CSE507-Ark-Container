@@ -2,7 +2,7 @@ NOTICE for base/ark_finetune
 
 Ported code. dataloader.py in this directory is a copy of the Ark+ fine-tuning data code of the Arizona State University project Ark (https://github.com/jlianglab/Ark,
 Ark_Plus/Finetuning/dataloader.py), taken on 2026-10-10 from
-    /Users/jaroddefilippo/code/CSE494-IP/Ark-main/Ark_Plus/Finetuning/
+    the upstream Ark_Plus repository (github.com/jlianglab/Ark), Ark_Plus/Finetuning/
 and ported for the CSE 507 Ark+ container (base/). It is used under the license in LICENSE, "License Text for ASU GitHub Project", for academic and other non-commercial research.
 Its section 5(c) asks for a prominent notice of changes and a description of them in a NOTICE file: this is that file.
 

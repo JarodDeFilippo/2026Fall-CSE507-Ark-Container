@@ -1,5 +1,5 @@
 """CPU self-test for probe_ssl_memory.py, on the --tiny ViT (2 blocks, 64-dim) and small heads through the trainer's own build path.
-Run with the Mac interpreter, from anywhere: /Users/jaroddefilippo/code/CSE494-IP/.venv-ark/bin/python base/test_probe_ssl_memory.py"""
+Run with a Python with torch, numpy and PyYAML installed, from any directory: python <repo>/base/test_probe_ssl_memory.py"""
 import atexit
 import contextlib
 import io

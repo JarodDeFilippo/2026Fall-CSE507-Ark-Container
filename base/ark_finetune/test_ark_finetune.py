@@ -49,8 +49,8 @@ from ark_finetune import dataloader, dataset_lists, embedding_mode, extract_embe
 from ark_linearprobe import embedding_datasets, main_linearprobing, run_linearprobe
 from ark_linearprobe import utils as lp_utils
 
-UPSTREAM = os.environ.get("ARK_UPSTREAM", "/Users/jaroddefilippo/code/CSE494-IP/Ark-main/Ark_Plus")  # the Ark_Plus folder of the upstream repo
-VENDORED = ((os.path.join(UPSTREAM, "Finetuning"), HERE, ("dataloader.py",)), (os.path.join(UPSTREAM, "Linearprobing"), LP_HERE, ("main_linearprobing.py", "utils.py")))
+UPSTREAM = os.environ.get("ARK_UPSTREAM")  # the Ark_Plus folder of a local checkout of the upstream repo (github.com/jlianglab/Ark); unset, the vendoring guard is skipped
+VENDORED = ((os.path.join(UPSTREAM, "Finetuning"), HERE, ("dataloader.py",)), (os.path.join(UPSTREAM, "Linearprobing"), LP_HERE, ("main_linearprobing.py", "utils.py"))) if UPSTREAM else ()
 NAMES = ("ChestXray14", "CheXpert", "MIMIC", "VinDrCXR")
 real_config = get_config(os.path.join(BASE, "datasets_config.yaml"))
 # the same ViT as the container's with ONE block of the real width: 2 * 768 = 1536-d features, and 32x32 inputs make it cheap on the CPU
@@ -109,8 +109,9 @@ assert len(unmarked_hunks(blank, ["a = 11  # ported: why", "", "b = 22"])[1]) ==
 
 for gone in ("main_classification.py", "engine.py", "trainer.py", "utils.py", "run_probe.py"):  # the Finetuning loop and its runner are not vendored any more: nothing uses them
     assert not os.path.exists(os.path.join(HERE, gone)), gone
-if not os.path.isdir(UPSTREAM):
-    print("SKIP (a) vendoring guard against the upstream files: they are not at {} (set ARK_UPSTREAM to the Ark_Plus folder)".format(UPSTREAM))
+if not UPSTREAM or not os.path.isdir(UPSTREAM):
+    print("SKIP (a) vendoring guard against the upstream files: {}; set ARK_UPSTREAM to the Ark_Plus folder of a local Ark checkout (github.com/jlianglab/Ark)"
+          .format("ARK_UPSTREAM is not set" if not UPSTREAM else "{} is not a directory".format(UPSTREAM)))
 else:
     summary = {}
     for upstream_dir, local_dir, files in VENDORED:
@@ -1370,7 +1371,7 @@ for extra, passed in ((["--max_images", "512", "--workers", "16"], "--max_images
 # a model name is syntax-checked and nothing more: the builders of B1 (vit_base_dinov2, vit_base_raddino) need no change here
 done, calls, _, _ = run_wrapper(["rad", "vit_base_raddino", "/workspace/weights/rad_dino_vitb14_pretrain.pth", "raddino"], files=("weights/rad_dino_vitb14_pretrain.pth",))
 assert done.returncode == 0 and "--model vit_base_raddino --weights /workspace/weights/rad_dino_vitb14_pretrain.pth --normalization raddino" in calls[0], calls
-# the RayDINO submission line, as Jarod pastes it (Meta's file name kept): the wrapper's tag / model / path / normalization checks accept it, and the extractor gets exactly those arguments, then the four fits
+# the RayDINO submission line, as pasted at the terminal (Meta's file name kept): the wrapper's tag / model / path / normalization checks accept it, and the extractor gets exactly those arguments, then the four fits
 RAY_SUBMISSION = "sbatch run_emb_gaudi.sh raydino vit_large_raydino /workspace/weights/xray_dino_vitl16_pretrained-ad31c2b0.pth imagenet"
 assert RAY_SUBMISSION in wrapper_text  # and it is the example in the wrapper's header
 done, calls, card_check, results = run_wrapper(RAY_SUBMISSION.split()[2:], files=("weights/xray_dino_vitl16_pretrained-ad31c2b0.pth",))

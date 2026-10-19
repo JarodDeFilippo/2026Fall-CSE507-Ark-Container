@@ -1,6 +1,6 @@
-# Naming rules for every Step VIII deliverable (Jarod, 2026-10-17 ~13:00; standing)
-Use the names things already have. Never coin a token for a variant; describe the variant in words. (The professor made a lab member fix "VINDRCXR"
-and another fix "RICORD30PCT": the published name plus a plain description of the deviation is the convention.)
+# Naming rules for every Step VIII deliverable
+Use the names things already have. Never coin a token for a variant; describe the variant in words: the published name plus a plain description
+of the deviation is the convention.
 - Datasets, display form: VinDr-CXR, ChestX-ray14, MIMIC-CXR, CheXpert. Machine ids (directory names VinDrCXR / ChestXray14 / MIMIC / CheXpert,
   workbook column ids like T_CXR14_end, CSV paths) stay unchanged; only human-facing strings (titles, legends, table headers, covers, prose) change.
 - Backbones: DINOv3 ViT-B/16 (Meta), DINOv2 ViT-B/14 (Meta), RAD-DINO ViT-B/14 (Microsoft), Swin-B (Ark+). "stock" = the published DINOv3 weights.
@@ -12,7 +12,7 @@ and another fix "RICORD30PCT": the published name plus a plain description of th
   in a document says what the tag is.
 - Ten-crop / center crop as already defined. "Stage A" may remain once, in parentheses, as the internal name of the DINO-X pretraining phase.
 
-## Consistency (Jarod, 13:20: "imagine these graphs and numbers go into a journal or conference submission")
+## Consistency (write every graph and number as if for a journal or conference submission)
 One convention per thing, across workbook, deck, PDFs, prose:
 - Metric name: **mAUC** (mean AUROC over the dataset's classes), written "mAUC" everywhere; never "Mean AUROC", "AUROC", "mean AUC" as the label.
 - Unit: **percent** everywhere, axis label "Test mAUC (%)" / "Validation mAUC (%)"; tables and prose one decimal (95.4), workbook two decimals, probe
@@ -27,5 +27,5 @@ One convention per thing, across workbook, deck, PDFs, prose:
 - Captions/titles: "<Figure subject> — <dataset display name> — <split> — Teacher" pattern; no internal tags in titles except the arm id (S2, …).
 - Cycle axis: integer cycles, label "Cycle"; evaluation points inside a cycle at quarter positions are allowed but the ticks are integers.
 
-## Run names (Jarod, 2026-10-17 ~13:55)
+## Run names
 The two DINO-X runs are written **DINO-X Cosine** and **DINO-X ConstLR** (exactly this casing), with the epoch after: "DINO-X Cosine e30", "DINO-X ConstLR e40". Init tags: "init DINO-X Cosine e30" (S13), "init DINO-X ConstLR e30" (S16).
