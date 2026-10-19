@@ -28,14 +28,17 @@ from datetime import datetime
 from pathlib import Path
 
 sys.dont_write_bytecode = True  # importing plot_linear_probes must not drop a __pycache__ into the plot folder
-SCRATCH = Path("/private/tmp/claude-501/-Users-jaroddefilippo-Jarod-s-Second-Brain/2a683ce5-341a-44cb-a02d-a29f78df69f6/scratchpad")
-os.environ["MPLCONFIGDIR"] = str(SCRATCH / "mplconfig")  # matplotlib's cache stays in the scratchpad (subprocesses inherit it)
 PLOT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PLOT_DIR))
 from run_labels import arm_label  # noqa: E402  (the fixed labels of the input-size arms, shared with compare_cyclic_runs.py)
 
-ROOT = Path("/Users/jaroddefilippo/code/CSE494-IP/demo1_results")
-CONTAINER = Path("/Users/jaroddefilippo/code/CSE494-IP/2026Fall-CSE507-Ark-Container-main")
+# Path settings, each overridable from the environment (listed in --help); main() resolves them:
+#   DINOX_CONTAINER_ROOT  the container root, for sweep/wave1.tsv (default: the repository this script is in)
+#   DINOX_RESULTS_ROOT    the mirror root of the Sol run tree (default: demo1_results next to the container root, i.e. <container>/../demo1_results)
+#   DINOX_REPORT_OUT      the output directory (default: dinox_report next to the container root, outside the repository)
+#   MPLCONFIGDIR          matplotlib's cache (default: .mplconfig next to the output directory, created if missing unless --skip-figs; --selftest keeps it in its
+#                         temporary directory; subprocesses inherit it)
+CONTAINER = Path(os.environ.get("DINOX_CONTAINER_ROOT", PLOT_DIR.parent))
 XLSX_NAME, PPTX_NAME = "DINO-X-numbers.xlsx", "DINO-X-graphs.pptx"  # the project is DINO-X; until 2026-10-18 these were step8-dinov3-numbers.xlsx and step8-dinov3-graphs.pptx (same data)
 DATASETS = ("VinDrCXR", "ChestXray14", "MIMIC", "CheXpert")  # training order inside a cycle
 SHORT = dict(zip(DATASETS, ("VinDr", "CXR14", "MIMIC", "CheXpert")))
@@ -1167,7 +1170,7 @@ def build(root, container, out_dir, skip_figs):
         for r in have:
             if r not in full:
                 warn(f"{r['id']}: figures skipped, evaluation files incomplete")
-        with tempfile.TemporaryDirectory(dir=SCRATCH if SCRATCH.is_dir() else None) as tmp:
+        with tempfile.TemporaryDirectory() as tmp:
             cyclic_figs(root, full, fig_dir, Path(tmp))
             compare_figs(root, by_id, {r["id"] for r in full}, fig_dir, Path(tmp))
         pages = probe_pages(root, probes, fig_dir, now.strftime("%Y-%m-%d")) if probes else []
@@ -1724,8 +1727,11 @@ def selftest_seed(tmp):
 def selftest():
     from openpyxl import load_workbook
 
-    with tempfile.TemporaryDirectory(dir=SCRATCH if SCRATCH.is_dir() else None) as tmp:
+    with tempfile.TemporaryDirectory() as tmp:
         root, container, out = Path(tmp) / "mirror", Path(tmp) / "container", Path(tmp) / "report"
+        if "MPLCONFIGDIR" not in os.environ:  # the self-test's cache sits next to its own output directory, inside the temporary directory
+            (Path(tmp) / ".mplconfig").mkdir()
+            os.environ["MPLCONFIGDIR"] = str(Path(tmp) / ".mplconfig")
         synth_mirror(root, container)
         ssl_csv = root / "ssl_dinov3_cxr_main_seed_100" / "ssl_losses.csv"
         xlsx = out / XLSX_NAME
@@ -2070,13 +2076,27 @@ def selftest():
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--root", type=Path, default=ROOT, help="mirror root of the Sol run tree")
-    ap.add_argument("--container", type=Path, default=CONTAINER, help="container copy (for sweep/wave1.tsv)")
-    ap.add_argument("--out-dir", type=Path, default=SCRATCH / "report")
+    ap = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
+        epilog="environment: DINOX_CONTAINER_ROOT, DINOX_RESULTS_ROOT and DINOX_REPORT_OUT set the defaults of --container, --root and --out-dir; "
+               "MPLCONFIGDIR, if set, is matplotlib's cache, else .mplconfig next to the output directory (created if missing, unless --skip-figs; --selftest keeps it in its temporary directory)")
+    ap.add_argument("--root", type=Path, default=None,
+                    help="mirror root of the Sol run tree (default: $DINOX_RESULTS_ROOT, else <container>/../demo1_results)")
+    ap.add_argument("--container", type=Path, default=CONTAINER,
+                    help="container root, for sweep/wave1.tsv (default: $DINOX_CONTAINER_ROOT, else this script's repository)")
+    ap.add_argument("--out-dir", type=Path, default=None,
+                    help="output directory (default: $DINOX_REPORT_OUT, else <container>/../dinox_report)")
     ap.add_argument("--skip-figs", action="store_true", help="workbook and tables only: no figures, no deck")
     ap.add_argument("--selftest", action="store_true", help="build a tiny synthetic mirror, run the pipeline on it, assert, exit")
     a = ap.parse_args()
+    if a.root is None:
+        a.root = Path(os.environ.get("DINOX_RESULTS_ROOT", a.container.resolve().parent / "demo1_results"))
+    if a.out_dir is None:
+        a.out_dir = Path(os.environ.get("DINOX_REPORT_OUT", a.container.resolve().parent / "dinox_report"))
+    if not a.selftest and not a.skip_figs and "MPLCONFIGDIR" not in os.environ:  # before anything imports matplotlib (--skip-figs never does); the plot subprocesses inherit it
+        mplconfig = a.out_dir.parent / ".mplconfig"
+        mplconfig.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(mplconfig)
     if a.selftest:
         try:
             return selftest()

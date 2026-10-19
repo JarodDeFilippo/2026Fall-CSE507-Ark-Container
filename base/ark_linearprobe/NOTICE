@@ -2,7 +2,7 @@ NOTICE for base/ark_linearprobe
 
 Ported code. main_linearprobing.py and utils.py in this directory are copies of the embedding linear probe of the Arizona State University project Ark (https://github.com/jlianglab/Ark,
 Ark_Plus/Linearprobing), taken on 2026-10-10 from
-    /Users/jaroddefilippo/code/CSE494-IP/Ark-main/Ark_Plus/Linearprobing/
+    the upstream Ark_Plus repository (github.com/jlianglab/Ark), Ark_Plus/Linearprobing/
 and ported for the CSE 507 Ark+ container (base/), to run the lab's linear probe as shipped on the embeddings B2's extractor caches (CSE 494 IP, Step VIII). They are used under the license in
 LICENSE, "License Text for ASU GitHub Project", for academic and other non-commercial research. Its section 5(c) asks for a prominent notice of changes and a description of them in a
 NOTICE file: this is that file.

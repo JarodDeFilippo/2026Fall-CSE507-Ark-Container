@@ -2,6 +2,16 @@
 
 This fork of the [CSE 507 course repository](https://github.com/jliangclass-intro/2026Fall-CSE507-Ark-Container) adds a DINOv3 ViT-B/16 backbone (`ArkViT` in `base/models.py`, built on vendored Meta code in `base/dinov3/`); the Demo 1 experiment scripts under `experiment_scripts/all4_*`, namely the Swin-B concurrent run (`all4_concurrent_random_sampling`) and the DINOv3 cyclic arms A1/A2 with SGD (`all4_concurrent_random_sampling_dinov3`, which keeps its historical name but trains cyclically, and `all4_cyclic_dinov3_v2`) and B with AdamW (`all4_cyclic_dinov3_adamw`); and a Gaudi2/HPU path (`containers/gaudi/`, `gaudi.sh`, `gaudi_hlsmi.sh`, `gaudi_check_cards.sh`, `gaudi_verify_busy.sh`, `gaudi_smoke.sh`, `build_gaudi_image.sh`, `run_d1_8a_gaudi.sh` and `resume_d1_8a_gaudi.sh`, described under "Gaudi on Sol" below). The `run_*` and `resume_*` scripts at the repository root are the Slurm launchers for the Practice 1 (`p1_*`) and Demo 1 (`d1_*`) runs on Sol; their `#SBATCH -A` lines name the course and lab accounts, so change them to your own.
 
+## Since 2026-10-07
+
+- DINO-X SSL stage and chain: `base/ssl_pretrain.py` (DINOv3-style continued pretraining on the four chest X-ray datasets, with a Gram teacher) and the phase scripts in `chain/`, run back to back by `run_d1_8_chain_gaudi.sh` (see `chain/README.md`), including the DINO-X ConstLR 512 px stage and its Gram-512 twin `run_d1_8hires_gram512_gaudi.sh`.
+- Input-resolution arms and the sweep table: `sweep/wave1.tsv` (one fine-tuning arm per row, the 448 and 512 px arms included), `sweep/submit_wave.sh`, the 2-, 4- and 8-card arm launchers `run_d1_8sw_gaudi.sh`, `run_d1_8sw4_gaudi.sh` and `run_d1_8sw8_gaudi.sh`, and the memory probe `run_probe_resolution_gaudi.sh`.
+- Evaluation every cycle and offline protocols: a per-arm `eval_every` (every cycle for the input-resolution arms), `--eval_cycle0` for the initial weights, and `eval_d1_6.sh`, which scores saved weights ten-crop by default or center crop with `ARK_TEST_AUGMENT=false` (results in `cycle_<NNNN>_<run>.centercrop.csv`).
+- Frozen-backbone and linear-probe arms with DINOv2, RAD-DINO and RayDINO backbones: the `--freeze_backbone` arms (`experiment_scripts/all4_cyclic_dinov3_frozen*`, `all4_cyclic_dinov3_probe`), the Ark+ embedding linear probe (`run_emb_gaudi.sh`, `base/ark_finetune/`, `base/ark_linearprobe/`), and the model names `vit_base_dinov2`, `vit_base_raddino` and `vit_large_raydino`.
+- Report builder: `plot/build_step8_report.py` builds the numbers workbook, the figures and a graphs-only deck from a local mirror of the run tree; besides matplotlib it needs `openpyxl` and `python-pptx` (`--help` lists its paths and environment variables).
+
+The RAD-DINO and RayDINO checkpoints are not in this repository: download them yourself from their publishers (Microsoft's RAD-DINO on Hugging Face, Meta's RayDINO release) into `weights/` before using `run_emb_gaudi.sh`.
+
 ## Licenses
 
 The course repository has no license file. The Ark-derived code is under the ASU non-commercial license in `LICENSE-ASU-Ark.txt`, and `base/dinov3/` is Meta's DINOv3 code under the DINOv3 License in `base/dinov3/LICENSE.md`. The DINOv3 weights are gated by Meta and are not in this repository: download them yourself into `weights/` (gitignored; the scripts expect `weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth`).
