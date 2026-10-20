@@ -345,8 +345,9 @@ def swin_architecture(state_dict):
 
 def build_omni_model_from_checkpoint(args, num_classes_list, key):
     """The lab's Ark_Plus/Pretraining/models.py loader: the model of args.model_name with the weights of checkpoint[key]; 'teacher' is the lab's convention for an Ark checkpoint's encoder (build_omni_model reads
-    checkpoint['state_dict'], the student). Hardened for the embedding extractor, which builds no projector and no heads: a file with no `key` entry is refused (KeyError); a Swin file whose embed_dim, window or input
-    size is not the model's is refused (RuntimeError, see swin_architecture), as is any missing or unexpected key but the projector, the heads and the derived buffers; a Swin load logs one warning line on what the file held."""
+    checkpoint['state_dict'], the student). Hardened for the embedding extractor, which builds no projector and no heads: a file with no `key` entry is refused (KeyError), as is a model name this function does not build (ValueError);
+    a swin_* file with no Swin tensors, or whose embed_dim, window or input size is not the model's, is refused (RuntimeError, see swin_architecture), as is any missing or unexpected key but the projector, the heads
+    and the derived buffers; a Swin load logs one warning line on what the file held."""
     if args.model_name == "swin_base": #swin_base_patch4_window7_224
         model = ArkSwinTransformer(num_classes_list, args.projector_features, args.use_mlp, patch_size=4, window_size=7, embed_dim=128, depths=(2, 2, 18, 2), num_heads=(4, 8, 16, 32))
     elif args.model_name == "swin_large": #swin_large_patch4_window7_224
@@ -363,6 +364,8 @@ def build_omni_model_from_checkpoint(args, num_classes_list, key):
         model = ArkViTDinoV2(num_classes_list, args.projector_features, args.use_mlp, **DINOV2_VITB14_KWARGS)
     elif args.model_name == "vit_large_raydino":  # RayDINO: DINOv2's ViT-L/16, CLS ++ mean patch = 2 * 1024 = 2048-d
         model = ArkViTDinoV2(num_classes_list, args.projector_features, args.use_mlp, encoder_features=2048, **DINOV2_VITL16_KWARGS)
+    else:
+        raise ValueError("--model {} is not built by build_omni_model_from_checkpoint (it builds swin_base, swin_large, swin_large_384, swin_large_768, conv_base, vit_base_dinov3, vit_base_dinov2, vit_base_raddino, vit_large_raydino)".format(args.model_name))
 
     if args.pretrained_weights is not None:
         checkpoint = torch.load(args.pretrained_weights, map_location='cpu', weights_only=False)
@@ -374,6 +377,9 @@ def build_omni_model_from_checkpoint(args, num_classes_list, key):
 
         is_swin = isinstance(model, ArkSwinTransformer)  # not `swin`: that is the timm module above
         if is_swin:  # strict=False loads a Swin file of another window or input size only as far as torch's shape check notices (and not at all when the file has no attn_mask buffers): read both off the file and compare
+            absent = [k for k in ("patch_embed.proj.weight", "layers.0.blocks.0.attn.relative_position_bias_table") if k not in state_dict]
+            if absent:  # another architecture's file under a swin name: swin_architecture would stop on a bare KeyError
+                raise RuntimeError("Ark checkpoint {} ('{}') is not a Swin state dict: it has no {}; --model {} is a Swin".format(args.pretrained_weights, key, absent[0], args.model_name))
             embed, window, size = swin_architecture(state_dict)
             embed2, window2, size2 = swin_architecture(model.state_dict())
             shape = lambda name: list(state_dict[name].shape) if name in state_dict else "not saved"

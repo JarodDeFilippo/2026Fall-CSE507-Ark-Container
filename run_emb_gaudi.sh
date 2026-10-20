@@ -51,13 +51,15 @@
 # dataset's job without ARK_EMB_NO_FIT and with sbatch --dependency=afterok:<the other jobs' ids> ...: it extracts its dataset and fits all four. Every job of a tag takes the same <model>, <weights>, <normalization> and
 # ARK_EMB_INPUT_SIZE: the fit refuses the caches of one tag that were not extracted the same way.
 # ARK_ROOT overrides the repo root (the Mac dry run in base/ark_finetune/test_ark_finetune.py points it at a fake repo).
+# The A100 sibling is run_emb_class.sh (one A100 on the class account, through nvidia.sh): the same usage, checks and fit, and the block between the two "shared" marker lines below is identical in both scripts (test_ark_finetune.py checks it).
 export PT_HPU_LAZY_MODE=1
+# --- begin: shared with run_emb_gaudi.sh / run_emb_class.sh (test_ark_finetune.py checks the two copies are identical) ---
 TAG_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'   # the tag is a directory name: no path separators, no spaces
 MODEL_RE='^[A-Za-z0-9_]+$'
 NORMALIZATION_RE='^(imagenet|chestx-ray|none|raddino)$'
 EXTRA_RE='^--(max_images|datasets|workers)(=.+)?$'   # the only options that may follow <normalization>
 if [[ $# -lt 4 || ! $1 =~ $TAG_RE || ! $2 =~ $MODEL_RE || $3 != /workspace/* || ! $4 =~ $NORMALIZATION_RE ]]; then
-  echo "Usage: sbatch run_emb_gaudi.sh <tag: letters, digits, . _ - only> <model> <in-container weights path under /workspace> <imagenet|chestx-ray|none|raddino> [--max_images N] [--datasets NAME...] [--workers N]" >&2
+  echo "Usage: sbatch run_emb_gaudi.sh|run_emb_class.sh <tag: letters, digits, . _ - only> <model> <in-container weights path under /workspace> <imagenet|chestx-ray|none|raddino> [--max_images N] [--datasets NAME...] [--workers N]" >&2
   exit 2
 fi
 refused=()
@@ -104,6 +106,7 @@ if [[ ${#taken[@]} -gt 0 ]]; then
   echo "ERROR: results already exist for tag $TAG: ${taken[*]}; refusing to start the extraction, because the fit would refuse to overwrite them afterwards. Remove them or use another tag" >&2
   exit 1
 fi
+# --- end: shared ---
 # fail closed: --cleanenv drops SLURM_JOB_GPUS, so check the container sees exactly the allocated card before the extraction starts
 ./gaudi_check_cards.sh || exit 1
 # 1. the extraction; it refuses an existing cache before the model loads, and a failure ends the job here: no fit on a half-written cache

@@ -56,6 +56,7 @@ Experiment scripts and launchers
 - experiment_scripts/all4_concurrent_random_sampling/, all4_concurrent_random_sampling_dinov3/, all4_cyclic_dinov3_adamw/, all4_cyclic_dinov3_v2/, all4_cyclic_dinov3_short/, all4_cyclic_dinov3_frozen/, all4_cyclic_dinov3_frozen_long/, all4_cyclic_dinov3_probe/ and all4_cyclic_dinov3_sweep/: start and resume scripts for the Demo 1 runs on all four datasets (VinDr-CXR, ChestX-ray14, MIMIC, CheXpert).
 - run_p1_*.sh and resume_p1_*.sh in the repository root: Slurm launchers for the Practice 1 runs.
 - run_d1_*.sh, resume_d1_*.sh and eval_d1_6.sh in the repository root: Slurm launchers for the Demo 1 runs and the d1_6 evaluation, including the Gaudi launchers (run_d1_8*_gaudi.sh, resume_d1_8a_gaudi.sh, resume_d1_8c_gaudi.sh: the arms, the Stage A chain driver, the sweep arms on 2, 4 and 8 cards, the DINO-X ConstLR 512 px Gram-512 twin, a timing job), run_emb_gaudi.sh (the linear probe), run_probe_resolution_gaudi.sh and run_probe_ssl_gaudi.sh (the memory probes), and weight_norms.sh.
+- run_emb_class.sh in the repository root: Slurm launcher for the linear probe on one A100 of the class account, the sibling of run_emb_gaudi.sh (the same arguments, checks and fit, through nvidia.sh).
 
 Documentation
 - docs/gaudi-vs-a100.md, docs/gaudi-vs-a100.pdf, docs/sol-gaudi-guide.md, docs/sol-gaudi-guide.pdf: the short and the long guide to running the training on Sol's Gaudi2 cards.
