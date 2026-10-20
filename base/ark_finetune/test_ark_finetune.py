@@ -11,8 +11,9 @@ Run from base/:  python -m ark_finetune.test_ark_finetune   (or python ark_finet
 (h) the extractor on tiny synthetic images and a tiny ViT (train and test only, one center crop each), and the normalization presets
 (i) extractor -> runner on the four official list formats
 (i3) the Ark+ Swin teacher through the extractor: a lab-style checkpoint's TEACHER (not its student) is embedded before the projector, 1024-d for swin_base; a model that does not fit the file (embed_dim, window, input size),
-     a file with no teacher or with a missing block weight, and a crop that is not the Swin's size are refused; a file with no attn_mask buffers loads and says its input size is unverified
-(j) run_emb_gaudi.sh in a fake repo, preflight, the allow-list of extractor arguments and the ARK_EMB_NO_FIT switch included
+     a file with no teacher or with a missing block weight, a model name the loader does not build, a ViT's file under a swin name, and a crop that is not the Swin's size are refused; a file with no attn_mask buffers
+     loads and says its input size is unverified
+(j) run_emb_gaudi.sh and its A100 sibling run_emb_class.sh in a fake repo, preflight, the allow-list of extractor arguments and the ARK_EMB_NO_FIT switch included, and the drift guard on the block the two share
 """
 import ast
 import contextlib
@@ -1387,6 +1388,12 @@ try:
             torch.save(torch.zeros(1), other)  # not even a dict
             rejects(KeyError, lambda: load_swin("swin_base", other), "has no 'teacher' entry")
 
+            # two refusals that were a bare traceback from inside the loader: a model name it does not build (a typo for swin_large_768 here: UnboundLocalError) and a ViT's file under a swin name (a KeyError in swin_architecture)
+            rejects(ValueError, lambda: load_swin("swin_large_1152"), "--model swin_large_1152 is not built by build_omni_model_from_checkpoint (it builds swin_base, swin_large, swin_large_384, swin_large_768, conv_base, vit_base_dinov3, vit_base_dinov2, vit_base_raddino, vit_large_raydino)")
+            save_ark(other, ArkViT([], None, False, **TINY).state_dict())  # a ViT-shaped teacher: patch_embed.proj.weight and blocks.*, no relative_position_bias_table
+            message = rejects(RuntimeError, lambda: load_swin("swin_base", other), "is not a Swin state dict")
+            assert message == "Ark checkpoint {} ('teacher') is not a Swin state dict: it has no layers.0.blocks.0.attn.relative_position_bias_table; --model swin_base is a Swin".format(other), message
+
             # a file with no attn_mask buffers (derived: the model keeps its own) loads, with its teacher's weights, but its input size cannot be checked: said on stderr
             save_ark(other, {k: v for k, v in swin_teacher.state_dict().items() if not k.endswith("attn_mask")})
             loaded, _, err = load_swin("swin_base", other)
@@ -1411,7 +1418,7 @@ try:
             torch.set_num_threads(threads)
         print("OK (i3) Ark+ Swin teacher: swin_base loads checkpoint['teacher'] (not the student's state_dict) from a lab-layout .pth.tar and the extractor writes float16 (N, 1024) caches equal to the teacher's pooled vector before "
               "its projector, feature_dim 1024, 'dim 1024' on the EMB line, one summary line on stderr (key, tensors, embed_dim / window / input, the 6 projector and head keys not loaded); refused: the same file as swin_large "
-              "(names the file's tensors and --model swin_base at a 224 px crop), a 448 px Swin-B (no model name), a missing block weight, a plain state dict, a student-only file and a non-dict (no 'teacher'), a 32 px crop for "
+              "(names the file's tensors and --model swin_base at a 224 px crop), a 448 px Swin-B (no model name), a missing block weight, a plain state dict, a student-only file and a non-dict (no 'teacher'), swin_large_1152 (a model name the loader does not build: the message lists the ones it does), a ViT's file under swin_base (no Swin tensors: the message names the missing key), a 32 px crop for "
               "swin_base (before any directory); a file with no attn_mask loads with an 'unverified' warning; swin_large_768 / swin_large_384 / swin_base build 1536 / 1536 / 1024-d at 768 / 384 / 224 px and swin_architecture reads "
               "(192, 12, 768) / (192, 12, 384) / (128, 7, 224) off their state dicts, with no input size when the mask is gone or its window count is not a square (all at two blocks a stage)")
 finally:
@@ -1439,13 +1446,16 @@ case "$*" in
 esac
 exit 99
 """
+NVIDIA_STUB = STUB.replace("printf 'OMP=", "printf 'nvidia.sh OMP=")  # the same stub with each call logged behind "nvidia.sh ", so a wrapper that reaches the wrong launcher shows in its calls
+assert NVIDIA_STUB != STUB
+USAGE = "Usage: sbatch run_emb_gaudi.sh|run_emb_class.sh <tag: letters, digits, . _ - only> <model> <in-container weights path under /workspace> <imagenet|chestx-ray|none|raddino> [--max_images N] [--datasets NAME...] [--workers N]"  # both print it: $0 is Slurm's spool copy under sbatch, so neither can name itself
 
 
-def run_wrapper(args, files=(STOCK_HOST,), card_check_exit=0, content="x", **env):
-    """The wrapper from a different directory, ARK_ROOT = a fake repo whose gaudi.sh logs each call (one line: OMP_NUM_THREADS, then the arguments) and whose gaudi_check_cards.sh
-    records a call. Returns (completed process, the gaudi.sh calls or None, card check ran, results/<tag> listing or None)."""
+def run_wrapper(args, files=(STOCK_HOST,), card_check_exit=0, content="x", wrapper=WRAPPER, **env):
+    """`wrapper` (run_emb_gaudi.sh unless given) from a different directory, ARK_ROOT = a fake repo whose gaudi.sh and nvidia.sh log each call (one line: OMP_NUM_THREADS, then the arguments; nvidia.sh's behind
+    "nvidia.sh ") and whose gaudi_check_cards.sh records a call. Returns (completed process, the launchers' calls or None, card check ran, results/<tag> listing or None)."""
     with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as elsewhere:
-        for name, body in (("gaudi.sh", STUB), ("gaudi_check_cards.sh", "echo CARD_CHECK; exit {}".format(card_check_exit))):
+        for name, body in (("gaudi.sh", STUB), ("nvidia.sh", NVIDIA_STUB), ("gaudi_check_cards.sh", "echo CARD_CHECK; exit {}".format(card_check_exit))):
             with open(os.path.join(root, name), "w") as f:
                 f.write(body if body.startswith("#!") else "#!/usr/bin/env bash\n" + body + "\n")
             os.chmod(os.path.join(root, name), 0o755)
@@ -1454,7 +1464,7 @@ def run_wrapper(args, files=(STOCK_HOST,), card_check_exit=0, content="x", **env
             with open(os.path.join(root, name), "w") as f:
                 f.write(content)
         log = os.path.join(root, "stub.log")
-        done = subprocess.run(["bash", WRAPPER] + list(args), cwd=elsewhere, env=dict(os.environ, ARK_ROOT=root, STUB_LOG=log, **env), capture_output=True, text=True)
+        done = subprocess.run(["bash", wrapper] + list(args), cwd=elsewhere, env=dict(os.environ, ARK_ROOT=root, STUB_LOG=log, **env), capture_output=True, text=True)
         calls = open(log).read().splitlines() if os.path.exists(log) else None
         results = os.path.join(root, "results", args[0] if args else "")
         return done, calls, "CARD_CHECK" in done.stdout, sorted(os.listdir(results)) if os.path.isdir(results) else None
@@ -1583,11 +1593,114 @@ for bad in ([], ["stock"], ["stock", "vit_base_dinov3", STOCK], ["../x", "vit_ba
             ["stock", "vit_base_dinov3", "weights/x.pth", "imagenet"], ["stock", "vit_base_dinov3", "/data/x.pth", "imagenet"], ["stock", "vit_base_dinov3", STOCK, "caffe"],
             ["stock", "vit_base_dinov3", STOCK, ""], ["stock", "vit_base_dinov3", "weights/x.pth", "imagenet", "--max_images", "5"], ["--max_images", "5"]):
     done, calls, card_check, results = run_wrapper(bad)
-    assert done.returncode == 2 and "Usage: sbatch run_emb_gaudi.sh" in done.stderr and done.stdout == "" and calls is None and not card_check and results is None, (bad, done)
+    assert done.returncode == 2 and done.stderr == USAGE + "\n" and done.stdout == "" and calls is None and not card_check and results is None, (bad, done)
 print("OK (j) run_emb_gaudi.sh: bash -n, Slurm header (b2-emb, 08:00:00, hl225:1, -c 36, 128G), expands to: {} then run_linearprobe --tag stock --datasets <each of the four> with OMP_NUM_THREADS=1, in "
       "parallel, one log each; after <normalization> only --max_images, --datasets and --workers (also --opt=value) go to the extractor, unchanged and last (smoke: {}), and anything else (its own "
       "options, --embeddings_root / --results_root, --input_size / --img_resize / --batch_size, abbreviations, --help) exits 2 before the weights check, the preflight, the card check and the extraction; PREFLIGHT: results.json or probe/<dataset> of any of the four datasets "
       "(the paths run_linearprobe refuses) stop the job with exit 1 before the card check and the extraction, a .log, another tag's results or a longer tag do not; missing / empty weights exit 1 before "
       "the card check, a failed card check exits 1, the extractor's status (7) ends the job with no fit, one failed fit exits 1 after the others finish, bad usage exits 2".format(expanded, smoke_command))
+
+# run_emb_class.sh, the A100 sibling, and the block the two wrappers share ------------------------------------------------------------------------------------------------
+CLASS_WRAPPER = os.path.join(REPO, "run_emb_class.sh")
+subprocess.run(["bash", "-n", CLASS_WRAPPER], check=True)
+assert os.access(CLASS_WRAPPER, os.X_OK)
+class_text = open(CLASS_WRAPPER).read()
+assert class_text.startswith("#!/usr/bin/env bash\n")
+assert re.findall(r"^#SBATCH (.+)$", class_text, re.M) == ["--job-name=b2-emb-c", "-A class_cse49478170fall2026", "-p public,htc", "-q class", "-t 04:00:00", "-N 1", "--gres=gpu:1", "--constraint=a100_80", "-c 12", "--mem=64G"]
+assert "PT_HPU_LAZY_MODE" not in class_text and "/scratch/$USER/2026Fall-CSE507-Ark-Container" in class_text
+# the drift guard: the argument, environment, weights and results checks are ONE text, between one pair of marker lines in each script, so a fix made to one cannot miss the other
+BEGIN = "# --- begin: shared with run_emb_gaudi.sh / run_emb_class.sh (test_ark_finetune.py checks the two copies are identical) ---"
+END = "# --- end: shared ---"
+
+
+def shared_block(text):
+    """What lies between the marker lines of one script, as it is. The markers must be there exactly once each, begin first, and no other line may look like one."""
+    lines = text.split("\n")
+    assert lines.count(BEGIN) == 1 and lines.count(END) == 1 and lines.index(BEGIN) < lines.index(END), "need exactly one begin and one end marker line, begin first"
+    assert sum(l.startswith("# --- begin") for l in lines) == 1 and sum(l.startswith("# --- end") for l in lines) == 1, "another line looks like a marker"
+    return "\n".join(lines[lines.index(BEGIN) + 1:lines.index(END)]) + "\n"
+
+
+gaudi_shared, class_shared = shared_block(wrapper_text), shared_block(class_text)
+assert gaudi_shared == class_shared, "the shared blocks differ:\n" + "".join(difflib.unified_diff(gaudi_shared.splitlines(True), class_shared.splitlines(True), "run_emb_gaudi.sh", "run_emb_class.sh"))
+assert gaudi_shared.startswith("TAG_RE=") and "taken=()" in gaudi_shared and gaudi_shared.endswith("another tag\" >&2\n  exit 1\nfi\n") and "PT_HPU_LAZY_MODE" not in gaudi_shared  # TAG_RE= through the results preflight's refusal
+print("OK (j) drift guard: run_emb_gaudi.sh and run_emb_class.sh each hold one pair of marker lines, and the {} lines between them (TAG_RE= through the results preflight's refusal: usage and argument checks, ARK_EMB_INPUT_SIZE, "
+      "ARK_EMB_NO_FIT, the weights check, the preflight) are the same text; run_emb_class.sh: bash -n, executable, Slurm header (b2-emb-c, class QOS, public,htc, 04:00:00, gpu:1 a100_80, -c 12, 64G), no PT_HPU_LAZY_MODE".format(gaudi_shared.count("\n")))
+
+# the same checks through both wrappers, in the one fake repo that holds both launchers' stubs: every call must come through the wrapper's own launcher, and only run_emb_gaudi.sh runs the card check. run_emb_class.sh gives the fits
+# OMP_NUM_THREADS=1 through `env` inside the container (nvidia.sh's --cleanenv forwards none), so its nvidia.sh stub sees no host value: "unset"
+EXTRACTION = {WRAPPER: "OMP=unset python -m ark_finetune.extract_embeddings --device hpu --tag {} --model {} --weights {} --normalization {} --workers 32",
+              CLASS_WRAPPER: "nvidia.sh OMP=unset python -m ark_finetune.extract_embeddings --device cuda --tag {} --model {} --weights {} --normalization {} --workers 12"}
+FIT = {WRAPPER: "OMP=1 python -m ark_linearprobe.run_linearprobe --tag {} --datasets {}",
+       CLASS_WRAPPER: "nvidia.sh OMP=unset env OMP_NUM_THREADS=1 python -m ark_linearprobe.run_linearprobe --tag {} --datasets {}"}
+
+
+def run_checked(wrapper, args, **kwargs):
+    """run_wrapper through `wrapper`, plus what every run must satisfy: each call came through the wrapper's own launcher (gaudi.sh's calls carry no prefix, nvidia.sh's start with "nvidia.sh "), and the card check ran only for run_emb_gaudi.sh."""
+    done, calls, card_check, results = run_wrapper(args, wrapper=wrapper, **kwargs)
+    assert all(c.startswith("nvidia.sh ") == (wrapper == CLASS_WRAPPER) for c in calls or []) and (wrapper == WRAPPER or not card_check), (wrapper, calls, done.stdout)
+    return done, calls, card_check, results
+
+
+for wrapper in (WRAPPER, CLASS_WRAPPER):
+    gaudi = wrapper == WRAPPER  # only run_emb_gaudi.sh goes through gaudi.sh and the card check
+    run = lambda args, **kwargs: run_checked(wrapper, args, **kwargs)
+    expect = EXTRACTION[wrapper].format("stock", "vit_base_dinov3", STOCK, "imagenet")
+    # the job: the extraction alone first, then the four fits, one log each
+    done, calls, card_check, results = run(base)
+    assert done.returncode == 0 and done.stderr == "" and card_check == gaudi and calls[0] == expect and sorted(calls[1:]) == sorted(FIT[wrapper].format("stock", d) for d in NAMES), (wrapper, done, calls)
+    assert results == sorted(d + ".log" for d in NAMES) and sorted(l for l in done.stdout.splitlines() if l.startswith(("fit ", "PROBE "))) == \
+        sorted(["fit {}: done".format(d) for d in NAMES] + ["PROBE tag {}: stub".format(d) for d in NAMES]), (wrapper, results, done.stdout)
+    # the extras allow-list: anything else exits 2 before anything runs, the weights there or not; --max_images, --datasets and --workers reach the extractor as they are, last
+    for extra in (["--tag", "other"], ["--device=cuda"], ["--embeddings_root", "/tmp/e"], ["--input_size", "518"], ["--emb", "/tmp/e"], ["-h"], ["--max_images", "5", "--tag", "x"]):
+        for files in ((STOCK_HOST,), ()):
+            done, calls, card_check, results = run(base + extra, files=files)
+            assert done.returncode == 2 and calls is None and not card_check and results is None and done.stdout == "" and "not accepted after <normalization>." in done.stderr, (wrapper, extra, files, done)
+    done, calls, _, _ = run(base + ["--max_images", "5", "--workers", "4"])
+    assert done.returncode == 0 and calls[0] == expect + " --max_images 5 --workers 4", (wrapper, calls)
+    # bad usage: exit 2 and the one usage line that names both scripts
+    for bad in ([], ["stock", "vit_base_dinov3", STOCK], ["../x", "vit_base_dinov3", STOCK, "imagenet"], ["stock", "vit_base_dinov3", "weights/x.pth", "imagenet"], ["stock", "vit_base_dinov3", STOCK, "caffe"]):
+        done, calls, card_check, results = run(bad)
+        assert done.returncode == 2 and done.stderr == USAGE + "\n" and done.stdout == "" and calls is None and not card_check and results is None, (wrapper, bad, done)
+    # missing or empty weights, and results that exist (the JSON, the shipped script's directory): exit 1 before the extraction
+    for kwargs in (dict(files=()), dict(content="")):
+        done, calls, card_check, results = run(base, **kwargs)
+        assert done.returncode == 1 and calls is None and not card_check and results is None and "ERROR: weights not found at ./" + STOCK_HOST in done.stderr, (wrapper, kwargs, done)
+    for blocking, named in (("results/stock/CheXpert.json", "results/stock/CheXpert.json"), ("results/stock/probe/MIMIC/log.txt", "results/stock/probe/MIMIC")):
+        done, calls, card_check, results = run(base, files=(STOCK_HOST, blocking))
+        assert done.returncode == 1 and calls is None and not card_check and done.stdout == "" and "ERROR: results already exist for tag stock: {}; refusing to start the extraction".format(named) in done.stderr, (wrapper, blocking, done)
+    # the extractor's status ends the job with no fit; one failed fit exits 1 after the other three finish
+    done, calls, _, results = run(base, EXTRACT_EXIT="7")
+    assert done.returncode == 7 and calls == [expect] and results is None, (wrapper, done, calls)
+    done, calls, _, results = run(base, FAIL_FIT="MIMIC")
+    assert done.returncode == 1 and len(calls) == 5 and "ERROR: fit MIMIC failed (see results/stock/MIMIC.log)" in done.stderr and all("fit {}: done".format(d) in done.stdout for d in NAMES if d != "MIMIC"), (wrapper, done, calls)
+    # ARK_EMB_INPUT_SIZE: --input_size 768 --img_resize 878 after the wrapper's own arguments and before the extras, none for the fits; an invalid value exits 2 before anything runs
+    done, calls, _, _ = run(base + ["--max_images", "5"], ARK_EMB_INPUT_SIZE="768")
+    assert done.returncode == 0 and calls[0] == expect + " --input_size 768 --img_resize 878 --max_images 5" and all("--input_size" not in c for c in calls[1:]), (wrapper, calls)
+    done, calls, card_check, results = run(base, ARK_EMB_INPUT_SIZE="12345")
+    assert done.returncode == 2 and "ARK_EMB_INPUT_SIZE" in done.stderr and calls is None and not card_check and results is None, (wrapper, done)
+    # ARK_EMB_NO_FIT: 1 = the extraction only and its stdout line (exit 0, no results/<tag>); another value exits 2 before the weights check; the preflight still runs; a failed extraction ends the job with its status
+    done, calls, card_check, results = run(base, ARK_EMB_NO_FIT="1")
+    assert done.returncode == 0 and done.stderr == "" and card_check == gaudi and calls == [expect] and results is None and done.stdout.splitlines() == (["CARD_CHECK"] if gaudi else []) + [NO_FIT_LINE], (wrapper, done, calls)
+    for bad in ("0", "yes"):
+        done, calls, card_check, results = run(base, files=(), ARK_EMB_NO_FIT=bad)
+        assert done.returncode == 2 and done.stderr == "ERROR: ARK_EMB_NO_FIT='{}' must be unset, empty or 1\n".format(bad) and done.stdout == "" and calls is None and not card_check and results is None, (wrapper, bad, done)
+    done, calls, card_check, results = run(base, files=(STOCK_HOST, "results/stock/CheXpert.json"), ARK_EMB_NO_FIT="1")
+    assert done.returncode == 1 and calls is None and not card_check and "ERROR: results already exist for tag stock: results/stock/CheXpert.json; refusing to start the extraction" in done.stderr, (wrapper, done)
+    done, calls, _, results = run(base, EXTRACT_EXIT="7", ARK_EMB_NO_FIT="1")
+    assert done.returncode == 7 and calls == [expect] and "extraction only" not in done.stdout and results is None, (wrapper, done, calls)
+print("OK (j) both wrappers, each through its own launcher only (run_emb_gaudi.sh: gaudi.sh and the card check, hpu, 32 workers; run_emb_class.sh: nvidia.sh, no card check, cuda, 12 workers): the extraction alone first, then the four fits, one log each "
+      "(class: {} then {}); extras other than --max_images / --datasets / --workers, a bad usage (one usage line naming both scripts), missing or empty weights, results that exist and an invalid ARK_EMB_INPUT_SIZE / ARK_EMB_NO_FIT stop the job "
+      "before anything runs (exit 2 / 2 / 1 / 1 / 2 / 2); the extractor's status (7) ends it with no fit; one failed fit exits 1 after the others finish; ARK_EMB_INPUT_SIZE=768 -> --input_size 768 --img_resize 878; "
+      "ARK_EMB_NO_FIT=1 -> the extraction only, exit 0, no results/<tag>".format(EXTRACTION[CLASS_WRAPPER].format("stock", "vit_base_dinov3", STOCK, "imagenet")[len("nvidia.sh OMP=unset "):], FIT[CLASS_WRAPPER].format("stock", "<each of the four>")[len("nvidia.sh OMP=unset "):]))
+
+# the Ark+ Swin-L submission of run_emb_class.sh's header, one job per dataset as in run_emb_gaudi.sh: the job that only extracts MIMIC is the one call and the extraction-only line
+CLASS_SUBMISSION = "ARK_EMB_INPUT_SIZE=768 sbatch -t 14:00:00 run_emb_class.sh arkplus6 swin_large_768 {} imagenet --datasets MIMIC".format(ARK_WEIGHTS)
+assert CLASS_SUBMISSION in class_text  # the example in the class script's header
+class_ark_extraction = "nvidia.sh OMP=unset python -m ark_finetune.extract_embeddings --device cuda --tag arkplus6 --model swin_large_768 --weights {} --normalization imagenet --workers 12 --input_size 768 --img_resize 878 --datasets MIMIC".format(ARK_WEIGHTS)
+done, calls, card_check, results = run_checked(CLASS_WRAPPER, ark_args + ["--datasets", "MIMIC"], files=ark_files, ARK_EMB_INPUT_SIZE="768", ARK_EMB_NO_FIT="1")
+assert done.returncode == 0 and done.stderr == "" and calls == [class_ark_extraction] and not card_check and results is None, (done, calls)
+assert done.stdout == "ARK_EMB_NO_FIT=1: extraction only, no fit for tag arkplus6; the job that extracts the last dataset of this tag without ARK_EMB_NO_FIT fits all four\n", done.stdout
+print("OK (j) Ark+ Swin-L on the class lane: ARK_EMB_INPUT_SIZE=768 ARK_EMB_NO_FIT=1 with --datasets MIMIC expands to the one call {} and the extraction-only line".format(class_ark_extraction[len("nvidia.sh OMP=unset "):]))
 
 print("ALL OK")
