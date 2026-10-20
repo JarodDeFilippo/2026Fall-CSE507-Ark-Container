@@ -10,7 +10,9 @@ Run from base/:  python -m ark_finetune.test_ark_finetune   (or python ark_finet
 (g) the runner: 10 runs, seeds, the JSON and its cross-checks, flags, refusals and the preflight order
 (h) the extractor on tiny synthetic images and a tiny ViT (train and test only, one center crop each), and the normalization presets
 (i) extractor -> runner on the four official list formats
-(j) run_emb_gaudi.sh in a fake repo, preflight and the allow-list of extractor arguments included
+(i3) the Ark+ Swin teacher through the extractor: a lab-style checkpoint's TEACHER (not its student) is embedded before the projector, 1024-d for swin_base; a model that does not fit the file (embed_dim, window, input size),
+     a file with no teacher or with a missing block weight, and a crop that is not the Swin's size are refused; a file with no attn_mask buffers loads and says its input size is unverified
+(j) run_emb_gaudi.sh in a fake repo, preflight, the allow-list of extractor arguments and the ARK_EMB_NO_FIT switch included
 """
 import ast
 import contextlib
@@ -48,6 +50,8 @@ from utils import get_config
 from ark_finetune import dataloader, dataset_lists, embedding_mode, extract_embeddings
 from ark_linearprobe import embedding_datasets, main_linearprobing, run_linearprobe
 from ark_linearprobe import utils as lp_utils
+
+DEFAULT_THREADS = torch.get_num_threads()  # before the runner (g) pins torch to one thread for the rest of the run: (i3)'s Swin models take this back
 
 UPSTREAM = os.environ.get("ARK_UPSTREAM")  # the Ark_Plus folder of a local checkout of the upstream repo (github.com/jlianglab/Ark); unset, the vendoring guard is skipped
 VENDORED = ((os.path.join(UPSTREAM, "Finetuning"), HERE, ("dataloader.py",)), (os.path.join(UPSTREAM, "Linearprobing"), LP_HERE, ("main_linearprobing.py", "utils.py"))) if UPSTREAM else ()
@@ -1070,7 +1074,8 @@ print("OK (h2) extract_features: [N, 1536] float16, one embedding per image (no 
       "another device than requested raise RuntimeError; progress lines at batches 1, 2 and every 20th")
 
 # the width: by model name (embedding_dim), from a cache's meta.json (feature_dim), and as extract_features' parameter (the built backbone's; the default is the ViT-B 1536)
-assert embedding_mode.EMBEDDING_DIM == 1536 and [embedding_mode.embedding_dim(m) for m in ("vit_base_dinov3", "vit_base_dinov2", "vit_base_raddino", "vit_large_raydino")] == [1536, 1536, 1536, 2048]
+assert embedding_mode.EMBEDDING_DIM == 1536 and [embedding_mode.embedding_dim(m) for m in ("vit_base_dinov3", "vit_base_dinov2", "vit_base_raddino", "vit_large_raydino", "swin_base", "swin_large", "swin_large_384", "swin_large_768")] == \
+    [1536, 1536, 1536, 2048, 1024, 1536, 1536, 1536]
 assert embedding_mode.embedding_dim("some_other_model") == 1536 and embedding_mode.feature_dim({}) == 1536 and embedding_mode.feature_dim({"feature_dim": 2048}) == 2048
 for bad_dim in (0, -1, 1536.0, "2048", None, True, [2048]):
     rejects(ValueError, lambda: embedding_mode.feature_dim({"feature_dim": bad_dim}), "meta.json feature_dim {!r} is not a positive integer".format(bad_dim))
@@ -1078,7 +1083,7 @@ wide = extract_embeddings.extract_features(FakeModel(lambda x: torch.ones(len(x)
 assert wide.shape == (5, 2048) and wide.dtype == np.float16 and (wide == 1).all()
 rejects(RuntimeError, lambda: extract_embeddings.extract_features(FakeModel(lambda x: torch.zeros(len(x), 1536)), Loader([(x4, None)]), Accelerator("cpu"), dim=2048), "returned 1536-d features, the probe's head takes 2048")
 rejects(RuntimeError, lambda: extract_embeddings.extract_features(FakeModel(lambda x: torch.zeros(len(x), 2048)), Loader([(x4, None)]), Accelerator("cpu")), "returned 2048-d features, the probe's head takes 1536")
-print("OK (h2b) width: embedding_dim is 1536 for the three ViT-B names and 2048 for vit_large_raydino (EMBEDDING_DIM stays the ViT-B 1536); feature_dim reads meta.json (absent = 1536; 0, -1, 1536.0, '2048', null, true and a list "
+print("OK (h2b) width: embedding_dim is 1536 for the three ViT-B names and the three Swin-L names, 2048 for vit_large_raydino and 1024 for swin_base (EMBEDDING_DIM stays 1536); feature_dim reads meta.json (absent = 1536; 0, -1, 1536.0, '2048', null, true and a list "
       "are refused); extract_features takes the width as a parameter: 2048 gives (N, 2048) float16 and a 1536-wide model is refused at dim=2048, a 2048-wide one at the default")
 
 stock_kwargs, stock_extractor_entry = models.DINOV3_VITB16_KWARGS, extract_embeddings.dataset_entry
@@ -1305,6 +1310,110 @@ try:
         print("OK (i2) RayDINO: a vit_large_raydino file in DINOv2's block_chunks layout is summarised (one line: key count, non-block keys with shapes, first and last block key, layout) and renamed on load (one notice), both on stderr, the extractor writes float16 (N, 2048) caches equal to the chunked model's embeddings with "
               "feature_dim 2048 in every meta.json and 'dim 2048' on every EMB line, the runner fits a 2048-wide probe head (protocol text, ckpt weight shape) for 2 runs on all four datasets; the JSON carries "
               "pretraining_overlap_train, its flags.rad_dino_pretraining_overlap stays null (no test-set overlap), and other models carry no such field; a meta that disagrees with its arrays is refused")
+
+        # (i3) the Ark+ Swin teacher: a swin_* name loads checkpoint['teacher'], the lab's convention for the encoder of an Ark checkpoint, never checkpoint['state_dict'] (the student, which build_omni_model would read into a Swin with no
+        # key guard), and embeds before the projector: 1024-d for swin_base. The stand-in is the lab's own model in its checkpoint layout (every key under 'module.', the teacher beside the student) with a projector and two heads, at
+        # swin_base's width, window and input size (embed_dim 128, window 7, 224 px) but TWO blocks a stage instead of (2, 2, 18, 2): the checks read the width, the window, the input size and the key names, never the depth, and a
+        # full Swin-B is ~90 M weights to initialise and (i3) builds a model many times over. The loader builds its probe with the depths as written, so the Swin class it builds is swapped for one that replaces them, for all of (i3): every model built
+        # below (the probes and the shape-only builds too) is the shallow one. Delete ShallowSwin and the two lines that set and restore it for the real depths
+        stock_swin, threads = models.ArkSwinTransformer, torch.get_num_threads()
+
+        class ShallowSwin(stock_swin):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **dict(kwargs, depths=(2, 2, 2, 2)))
+
+        models.ArkSwinTransformer = ShallowSwin
+        torch.set_num_threads(DEFAULT_THREADS)  # the runner (g) left torch on one thread
+        try:
+            SWIN_BASE = dict(patch_size=4, window_size=7, embed_dim=128, depths=(2, 2, 18, 2), num_heads=(4, 8, 16, 32))  # swin_base as build_omni_model builds it
+            torch.manual_seed(21)
+            swin_teacher = models.ArkSwinTransformer([14, 3], 1376, False, **SWIN_BASE).eval()
+            torch.manual_seed(22)
+            swin_student = models.ArkSwinTransformer([14, 3], 1376, False, **SWIN_BASE).eval()
+
+            def save_ark(path, teacher_state, **others):
+                """The lab's checkpoint layout around `teacher_state` (a plain state dict): every key under 'module.' (DataParallel), plus `others` (e.g. state_dict=<the student's keys under 'module.'>)."""
+                torch.save(dict({"epoch": 50, "teacher": {"module." + k: v for k, v in teacher_state.items()}, "optimizer": {}}, **others), path)
+
+            ark_path = os.path.join(tmp, "ark_tiny.pth.tar")
+            save_ark(ark_path, swin_teacher.state_dict(), state_dict={"module." + k: v for k, v in swin_student.state_dict().items()})
+            swin_transform = dataloader.build_transform_classification(normalize="imagenet", crop_size=224, resize=256, mode="valid")
+
+            def swin_rows(model, split, limit=None):
+                """Each ChestXray14 image through the official 'valid' transform at 224 and `model` on its own, before the projector: [N, 1024]."""
+                with torch.no_grad():
+                    return np.concatenate([model.generate_embeddings(swin_transform(Image.open(path).convert("RGB"))[None], after_proj=False).numpy()
+                                           for path in official_dataset("ChestXray14", entries["ChestXray14"], split).img_list[:limit]])
+
+            def swin_main(tag, size="224", resize="256"):
+                return quiet(lambda: extract_embeddings.main(["--tag", tag, "--normalization", "imagenet", "--model", "swin_base", "--weights", ark_path, "--embeddings_root", root, "--input_size", size, "--img_resize", resize,
+                                                              "--batch_size", "4", "--workers", "0", "--device", "cpu", "--datasets", "ChestXray14"]))
+
+            _, out, err = swin_main("arkswin")
+            swin_folder = os.path.join(root, "arkswin", "ChestXray14")
+            meta = json.load(open(os.path.join(swin_folder, "meta.json")))
+            assert meta["model"] == "swin_base" and meta["feature_dim"] == 1024 and meta["shapes"] == {"train": [7, 1024], "test": [6, 1024]} and meta["weights"]["path"] == ark_path, meta
+            assert meta["transform"]["crop"] == 224 and meta["transform"]["resize"] == 256
+            for split in ("train", "test"):
+                cached = np.load(embedding_mode.split_files(swin_folder, split)[0])
+                assert cached.dtype == np.float16 and cached.shape == (sizes[split], 1024), (split, cached.shape)
+                expected = swin_rows(swin_teacher, split)
+                assert np.allclose(cached, expected.astype(np.float16), atol=2e-3, rtol=2e-3), (split, np.abs(cached - expected).max())  # the teacher's pooled vector, before its 1376-d projector
+                assert not np.allclose(cached[:2], swin_rows(swin_student, split, 2).astype(np.float16), atol=2e-3, rtol=2e-3)  # and not the student's
+            assert re.findall(r"^EMB arkswin (\w+): train 7 / test 6, dim 1024, \d+s$", out, re.M) == ["ChestXray14"] and out.count("\n") == 1, out
+            assert err.count("loaded into --model swin_base") == 1 and "saved no attn_mask" not in err, err  # the summary line, once, in the job's log
+            for text in ("key 'teacher'", "embed_dim 128, window 7, input 224 px", "not loaded (the probe builds no projector or heads): 6 keys"):  # projector.{weight, bias} and omni_heads.{0, 1}.{weight, bias}
+                assert text in err, (text, err)
+
+            # refused: the file's architecture is not the model's (the message gives the file's tensors and the model that fits), a Swin-B at 448 px that no model name builds, a block weight gone, no teacher
+            load_swin = lambda model, path=ark_path: quiet(lambda: extract_embeddings.load_backbone(model, path))
+            message = rejects(RuntimeError, lambda: load_swin("swin_large"), "embed_dim 128, window 7, input 224 px")
+            assert "Use --model swin_base with a 224 px crop (run_emb_gaudi.sh: ARK_EMB_INPUT_SIZE=224)" in message and "--model swin_large builds embed_dim 192, window 7, input 224 px" in message, message
+            assert "patch_embed.proj.weight [128, 3, 4, 4], relative_position_bias_table [169, 4], layers.0.blocks.1.attn_mask [64, 49, 49]" in message and message.startswith("Ark checkpoint {} ('teacher') does not fit --model swin_large".format(ark_path)), message
+            other = os.path.join(tmp, "ark_other.pth.tar")  # rewritten for each case below: the temp dir holds one checkpoint beside ark_tiny's
+            torch.manual_seed(23)
+            save_ark(other, models.ArkSwinTransformer([14, 3], 1376, False, img_size=448, **SWIN_BASE).state_dict())
+            message = rejects(RuntimeError, lambda: load_swin("swin_base", other), "input 448 px")
+            assert "No model name here builds that architecture (swin_base 128/7/224, swin_large 192/7/224, swin_large_384 192/12/384, swin_large_768 192/12/768)" in message and "builds embed_dim 128, window 7, input 224 px" in message, message
+            gone = "layers.2.blocks.1.mlp.fc1.weight"
+            save_ark(other, {k: v for k, v in swin_teacher.state_dict().items() if k != gone})
+            message = rejects(RuntimeError, lambda: load_swin("swin_base", other), "missing keys")
+            assert "missing keys ['{}'] and unexpected keys []".format(gone) in message, message  # the projector and the heads the probe does not build are not unexpected keys
+            torch.save(swin_teacher.state_dict(), other)  # a plain state dict: no 'teacher' (nor 'state_dict') to take
+            message = rejects(KeyError, lambda: load_swin("swin_base", other), "has no 'teacher' entry")
+            assert "(top-level keys: ['patch_embed.proj.weight', " in message and "): not an Ark checkpoint" in message, message
+            torch.save({"epoch": 1, "state_dict": {"a": torch.zeros(1)}}, other)  # a student only
+            assert "(top-level keys: ['epoch', 'state_dict'])" in rejects(KeyError, lambda: load_swin("swin_base", other), "has no 'teacher' entry")
+            torch.save(torch.zeros(1), other)  # not even a dict
+            rejects(KeyError, lambda: load_swin("swin_base", other), "has no 'teacher' entry")
+
+            # a file with no attn_mask buffers (derived: the model keeps its own) loads, with its teacher's weights, but its input size cannot be checked: said on stderr
+            save_ark(other, {k: v for k, v in swin_teacher.state_dict().items() if not k.endswith("attn_mask")})
+            loaded, _, err = load_swin("swin_base", other)
+            assert "saved no attn_mask buffer" in err and "--model swin_base builds 224 px, unverified" in err and "input not saved px" in err and err.count("loaded into --model swin_base") == 1, err
+            assert torch.equal(loaded.patch_embed.proj.weight, swin_teacher.patch_embed.proj.weight) and not torch.equal(loaded.patch_embed.proj.weight, swin_student.patch_embed.proj.weight)
+
+            # a Swin takes the one input size it is built for: a 32 px crop is refused once the model is loaded and before any output directory is made (timm's PatchEmbed would assert at the first batch)
+            rejects(ValueError, lambda: swin_main("arkbad", "32", "36"), "--model swin_base takes 224x224 input, but the crop is 32 px: set ARK_EMB_INPUT_SIZE=224 (run_emb_gaudi.sh), i.e. --input_size 224")
+            assert not os.path.exists(os.path.join(root, "arkbad"))
+
+            # the shapes behind the checks, from the models themselves, no forward: width, input size and what swin_architecture reads off the state dict
+            for model_name, features, size, triple in (("swin_large_768", 1536, 768, (192, 12, 768)), ("swin_large_384", 1536, 384, (192, 12, 384)), ("swin_base", 1024, 224, (128, 7, 224))):
+                built = models.build_omni_model(SimpleNamespace(model_name=model_name, projector_features=None, use_mlp=False, pretrained_weights=None), [])
+                assert built.num_features == features and tuple(built.patch_embed.img_size) == (size, size), model_name
+                assert models.swin_architecture(built.state_dict()) == triple and models.SWIN_ARCHITECTURES[triple] == model_name and embedding_mode.embedding_dim(model_name) == features, model_name
+            assert models.swin_architecture({k: v for k, v in built.state_dict().items() if k != "layers.0.blocks.1.attn_mask"}) == (128, 7, None)  # no mask saved: no input size
+            fake = {"patch_embed.proj.weight": torch.zeros(128, 3, 4, 4), "layers.0.blocks.0.attn.relative_position_bias_table": torch.zeros(169, 4)}
+            assert models.swin_architecture(dict(fake, **{"layers.0.blocks.1.attn_mask": torch.zeros(64, 49, 49)})) == (128, 7, 224)
+            assert models.swin_architecture(dict(fake, **{"layers.0.blocks.1.attn_mask": torch.zeros(63, 49, 49)})) == (128, 7, None)  # 63 windows are not a square grid: no input size either
+        finally:
+            models.ArkSwinTransformer = stock_swin
+            torch.set_num_threads(threads)
+        print("OK (i3) Ark+ Swin teacher: swin_base loads checkpoint['teacher'] (not the student's state_dict) from a lab-layout .pth.tar and the extractor writes float16 (N, 1024) caches equal to the teacher's pooled vector before "
+              "its projector, feature_dim 1024, 'dim 1024' on the EMB line, one summary line on stderr (key, tensors, embed_dim / window / input, the 6 projector and head keys not loaded); refused: the same file as swin_large "
+              "(names the file's tensors and --model swin_base at a 224 px crop), a 448 px Swin-B (no model name), a missing block weight, a plain state dict, a student-only file and a non-dict (no 'teacher'), a 32 px crop for "
+              "swin_base (before any directory); a file with no attn_mask loads with an 'unverified' warning; swin_large_768 / swin_large_384 / swin_base build 1536 / 1536 / 1024-d at 768 / 384 / 224 px and swin_architecture reads "
+              "(192, 12, 768) / (192, 12, 384) / (128, 7, 224) off their state dicts, with no input size when the mask is gone or its window count is not a square (all at two blocks a stage)")
 finally:
     models.DINOV3_VITB16_KWARGS, extract_embeddings.dataset_entry = stock_kwargs, stock_extractor_entry
 
@@ -1438,6 +1547,36 @@ for bad in ("0", "-512", "512px", "5 12", "12345", "0512"):
     assert done.returncode == 2 and "ARK_EMB_INPUT_SIZE" in done.stderr and calls is None and not card_check and results is None, (bad, done)
 print("OK (j) ARK_EMB_INPUT_SIZE: 224 / 448 / 512 / 768 -> --input_size N --img_resize round(N x 8/7) (256 / 512 / 585 / 878); unset or empty -> neither "
       "(224 / 256); 0, negative, non-numeric, 5 digits, a leading 0 -> exit 2 before anything runs; 512: " + emb_size_command)
+# ARK_EMB_NO_FIT: exactly 1 = extraction only (the extraction is the job's one gaudi.sh call, a stdout line says so, exit 0, results/<tag> never made); unset or empty = the extraction and the four fits as before; any other value
+# exits 2 before anything runs, the weights check, the results preflight and the card check included. The results preflight still runs for a job that does not fit, and a failed extraction still ends it with its own status
+NO_FIT_LINE = "ARK_EMB_NO_FIT=1: extraction only, no fit for tag stock; the job that extracts the last dataset of this tag without ARK_EMB_NO_FIT fits all four"
+done, calls, card_check, results = run_wrapper(base, ARK_EMB_NO_FIT="1")
+assert done.returncode == 0 and done.stderr == "" and card_check and calls == [extraction] and results is None, (done, calls, results)
+assert done.stdout.splitlines() == ["CARD_CHECK", NO_FIT_LINE], done.stdout
+done, calls, card_check, results = run_wrapper(base, ARK_EMB_NO_FIT="")
+assert done.returncode == 0 and card_check and calls[0] == extraction and len(calls) == 5 and results == sorted(d + ".log" for d in NAMES) and "extraction only" not in done.stdout, (done, calls)
+for bad in ("0", "yes", "1 ", "true", "11"):
+    for files in ((STOCK_HOST,), (), (STOCK_HOST, "results/stock/MIMIC.json")):  # the weights present, missing, or results that exist: refused first all the same
+        done, calls, card_check, results = run_wrapper(base, files=files, ARK_EMB_NO_FIT=bad)
+        assert done.returncode == 2 and done.stderr == "ERROR: ARK_EMB_NO_FIT='{}' must be unset, empty or 1\n".format(bad) and done.stdout == "" and calls is None and not card_check, (bad, files, done)
+        assert results == (["MIMIC.json"] if len(files) == 2 else None), (bad, files, results)
+done, calls, card_check, results = run_wrapper(base, files=(STOCK_HOST, "results/stock/CheXpert.json"), ARK_EMB_NO_FIT="1")  # the preflight still runs
+assert done.returncode == 1 and calls is None and not card_check and "ERROR: results already exist for tag stock: results/stock/CheXpert.json; refusing to start the extraction" in done.stderr, done
+done, calls, _, results = run_wrapper(base, EXTRACT_EXIT="7", ARK_EMB_NO_FIT="1")  # a failed extraction ends the job with its status, not as "extraction only"
+assert done.returncode == 7 and calls == [extraction] and "extraction only" not in done.stdout and results is None, (done, calls)
+# the Ark+ Swin-L submission of the header, split by dataset: a job that only extracts MIMIC, then the last dataset's job without the switch, which extracts VinDrCXR and fits all four
+ARK_WEIGHTS = "/workspace/weights/Ark6_swinLarge768_ep50.pth.tar"
+ARK_SUBMISSION = "ARK_EMB_INPUT_SIZE=768 sbatch -t 1-00:00:00 run_emb_gaudi.sh arkplus6 swin_large_768 {} imagenet".format(ARK_WEIGHTS)
+assert ARK_SUBMISSION in wrapper_text  # the Ark+ example in the wrapper's header
+ark_extraction = "OMP=unset python -m ark_finetune.extract_embeddings --device hpu --tag arkplus6 --model swin_large_768 --weights {} --normalization imagenet --workers 32 --input_size 768 --img_resize 878".format(ARK_WEIGHTS)
+ark_args, ark_files = ["arkplus6", "swin_large_768", ARK_WEIGHTS, "imagenet"], ("weights/Ark6_swinLarge768_ep50.pth.tar",)
+done, calls, card_check, results = run_wrapper(ark_args + ["--datasets", "MIMIC"], files=ark_files, ARK_EMB_INPUT_SIZE="768", ARK_EMB_NO_FIT="1")
+assert done.returncode == 0 and card_check and calls == [ark_extraction + " --datasets MIMIC"] and results is None, (done, calls)
+done, calls, _, results = run_wrapper(ark_args + ["--datasets", "VinDrCXR"], files=ark_files, ARK_EMB_INPUT_SIZE="768")
+assert done.returncode == 0 and calls[0] == ark_extraction + " --datasets VinDrCXR" and sorted(calls[1:]) == sorted("OMP=1 python -m ark_linearprobe.run_linearprobe --tag arkplus6 --datasets {}".format(d) for d in NAMES), calls
+print("OK (j) ARK_EMB_NO_FIT: 1 = the extraction is the only gaudi.sh call, the 'extraction only' line names the tag, exit 0, no results/<tag>; unset or empty = the extraction and the four fits (5 calls); 0, yes, '1 ', true, 11 -> exit 2 naming "
+      "the value before the weights check, the preflight and the card check; the preflight still stops a job that does not fit (exit 1), a failed extraction ends it with its status (7); the Ark+ line expands to: " + ark_extraction +
+      " --datasets MIMIC (switch on), and the last dataset's job without it runs the extraction and the four fits")
 # usage: <tag> <model> <path under /workspace> <normalization>, each checked, exit 2, extra arguments do not bypass the checks
 for bad in ([], ["stock"], ["stock", "vit_base_dinov3", STOCK], ["../x", "vit_base_dinov3", STOCK, "imagenet"], ["a b", "vit_base_dinov3", STOCK, "imagenet"], ["-x", "vit_base_dinov3", STOCK, "imagenet"],
             ["", "vit_base_dinov3", STOCK, "imagenet"], ["stock", "vit base", STOCK, "imagenet"], ["stock", "", STOCK, "imagenet"], ["stock", "../m", STOCK, "imagenet"],

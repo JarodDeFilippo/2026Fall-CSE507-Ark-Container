@@ -1,5 +1,6 @@
 # Modified from the course Ark+ container (see NOTICE)
 import logging
+import math
 import re
 
 import torch
@@ -330,7 +331,22 @@ def checkpoint_summary(state_dict, listed=32):
         text += ". Blocks ({}): first {} {}, last {} {}".format(len(blocks), first, shape(first), last, shape(last))
     return text + "; layout " + layout
 
+SWIN_ARCHITECTURES = {(128, 7, 224): "swin_base", (192, 7, 224): "swin_large", (192, 12, 384): "swin_large_384", (192, 12, 768): "swin_large_768"}  # (embed_dim, window, input px) -> the Swin names build_omni_model_from_checkpoint builds
+
+def swin_architecture(state_dict):
+    """(embed_dim, window, input size in px) of a timm 0.5.4 Swin state dict, read off its tensors: embed_dim is the first dimension of patch_embed.proj.weight; the window w comes from stage 0's
+    relative_position_bias_table, which has (2w - 1)^2 rows; the input size from the attn_mask of stage 0's first shifted block, [nW, w * w, w * w] with nW = (input / 4 / w)^2 windows, so input = 4 * w * sqrt(nW).
+    The mask is a buffer a file may not hold: the input size is None then, and when nW is not a perfect square."""
+    embed_dim = state_dict["patch_embed.proj.weight"].shape[0]
+    window = (math.isqrt(state_dict["layers.0.blocks.0.attn.relative_position_bias_table"].shape[0]) + 1) // 2
+    mask = state_dict.get("layers.0.blocks.1.attn_mask")
+    side = None if mask is None else math.isqrt(mask.shape[0])
+    return embed_dim, window, (4 * window * side if side is not None and side * side == mask.shape[0] else None)
+
 def build_omni_model_from_checkpoint(args, num_classes_list, key):
+    """The lab's Ark_Plus/Pretraining/models.py loader: the model of args.model_name with the weights of checkpoint[key]; 'teacher' is the lab's convention for an Ark checkpoint's encoder (build_omni_model reads
+    checkpoint['state_dict'], the student). Hardened for the embedding extractor, which builds no projector and no heads: a file with no `key` entry is refused (KeyError); a Swin file whose embed_dim, window or input
+    size is not the model's is refused (RuntimeError, see swin_architecture), as is any missing or unexpected key but the projector, the heads and the derived buffers; a Swin load logs one warning line on what the file held."""
     if args.model_name == "swin_base": #swin_base_patch4_window7_224
         model = ArkSwinTransformer(num_classes_list, args.projector_features, args.use_mlp, patch_size=4, window_size=7, embed_dim=128, depths=(2, 2, 18, 2), num_heads=(4, 8, 16, 32))
     elif args.model_name == "swin_large": #swin_large_patch4_window7_224
@@ -350,12 +366,39 @@ def build_omni_model_from_checkpoint(args, num_classes_list, key):
 
     if args.pretrained_weights is not None:
         checkpoint = torch.load(args.pretrained_weights, map_location='cpu', weights_only=False)
+        if not isinstance(checkpoint, dict) or key not in checkpoint:  # e.g. a plain state dict: indexing it would fail with a bare KeyError
+            raise KeyError("{} has no '{}' entry (top-level keys: {}): not an Ark checkpoint".format(args.pretrained_weights, key, list(checkpoint)[:10] if isinstance(checkpoint, dict) else []))
         state_dict = checkpoint[key]
         if any([True if 'module.' in k else False for k in state_dict.keys()]):
                     state_dict = {k.replace('module.', ''): v for k, v in state_dict.items() if k.startswith('module.')}
 
+        is_swin = isinstance(model, ArkSwinTransformer)  # not `swin`: that is the timm module above
+        if is_swin:  # strict=False loads a Swin file of another window or input size only as far as torch's shape check notices (and not at all when the file has no attn_mask buffers): read both off the file and compare
+            embed, window, size = swin_architecture(state_dict)
+            embed2, window2, size2 = swin_architecture(model.state_dict())
+            shape = lambda name: list(state_dict[name].shape) if name in state_dict else "not saved"
+            if (embed, window) != (embed2, window2) or (size is not None and size2 is not None and size != size2):
+                fits = [k for k in SWIN_ARCHITECTURES if k[:2] == (embed, window) and size in (None, k[2])]  # a file with no attn_mask has no input size: only a unique (embed_dim, window) match is a suggestion
+                suggestion = ("Use --model {} with a {} px crop (run_emb_gaudi.sh: ARK_EMB_INPUT_SIZE={})".format(SWIN_ARCHITECTURES[fits[0]], fits[0][2], fits[0][2]) if len(fits) == 1 else
+                              "No model name here builds that architecture ({})".format(", ".join("{} {}/{}/{}".format(name, *k) for k, name in SWIN_ARCHITECTURES.items())))
+                raise RuntimeError("Ark checkpoint {} ('{}') does not fit --model {}: the checkpoint is a Swin with embed_dim {}, window {}, input {} px (patch_embed.proj.weight {}, relative_position_bias_table {}, "
+                                   "layers.0.blocks.1.attn_mask {}); --model {} builds embed_dim {}, window {}, input {} px. {}".format(
+                                       args.pretrained_weights, key, args.model_name, embed, window, size or "not saved", shape("patch_embed.proj.weight"),
+                                       shape("layers.0.blocks.0.attn.relative_position_bias_table"), shape("layers.0.blocks.1.attn_mask"), args.model_name, embed2, window2, size2, suggestion))
+            if "layers.0.blocks.1.attn_mask" not in state_dict:
+                logger.warning("Ark checkpoint {} saved no attn_mask buffer: its input size cannot be read from it; --model {} builds {} px, unverified".format(args.pretrained_weights, args.model_name, size2))
+
         msg = model.load_state_dict(state_dict, strict=False)
         logger.info('Loaded with msg: {}'.format(msg))
+        # The projector, the heads and timm's classifier head may be absent from the model or the file (the probe builds none); a Swin's attn_mask and relative_position_index are derived buffers. Any other key
+        # missing leaves part of the backbone at random init, any other one unexpected is another architecture: refuse either, as build_omni_model does for the DINO ViTs.
+        bad_missing = [k for k in msg.missing_keys if not k.startswith(("projector.", "omni_heads.", "head.")) and not k.endswith(("attn_mask", "relative_position_index"))]
+        bad_unexpected = [k for k in msg.unexpected_keys if not k.startswith(("projector.", "omni_heads.", "head."))]
+        if bad_missing or bad_unexpected:
+            raise RuntimeError("Ark checkpoint {} ('{}') does not match --model {}: missing keys {} and unexpected keys {}".format(args.pretrained_weights, key, args.model_name, sorted(bad_missing), sorted(bad_unexpected)))
+        if is_swin:  # a warning: the extractor sets no logging up, and an info line would not reach its log
+            logger.warning("Ark checkpoint {}: key '{}', {} tensors; Swin embed_dim {}, window {}, input {} px; loaded into --model {}; not loaded (the probe builds no projector or heads): {} keys".format(
+                args.pretrained_weights, key, len(state_dict), embed, window, size or "not saved", args.model_name, sum(k.startswith(("projector.", "omni_heads.")) for k in msg.unexpected_keys)))
            
     return model
 

@@ -9,7 +9,7 @@
 #SBATCH -c 36
 #SBATCH --mem=128G
 # B2 (CSE 494 IP, Step VIII): the Ark+ lab's embedding linear probe (Ark_Plus/Linearprobing/main_linearprobing.py, as shipped) for ONE backbone, on 1 Gaudi card and the node's CPUs.
-#   1. extraction on the card (base/ark_finetune/extract_embeddings.py): the frozen backbone's 1536-d (ViT-B) or 2048-d (ViT-L) vector (CLS ++ mean patch) for every image of the full official train list and the official
+#   1. extraction on the card (base/ark_finetune/extract_embeddings.py): the frozen backbone's 1536-d (ViT-B) or 2048-d (ViT-L) vector (CLS ++ mean patch), or a Swin's pooled output before its projector (1024-d Swin-B, 1536-d Swin-L), for every image of the full official train list and the official
 #      test list of ChestXray14, CheXpert, MIMIC and VinDrCXR, ONE center-crop embedding per image, no validation split -> /workspace/embeddings/<tag>/<dataset>/
 #   2. the fit on the CPU (base/ark_linearprobe/run_linearprobe.py): the shipped script, 10 runs of 100 epochs (float64 linear layer, Adam 1e-4 with the shipped cosine schedule whose lr RISES, batch 512),
 #      in each run the epoch with the best TEST mAUC is the one reported (the script has no validation split); one process per dataset, the four in parallel
@@ -20,13 +20,17 @@
 # usage: sbatch run_emb_gaudi.sh <tag> <model> <in-container weights path> <normalization> [--max_images N] [--datasets NAME...] [--workers N]
 #   <tag>            names the backbone: letters, digits, . _ - only. The cache and the results are keyed by it. Results that already exist for the tag stop the job in seconds, before the card
 #                    check and the extraction (the fit would refuse to overwrite them after the extraction had spent the allocation); an existing cache is refused by the extractor.
-#   <model>          base/models.py's model name, passed through: vit_base_dinov3, vit_base_dinov2, vit_base_raddino, vit_large_raydino.
-#   <weights>        under /workspace (= the repo root on the host): the stock .pth or a Stage A export/teacher_backbone_epoch_NNNN.pth.
+#   <model>          base/models.py's model name, passed through: vit_base_dinov3, vit_base_dinov2, vit_base_raddino, vit_large_raydino, swin_base, swin_large, swin_large_384, swin_large_768 (an Ark+ .pth.tar: its TEACHER
+#                    is embedded, see models.build_omni_model_from_checkpoint).
+#   <weights>        under /workspace (= the repo root on the host): the stock .pth, a Stage A export/teacher_backbone_epoch_NNNN.pth or an Ark+ .pth.tar.
 #   <normalization>  imagenet | chestx-ray | none | raddino.
 #   e.g. sbatch run_emb_gaudi.sh stock_dinov3 vit_base_dinov3 /workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth imagenet
 #        sbatch run_emb_gaudi.sh rad_dino vit_base_raddino /workspace/weights/rad_dino_vitb14_pretrain.pth raddino
 #        sbatch run_emb_gaudi.sh raydino vit_large_raydino /workspace/weights/xray_dino_vitl16_pretrained-ad31c2b0.pth imagenet
 #        (RayDINO: Meta's xray_dino_vitl16 file, trained with ImageNet mean/std, so no new normalization; its block keys are renamed on load, see models.flatten_chunked_blocks)
+#        ARK_EMB_INPUT_SIZE=768 sbatch -t 1-00:00:00 run_emb_gaudi.sh arkplus6 swin_large_768 /workspace/weights/Ark6_swinLarge768_ep50.pth.tar imagenet
+#        (an Ark+ Swin-L, the lab's public file name: Ark+ trains with ImageNet mean/std, the lab's main_ark.py default, so no new normalization; a Swin is built for ONE input size, so ARK_EMB_INPUT_SIZE must equal it, 768 here,
+#        and the extractor refuses otherwise)
 #   smoke: sbatch run_emb_gaudi.sh stock_smoke vit_base_dinov3 /workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth imagenet --max_images 512
 # After <normalization> only --max_images N, --datasets NAME... and --workers N may follow (--opt=value too); they reach extract_embeddings.py as they are, after the arguments below, so
 # --workers 16 wins over the wrapper's 32. Any other argument exits 2 before anything else runs, the card check included: --tag --model --weights --normalization --device are the wrapper's own
@@ -41,6 +45,11 @@
 # 512 -> 585), passed as the extractor's --input_size / --img_resize and recorded in meta.json (transform.crop / transform.resize; the fit refuses a tag whose
 # datasets differ there). Unset, the extractor keeps its own 224 / 256, so every existing probe number stays comparable; a 512 probe is a second table, under
 # its own tag, and slower (raise -t). e.g. ARK_EMB_INPUT_SIZE=512 sbatch -t 1-00:00:00 run_emb_gaudi.sh <tag> vit_base_dinov3 <weights> imagenet
+# ARK_EMB_NO_FIT (environment): unset or empty = the job above (extraction, then the fit of all four datasets). Exactly 1 = extraction only: once the extraction has succeeded the job prints an "extraction only" line
+# and exits 0, with no fit and no results/<tag> (the results preflight still runs); any other value exits 2 with the other environment checks, before the weights check, the preflight and the card check.
+# It splits a long extraction (a Swin-L at 768 px) into one job per dataset: ARK_EMB_NO_FIT=1 sbatch ... <tag> <model> <weights> <normalization> --datasets <one dataset> for each dataset but the last, then the last
+# dataset's job without ARK_EMB_NO_FIT and with sbatch --dependency=afterok:<the other jobs' ids> ...: it extracts its dataset and fits all four. Every job of a tag takes the same <model>, <weights>, <normalization> and
+# ARK_EMB_INPUT_SIZE: the fit refuses the caches of one tag that were not extracted the same way.
 # ARK_ROOT overrides the repo root (the Mac dry run in base/ark_finetune/test_ark_finetune.py points it at a fake repo).
 export PT_HPU_LAZY_MODE=1
 TAG_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'   # the tag is a directory name: no path separators, no spaces
@@ -66,6 +75,10 @@ if [[ -n ${ARK_EMB_INPUT_SIZE:-} ]]; then
     exit 2
   fi
   EMB_SIZE_ARGS=(--input_size "$ARK_EMB_INPUT_SIZE" --img_resize $(( (ARK_EMB_INPUT_SIZE * 16 + 7) / 14 )))  # round(size x 8/7)
+fi
+if [[ -n ${ARK_EMB_NO_FIT:-} && $ARK_EMB_NO_FIT != 1 ]]; then
+  echo "ERROR: ARK_EMB_NO_FIT='$ARK_EMB_NO_FIT' must be unset, empty or 1" >&2
+  exit 2
 fi
 TAG=$1
 MODEL=$2
@@ -95,6 +108,10 @@ fi
 ./gaudi_check_cards.sh || exit 1
 # 1. the extraction; it refuses an existing cache before the model loads, and a failure ends the job here: no fit on a half-written cache
 ./gaudi.sh python -m ark_finetune.extract_embeddings --device hpu --tag "$TAG" --model "$MODEL" --weights "$WEIGHTS" --normalization "$NORMALIZATION" --workers 32 "${EMB_SIZE_ARGS[@]}" "${@:5}" || exit $?
+if [[ ${ARK_EMB_NO_FIT:-} == 1 ]]; then  # extraction only: no fit and no results/<tag> here, the job that fits (the last dataset's, without the switch) finds all four caches
+  echo "ARK_EMB_NO_FIT=1: extraction only, no fit for tag $TAG; the job that extracts the last dataset of this tag without ARK_EMB_NO_FIT fits all four"
+  exit 0
+fi
 # 2. the fit: four CPU processes, one thread each (the loop is bound by Python overhead on small tensors), each with its own log; run_linearprobe refuses a (tag, dataset) that has results
 mkdir -p "results/$TAG" || exit 1
 pids=()
