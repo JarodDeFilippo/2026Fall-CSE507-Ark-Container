@@ -2,7 +2,7 @@
 and the label rules of the official Finetuning dataset classes that the cached rows are served with.
 (The file kept its name from the Finetuning-loop embedding mode it first served; the fit now runs the lab's Linearprobing script instead, see ark_linearprobe/NOTICE.)
 
-The cache is one directory per backbone tag and dataset: {train,test}.npy (float16, [N, 1536 (ViT-B) or 2048 (ViT-L)]: ONE center-crop embedding per image, test included), {split}_paths.txt (the dataset's
+The cache is one directory per backbone tag and dataset: {train,test}.npy (float16, [N, 1536 (ViT-B or Swin-L), 2048 (ViT-L) or 1024 (Swin-B)]: ONE center-crop embedding per image, test included), {split}_paths.txt (the dataset's
 img_list, one path per line) and meta.json. There is no validation split: the probe has none (it picks its best epoch on test). A dataset module refuses to serve embeddings whose
 path list is not exactly its own img_list: row i of the cache is only meaningful for img_list[i].
 
@@ -17,13 +17,13 @@ import random
 
 import torch
 
-EMBEDDING_DIM = 1536  # CLS token ++ mean patch token of a ViT-B (768 + 768), the vector Ark's projector receives: the ViT-B default, for callers that do not know the model (see embedding_dim)
-EMBEDDING_DIMS = {"vit_large_raydino": 2048}  # a ViT-L (1024 + 1024); every other --model name here is a ViT-B
+EMBEDDING_DIM = 1536  # CLS token ++ mean patch token of a ViT-B (768 + 768), also a Swin-L's pooled output (8 x 192), the vector Ark's projector receives: the default, for callers that do not know the model (see embedding_dim)
+EMBEDDING_DIMS = {"vit_large_raydino": 2048, "swin_base": 1024}  # a ViT-L (1024 + 1024), a Swin-B's pooled output (8 x 128); every other --model name here is a ViT-B (1536) or a Swin-L (swin_large, swin_large_384, swin_large_768: 1536)
 SPLITS = ("train", "test")
 
 
 def embedding_dim(model_name):
-    """The width of the embedding a backbone gives, by --model name: 2048 for vit_large_raydino (a ViT-L), else the ViT-B width EMBEDDING_DIM (1536)."""
+    """The width of the embedding a backbone gives, by --model name: 2048 for vit_large_raydino (a ViT-L), 1024 for swin_base, else EMBEDDING_DIM (1536: the ViT-B names and the Swin-L names)."""
     return EMBEDDING_DIMS.get(model_name, EMBEDDING_DIM)
 
 

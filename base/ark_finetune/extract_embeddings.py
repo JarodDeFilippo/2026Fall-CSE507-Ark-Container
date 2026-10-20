@@ -1,18 +1,21 @@
 """Embedding extractor for B2, the Ark+ lab's official linear probe on pre-generated embeddings (CSE 494 IP, Step VIII).
 
-Freezes a backbone and writes, for every image of the train and test lists of ChestXray14, CheXpert, MIMIC and VinDrCXR, the vector Ark's projector receives, 1536-d (ViT-B) or 2048-d (ViT-L)
-(CLS token ++ mean patch token, the container's generate_embeddings(after_proj=False)). The images go through the vendored official transform
+Freezes a backbone and writes, for every image of the train and test lists of ChestXray14, CheXpert, MIMIC and VinDrCXR, the vector Ark's projector receives (the container's generate_embeddings(after_proj=False)):
+1536-d (ViT-B) or 2048-d (ViT-L), the CLS token ++ the mean patch token; 1024-d (Swin-B) or 1536-d (Swin-L), the pooled output of an Ark+ teacher's backbone, before its projector. The lab's own Zeroshot notebook
+embeds with generate_embeddings' default after_proj=True (the 1376-d projector output), and because the lab's projector is one nn.Linear (no --use_mlp in the README recipes) that vector is an exact affine map of the cached one.
+The images go through the vendored official transform
 (build_transform_classification, mode "valid"): resize to 256 and center-crop 224 with no augmentation, for both splits: ONE embedding per image, as the lab's embedding linear probe
 (ark_linearprobe/) expects. There is no validation split: the probe has none. Lists and data directories are base/datasets_config.yaml's, the splits every arm uses
 (the full official train list of each dataset, VinDrCXR's 15,000 included, and its official test list; dataset_lists.py).
-The backbone is built by the container's build_omni_model from --model, passed through as it is, so any model name base/models.py knows works; the width of the vectors is the built backbone's
-(model.num_features), and meta.json records it as feature_dim.
+The backbone is built by the container's build_omni_model from --model, passed through as it is, so any ViT model name base/models.py knows works. The Swin names (swin_base, swin_large, swin_large_384,
+swin_large_768) are Ark+ checkpoints (.pth.tar): they load the TEACHER weights through build_omni_model_from_checkpoint (see load_backbone), and a Swin is built for ONE input size, so --input_size must be
+it (run_emb_gaudi.sh: ARK_EMB_INPUT_SIZE) and main() refuses otherwise. The width of the vectors is the built backbone's (model.num_features), and meta.json records it as feature_dim.
 
 Run from base/ (sbatch run_emb_gaudi.sh <tag> <model> <in-container weights path> <normalization> on Sol):
     python -m ark_finetune.extract_embeddings --device hpu --tag stock --model vit_base_dinov3 --normalization imagenet \
         --weights ../weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
 
-Per dataset it writes <embeddings_root>/<tag>/<dataset>/{train,test}.npy (float16, [N, 1536 (ViT-B) or 2048 (ViT-L)]), {split}_paths.txt (the
+Per dataset it writes <embeddings_root>/<tag>/<dataset>/{train,test}.npy (float16, [N, 1536 (ViT-B or Swin-L), 2048 (ViT-L) or 1024 (Swin-B)]), {split}_paths.txt (the
 dataset's img_list, one path per line, row i of the .npy being img_list[i]) and, last, meta.json (tag, model, weights path, size and sha256, normalization, transform,
 counts, timings, device). It refuses to overwrite a file that exists, before it loads the model: to redo a dataset (or finish after a job that died in the
 middle of one), delete its directory and run again with --datasets.
@@ -38,7 +41,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from accelerator import Accelerator
-from models import build_omni_model
+from models import ArkSwinTransformer, build_omni_model, build_omni_model_from_checkpoint
 
 from . import dataloader
 from .dataset_lists import BASE, DATASETS, REPO, dataset_entry
@@ -49,10 +52,10 @@ TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")  # the tag is a directory n
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Extract the embeddings (1536-d ViT-B or 2048-d ViT-L) of a frozen backbone for the B2 linear probe")
+    p = argparse.ArgumentParser(description="Extract the embeddings (1536-d ViT-B or Swin-L, 2048-d ViT-L, 1024-d Swin-B) of a frozen backbone for the B2 linear probe")
     p.add_argument("--tag", required=True, help="names the backbone, e.g. stock_dinov3: the cache is <embeddings_root>/<tag>/<dataset>/")
-    p.add_argument("--model", required=True, help="build_omni_model's model name, e.g. vit_base_dinov3 (passed through)")
-    p.add_argument("--weights", required=True, help="the backbone's weights file, as the container's builder loads it: the stock .pth or a Stage A export/teacher_backbone_epoch_NNNN.pth")
+    p.add_argument("--model", required=True, help="base/models.py's model name, e.g. vit_base_dinov3 (passed through); swin_base, swin_large, swin_large_384 and swin_large_768 embed the TEACHER of an Ark+ .pth.tar")
+    p.add_argument("--weights", required=True, help="the backbone's weights file, as the container's builder loads it: the stock .pth, a Stage A export/teacher_backbone_epoch_NNNN.pth, or (Swin names) an Ark+ .pth.tar")
     p.add_argument("--normalization", required=True, choices=NORMALIZATIONS)
     p.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     p.add_argument("--embeddings_root", default=os.path.join(REPO, "embeddings"))
@@ -103,8 +106,13 @@ def sha256_file(path, chunk=1 << 20):
 
 
 def load_backbone(model_name, weights):
-    """The container's backbone with no projector and no heads, loaded through build_omni_model, whose strict key guard raises on any missing or unexpected backbone key."""
+    """The container's backbone with no projector and no heads. The ViT names load through build_omni_model, whose strict key guard raises on any missing or unexpected backbone key.
+    The Swin names are the Ark+ lab's checkpoints and load through build_omni_model_from_checkpoint with the TEACHER weights, the lab's convention for the encoder of an Ark checkpoint (Ark_Plus README, "Load pre-trained
+    encoder": state_dict = checkpoint['teacher']; the Zeroshot notebook, key = "teacher"; the Finetuning --init ark_plus --key teacher). build_omni_model would take checkpoint['state_dict'], the Ark STUDENT, into a Swin with no key guard.
+    The load refuses a file with no 'teacher' entry (KeyError), whose Swin embed_dim, window or input size is not the model's, or whose keys do not match the backbone (RuntimeError)."""
     args = SimpleNamespace(model_name=model_name, projector_features=None, use_mlp=False, pretrained_weights=weights)
+    if model_name.startswith("swin"):
+        return build_omni_model_from_checkpoint(args, [], "teacher")
     return build_omni_model(args, [])
 
 
@@ -119,7 +127,7 @@ def to_device(model, accelerator):
 
 def extract_features(model, loader, accelerator, log=no_log, split="", dim=EMBEDDING_DIM):
     """Float16 numpy [N, dim] for a loader of images, in loader order: eval mode, no grad, fp32 forward, the vector Ark's
-    projector receives. `dim` is its width: main() passes the built backbone's (1536 for a ViT-B, 2048 for a ViT-L), the default is the ViT-B width.
+    projector receives. `dim` is its width: main() passes the built backbone's (1536 for a ViT-B or a Swin-L, 2048 for a ViT-L, 1024 for a Swin-B), the default is the ViT-B width.
     Raises RuntimeError if a batch's features are not on the requested device or not `dim` wide, or if any feature is not finite once cast to float16.
     Logs a line for the first two batches (the first compiles the HPU graph, the second is steady state) and one per 20 batches: images done, images/s since the
     previous line, and the device the features are on."""
@@ -180,7 +188,10 @@ def main(argv=None):
     with phase(log, "model load"):
         accelerator = Accelerator(args.device)
         model = to_device(load_backbone(args.model, args.weights), accelerator)
-        dim = model.num_features  # no projector was built: the encoder's width (CLS ++ mean patch), which sizes the arrays, the shape check and meta.json's feature_dim
+        dim = model.num_features  # no projector was built: the encoder's width (CLS ++ mean patch, or a Swin's pooled output), which sizes the arrays, the shape check and meta.json's feature_dim
+        if isinstance(model, ArkSwinTransformer) and tuple(model.patch_embed.img_size) != (args.input_size, args.input_size):  # timm 0.5.4's PatchEmbed would assert at the first batch, after the output directories were made
+            size = model.patch_embed.img_size[0]
+            raise ValueError("--model {} takes {}x{} input, but the crop is {} px: set ARK_EMB_INPUT_SIZE={} (run_emb_gaudi.sh), i.e. --input_size {}".format(args.model, size, size, args.input_size, size, size))
         log("model parameters on {} (lazy_mode={})".format(next(model.parameters()).device, getattr(accelerator, "lazy_mode", None)))
     for name, (entry, splits) in datasets.items():
         os.makedirs(out_dirs[name])
