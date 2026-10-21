@@ -1,6 +1,7 @@
 # Modified from the course Ark+ container (see NOTICE)
 import logging
 import math
+import os
 import re
 
 import torch
@@ -15,7 +16,6 @@ from dinov3.models.vision_transformer import DinoVisionTransformer
 from dinov2.layers import MemEffAttention, NestedTensorBlock
 from dinov2.models.vision_transformer import DinoVisionTransformer as DinoV2VisionTransformer
  
-from timm.models.helpers import load_state_dict
 
 from utils import remap_pretrained_keys_swin
 
@@ -407,6 +407,16 @@ def build_omni_model_from_checkpoint(args, num_classes_list, key):
                 args.pretrained_weights, key, len(state_dict), embed, window, size or "not saved", args.model_name, sum(k.startswith(("projector.", "omni_heads.")) for k in msg.unexpected_keys)))
            
     return model
+
+# timm 0.5.4's load_state_dict (use_ema=False) with weights_only=False: torch >= 2.6 defaults torch.load to weights_only=True, whose unpickler refuses the FRAME opcode ("Unsupported operand 149") of the pickle protocol >= 4 that the Gaudi-written Stage A exports use; the files are ours or a published backbone's, so this is deliberate
+def load_state_dict(path):
+    if not os.path.isfile(path):
+        raise FileNotFoundError("No checkpoint found at '{}'".format(path))
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    for key in ('state_dict', 'model'):
+        if isinstance(checkpoint, dict) and key in checkpoint:
+            return {k[7:] if k.startswith('module') else k: v for k, v in checkpoint[key].items()}
+    return checkpoint
 
 def build_omni_model(args, num_classes_list):
     if args.model_name == "swin_base": #swin_base_patch4_window7_224
