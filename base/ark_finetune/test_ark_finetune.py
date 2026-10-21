@@ -23,6 +23,7 @@ import hashlib
 import io
 import json
 import os
+import pickle
 import random
 import re
 import shutil
@@ -47,6 +48,7 @@ from PIL import Image
 import models
 from accelerator import Accelerator
 from models import ArkViT, ArkViTDinoV2, DINOV2_VITL16_KWARGS, DINOV3_VITB16_KWARGS
+from ssl_dinov3.model import export_backbone
 from utils import get_config
 from ark_finetune import dataloader, dataset_lists, embedding_mode, extract_embeddings
 from ark_linearprobe import embedding_datasets, main_linearprobing, run_linearprobe
@@ -1217,6 +1219,21 @@ try:
         assert np.allclose(raddino_rows, reference_rows("ChestXray14", "train", "raddino", 2).astype(np.float16), atol=2e-3, rtol=2e-3)
         assert not np.allclose(raddino_rows, np.load(embedding_mode.split_files(os.path.join(root, "tiny", "ChestXray14"), "train")[0])[:2], atol=2e-3, rtol=2e-3)  # another normalization, other embeddings
         print("OK (h6) --model reaches build_omni_model unchanged (vit_base_raddino, no projector, no heads, the given weights); --normalization raddino reaches the transform and the embeddings change with it")
+
+        # (h7) the Stage A export as the Gaudi trainer writes it (export_backbone: a flat dict of CPU tensors) is a pickle of protocol >= 4 (Sol job 66243085): torch >= 2.6's default torch.load (weights_only=True) refuses its FRAME opcode ("Unsupported operand 149"),
+        # and timm 0.5.4's loader took that default. build_omni_model reads it with the file's weights, also from a 'model' / 'state_dict' wrapper whose keys carry the `module.` prefix DataParallel adds (stripped, as timm did)
+        omni_from = lambda path: models.build_omni_model(SimpleNamespace(model_name="vit_base_dinov3", projector_features=None, use_mlp=False, pretrained_weights=path), [])
+        state = export_backbone(reference)
+        for name, saved in (("flat", state), ("model", {"model": state}), ("module_prefixed", {"state_dict": {"module." + k: v for k, v in state.items()}})):
+            protocol4 = os.path.join(tmp, name + "_protocol4.pth")
+            torch.save(saved, protocol4, pickle_protocol=4)  # torch's own default is 2, which the restricted loader reads
+            rejects(pickle.UnpicklingError, lambda: quiet(lambda: torch.load(protocol4, map_location="cpu")), "Unsupported operand 149")  # this torch's default refuses the file (and says on stderr that 4 is not its protocol) ...
+            loaded = omni_from(protocol4).state_dict()  # ... and the container loads it
+            assert loaded.keys() == state.keys() and all(torch.equal(loaded[k], v) for k, v in state.items()), name
+        no_file = os.path.join(tmp, "no_such_checkpoint.pth")
+        rejects(FileNotFoundError, lambda: omni_from(no_file), "No checkpoint found at '{}'".format(no_file))
+        print("OK (h7) a Stage A export saved at pickle protocol 4 (flat tensors, as export_backbone writes it), which this torch's default torch.load refuses (Unsupported operand 149, the FRAME opcode), loads through build_omni_model with every tensor equal to the file's, flat or in a 'model' / "
+              "'state_dict' wrapper with module.-prefixed keys (prefix stripped); a missing checkpoint raises FileNotFoundError naming the path")
 
         # CLI errors
         for bad, expected in ((["--tag", "../x"], "letters, digits"), (["--tag", "a b"], "letters, digits"), (["--tag", "ok", "--max_images", "0"], "--max_images must be at least 1"),
