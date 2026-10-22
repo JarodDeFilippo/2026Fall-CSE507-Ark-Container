@@ -125,11 +125,13 @@ DINOV3_VITB16_KWARGS = dict(
 )
 
 # The larger stock DINOv3 ViTs (LVD-1689M): Meta's hub entries dinov3_vitl16 / dinov3_vith16plus / dinov3_vit7b16 (dinov3/hub/backbones.py) are the ViT-B config above with these sizes.
-# The ViT-H+ and the 7B have a SwiGLU FFN (the 7B's swiglu64 aligns its hidden width to 64); the 7B has no qkv bias, and the hub builds it with untie_global_and_local_cls_norm=True and loads its file strictly, so the
-# file holds a local_cls_norm LayerNorm. Only the second (local-crop) entry of a training-mode multi-crop forward uses it, so Ark's single-tensor forward never does, but the strict key guard needs the module.
+# The ViT-H+ and the 7B have a SwiGLU FFN (the 7B's swiglu64 aligns its hidden width to 64); the 7B has no qkv bias.
+# untie_global_and_local_cls_norm is True in Meta's hub for the 7B, whose native file (loaded strictly) holds a local_cls_norm LayerNorm. It is False here because our file comes from Hugging Face, whose conversion drops
+# every local_cls_norm key (transformers' convert_dinov3_vit_to_hf.py), and convert_hf_dinov3_to_meta.py builds the strict-guard file from that. Only the second (local-crop) entry of a training-mode multi-crop forward
+# uses that norm, so Ark's single-tensor forward is the same without it (forward_features applies self.norm to the CLS, storage and patch tokens alike).
 DINOV3_VITL16_KWARGS = dict(DINOV3_VITB16_KWARGS, embed_dim=1024, depth=24, num_heads=16)
 DINOV3_VITH16PLUS_KWARGS = dict(DINOV3_VITB16_KWARGS, embed_dim=1280, depth=32, num_heads=20, ffn_ratio=6.0, ffn_layer="swiglu")
-DINOV3_VIT7B16_KWARGS = dict(DINOV3_VITB16_KWARGS, embed_dim=4096, depth=40, num_heads=32, ffn_ratio=3, qkv_bias=False, ffn_layer="swiglu64", untie_global_and_local_cls_norm=True)
+DINOV3_VIT7B16_KWARGS = dict(DINOV3_VITB16_KWARGS, embed_dim=4096, depth=40, num_heads=32, ffn_ratio=3, qkv_bias=False, ffn_layer="swiglu64", untie_global_and_local_cls_norm=False)
 
 # dinov2_vitb14 from Meta's hub: _make_dinov2_model's defaults (dinov2/hub/backbones.py), then the arguments vit_base
 # (dinov2/models/vision_transformer.py) fixes. img_size 518 only sizes the learned pos_embed (37x37 + CLS); a 224 px input
