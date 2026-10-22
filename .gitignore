@@ -26,3 +26,7 @@ weights/
 /results/*/probe/*/log.txt
 /results/**/ckpt.pth
 /results/*/*.log
+
+# check_hf_dinov3_parity.sh: its pip --target cache of transformers (one directory per pin) and the staging directory it publishes from
+.pylib-*/
+.pylib.*/
