@@ -2,24 +2,46 @@
 for vit_base_dinov3, vit_large_dinov3, vit_huge_plus_dinov3 and vit_7b_dinov3. Run from base/: python test_convert_hf_dinov3.py
 No real HF file is needed. Each model is built in Meta's layout with a distinct random value in every parameter, exported to HF names with transformers' own forward mapping
 (HF_RENAMES below, from its convert_dinov3_vit_to_hf.py), converted back by the script and compared with torch.equal, then loaded through build_omni_model.
-The ViT-B and ViT-L are full size; the ViT-H+ and the 7B keep their real per-layer shapes but have 2 blocks (the 7B's 40 are about 27 GB in fp32)."""
+The ViT-B and ViT-L are full size; the ViT-H+ and the 7B keep their real per-layer shapes but have 2 blocks (the 7B's 40 are about 27 GB in fp32).
+The script reads safetensors with the package when the Python has it, else with its own stdlib reader (the Sol container has no package): (g)-(i) check that reader, and (i) runs this whole file
+again in a subprocess with the package hidden. Real file for (h): $HF_DINOV3_VITB_DIR/model.safetensors (default ../../dinov3-vitb16-hf, the ViT-B HF download); $ARK_WEIGHTS_DIR (default ../weights)
+may hold the stock dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth, which the converted ViT-B is then compared with. A check whose file is missing prints a SKIP line and the rest still run."""
 import contextlib
+import filecmp
+import gc
 import io
 import json
 import os
 import re
+import struct
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file as package_load_file, save_file
 
-import convert_hf_dinov3_to_meta as converter
+# The second run (started by (i) at the end of the first): the package is hidden from the converter, as in the Sol container. save_file, imported above, still writes the fixtures.
+HIDDEN = os.environ.get("HIDE_SAFETENSORS") == "1"
+if HIDDEN:
+    sys.modules["safetensors"] = sys.modules["safetensors.torch"] = None
+
+import convert_hf_dinov3_to_meta as converter  # after the hiding above, on purpose
 import models
 from dinov3.models.vision_transformer import DinoVisionTransformer
 from models import DINOV3_VITB16_KWARGS, DINOV3_VITH16PLUS_KWARGS, DINOV3_VITL16_KWARGS, DINOV3_VIT7B16_KWARGS, build_omni_model
 
 torch.manual_seed(0)
+assert converter.load_file is (converter.load_file_stdlib if HIDDEN else package_load_file) and ("built-in" in converter.READER) == HIDDEN  # the package when it can be imported, the built-in reader when not
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+WEIGHTS = os.environ.get("ARK_WEIGHTS_DIR", os.path.join(REPO, "weights"))
+HF_VITB = os.path.abspath(os.path.join(os.environ.get("HF_DINOV3_VITB_DIR", os.path.join(REPO, "..", "dinov3-vitb16-hf")), "model.safetensors"))
+STOCK = "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
+# a fresh interpreter with the package hidden that runs the script's main: what `python convert_hf_dinov3_to_meta.py <src> <dst>` does in the Sol container
+HIDE_AND_CONVERT = "import sys; sys.modules['safetensors'] = sys.modules['safetensors.torch'] = None; import convert_hf_dinov3_to_meta as c; c.main(sys.argv[1:])"
 
 # transformers' convert_dinov3_vit_to_hf.py (Apache-2.0), Meta -> HF: its ORIGINAL_TO_CONVERTED_KEY_MAPPING in order, then split_qkv and the skips of convert_and_test_dinov3_checkpoint (to_hf below)
 HF_RENAMES = [
@@ -203,7 +225,7 @@ for name, (kwargs, prefix, shards, layer_keys, shapes, wrong) in CASES.items():
         n_params = sum(t.numel() for k, t in ref.items() if not re.fullmatch(converter.KEPT, k))
         n_bytes = sum(t.numel() * t.element_size() for t in ref.values())
         kept_names = "rope_embed.periods, blocks.*.attn.qkv.bias_mask" if kwargs["qkv_bias"] else "rope_embed.periods"
-        for line in ("Model:                      {}".format(name), "HF tensors consumed:        {}".format(len(expected)),
+        for line in ("safetensors reader: {}".format(converter.READER), "Model:                      {}".format(name), "HF tensors consumed:        {}".format(len(expected)),
                      "Meta params overwritten:    {} ({:,} elements)".format(len(ref) - n_kept, n_params), "Buffers kept from template: {} ({})".format(n_kept, kept_names),
                      "dtype written:              params torch.float32, buffers torch.float32", "Bytes written:              {:,} of tensors, {:,} on disk".format(n_bytes, os.path.getsize(dst)),
                      "Wrote {} ({} keys)".format(dst, len(ref))):
@@ -222,8 +244,9 @@ for name, (kwargs, prefix, shards, layer_keys, shapes, wrong) in CASES.items():
 
         # the same file under a --model of another size is refused, naming the HF tensor, the model and both shapes
         width, wrong_width = kwargs["embed_dim"], getattr(models, KWARGS_NAME[wrong])["embed_dim"]
-        message = rejects(SystemExit, lambda: converter.main(["--model", wrong, source, os.path.join(tmp, "refused.pth")]),
-                          ["embeddings.cls_token", "(1, 1, {})".format(width), "--model {}".format(wrong), "(1, 1, {})".format(wrong_width), "Meta's cls_token"])
+        with contextlib.redirect_stdout(io.StringIO()):  # main prints the reader line before it fails
+            message = rejects(SystemExit, lambda: converter.main(["--model", wrong, source, os.path.join(tmp, "refused.pth")]),
+                              ["embeddings.cls_token", "(1, 1, {})".format(width), "--model {}".format(wrong), "(1, 1, {})".format(wrong_width), "Meta's cls_token"])
         assert message.startswith("error: ") and not os.path.exists(os.path.join(tmp, "refused.pth"))
         print("OK (d) {}: its HF file under --model {} exits with '{}'; nothing is written".format(name, wrong, message))
     del ref
@@ -293,5 +316,96 @@ for name, (n_params, n_kept) in COUNTS.items():
     assert all(t.is_meta for k, t in template.items() if k not in kept) and sum(t.numel() for k, t in template.items() if k not in kept) == n_params, name
 print("OK (f) the real configs' templates are shapes only (meta device): {} parameters for the ViT-B / ViT-L / ViT-H+ / 7B, with {} real buffers kept (the rope periods, a k-bias mask per block; the 7B has no qkv bias, so only the periods)".format(
     " / ".join("{:,}".format(n) for n, _ in COUNTS.values()), " / ".join(str(k) for _, k in COUNTS.values())))
+
+# (g) the converter's own safetensors reader, the one it falls back on when the Python has no safetensors package (the Sol container)
+def raw_file(path, header, payload=b"", header_len=None):
+    """A .safetensors file written by hand (the 8-byte length, the JSON header, the payload), for the files the package would not write. `header_len` lies about the length."""
+    encoded = json.dumps(header).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(encoded) if header_len is None else header_len) + encoded + payload)
+
+
+def open_fds():
+    """The number of file descriptors this process holds after a collection (None where /dev/fd does not exist). Each live mmap holds one."""
+    gc.collect()
+    return len(os.listdir("/dev/fd")) if os.path.isdir("/dev/fd") else None
+
+
+read = converter.load_file_stdlib
+with tempfile.TemporaryDirectory() as tmp:
+    every = {"f64": torch.randn(3, dtype=torch.float64), "f32": torch.randn(2, 3), "f16": torch.randn(4).half(), "bf16": torch.randn(5).bfloat16(), "i64": torch.tensor([-3, 2 ** 40]),
+             "i32": torch.tensor([-7, 2 ** 20], dtype=torch.int32), "i16": torch.tensor([300, -2], dtype=torch.int16), "i8": torch.tensor([-1, 5, 127], dtype=torch.int8),
+             "u8": torch.tensor([200, 0, 255], dtype=torch.uint8), "flags": torch.tensor([True, False, True]), "scalar": torch.tensor(1.5), "empty": torch.empty(0, 4)}
+    path = os.path.join(tmp, "every.safetensors")
+    save_file(every, path, metadata={"format": "pt"})
+    loaded = read(path)
+    assert set(loaded) == set(every) and all(loaded[k].dtype == t.dtype and loaded[k].shape == t.shape and torch.equal(loaded[k], t) for k, t in every.items())  # no __metadata__ key
+    assert HIDDEN or list(loaded) == list(package_load_file(path))  # the package's order too: the header's
+    loaded["f32"].fill_(7)  # copy-on-write: a write to a loaded tensor does not reach the file
+    assert torch.equal(read(path)["f32"], every["f32"])
+    print("OK (g1) the built-in reader loads all ten dtypes, a scalar and an empty tensor from a file with metadata, each torch.equal to what was written{}; a write to a loaded tensor leaves the file as it was".format(
+        "" if HIDDEN else ", with the keys in the package's order"))
+    del loaded
+
+    bad, f32 = os.path.join(tmp, "bad.safetensors"), {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]}
+    for header, payload, header_len, parts in (
+            ({"w": dict(f32, dtype="F8_E4M3", shape=[8])}, bytes(8), None, [bad, "w has dtype F8_E4M3", "only F64, F32, F16, BF16, I64, I32, I16, I8, U8, BOOL are read"]),  # a dtype it does not read
+            ({"w": f32}, bytes(4), None, [bad, "w has data_offsets [0, 8]", "do not hold 2 F32 values of shape [2]"]),  # offsets past the end of the file
+            ({"w": dict(f32, data_offsets=[0, 4])}, bytes(8), None, [bad, "w has data_offsets [0, 4]", "do not hold 2 F32 values of shape [2]"]),  # a byte count that is not the shape's
+            ({"w": f32}, bytes(8), 10 ** 6, [bad, "header length 1000000 runs past the end of the file"])):  # a header longer than the file
+        raw_file(bad, header, payload, header_len)
+        rejects(ValueError, lambda: read(bad), parts)
+    for short in (b"", b"abc"):  # shorter than the 8-byte length
+        with open(bad, "wb") as f:
+            f.write(short)
+        rejects(ValueError, lambda: read(bad), [bad, "shorter than the 8-byte header length"])
+    print("OK (g2) the built-in reader refuses, naming the file and the tensor: a dtype it does not read (F8_E4M3), data_offsets past the end or of the wrong byte count, a header longer than the file, a file under 8 bytes")
+
+    # through read_hf's shard-at-a-time loop: one mapping per shard, alive as long as its tensors and released with them (a closed mapping crashes the reads, a leaked one holds the shard)
+    directory = os.path.join(tmp, "sharded")
+    os.mkdir(directory)
+    expected_hf = to_hf(reference(TINY), "")
+    index = write_hf(expected_hf, directory, shards=2)
+    before = open_fds()
+    with patched(converter, "load_file", read):
+        hf = converter.read_hf(index)
+    held = open_fds()
+    assert set(hf) == set(expected_hf) and all(torch.equal(hf[k], expected_hf[k]) for k in expected_hf)  # still readable after a collection
+    del hf
+    released = open_fds()
+    assert before is None or (held, released) == (before + 2, before), (before, held, released)
+    print("OK (g3) read_hf on 2 shards with the built-in reader: every tensor torch.equal to the export after a collection, one mapping per shard held while they live and released with them{}".format(
+        "" if before is not None else " (SKIP the descriptor count: no /dev/fd here)"))
+
+# (h) the real ViT-B file, with the package as the reference: the same tensors, then the same converted file byte for byte (the package is hidden in the second run, so nothing to compare with there)
+if not HIDDEN:
+    if not os.path.exists(HF_VITB):
+        print("SKIP (h): {} not found (set HF_DINOV3_VITB_DIR)".format(HF_VITB))
+    else:
+        package_tensors, stdlib_tensors = package_load_file(HF_VITB), read(HF_VITB)
+        assert list(stdlib_tensors) == list(package_tensors) and all(
+            stdlib_tensors[k].dtype == t.dtype and stdlib_tensors[k].shape == t.shape and torch.equal(stdlib_tensors[k], t) for k, t in package_tensors.items())
+        print("OK (h1) the built-in reader on the real ViT-B file {}: the package's {} keys in the same order, with the same dtypes and shapes and torch.equal tensors".format(HF_VITB, len(package_tensors)))
+        del package_tensors, stdlib_tensors
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # the same file name in two directories: torch.save writes the name into the zip, so the bytes can only match under one name
+            with_package, with_fallback = (os.path.join(tmp, d, STOCK) for d in ("package", "fallback"))
+            assert "safetensors reader: safetensors package" in convert_main([HF_VITB, with_package], "vit_base_dinov3", DINOV3_VITB16_KWARGS).splitlines()
+            done = subprocess.run([sys.executable, "-W", "ignore", "-c", HIDE_AND_CONVERT, HF_VITB, with_fallback], cwd=HERE, capture_output=True, text=True)
+            assert done.returncode == 0 and any(line.startswith("safetensors reader: built-in stdlib reader") for line in done.stdout.splitlines()), (done.returncode, done.stdout, done.stderr)
+            assert filecmp.cmp(with_package, with_fallback, shallow=False)
+            stock = os.path.join(WEIGHTS, STOCK)
+            if os.path.exists(stock):
+                assert filecmp.cmp(with_package, stock, shallow=False), stock
+            print("OK (h2) the ViT-B converted by a fresh interpreter with the package hidden (the built-in reader, its line printed) is byte-identical (cmp) to the conversion with the package, {:,} bytes{}".format(
+                os.path.getsize(with_package), "; both are byte-identical to the stock {}".format(stock) if os.path.exists(stock) else "; SKIP the comparison with the stock file ({} not found, set ARK_WEIGHTS_DIR)".format(stock)))
+
+# (i) all of the above, (a)-(g), once more in a fresh interpreter with the package hidden: the converter then reads every fixture with its built-in reader
+if not HIDDEN:
+    done = subprocess.run([sys.executable, "-W", "ignore", os.path.abspath(__file__)], env=dict(os.environ, HIDE_SAFETENSORS="1"), capture_output=True, text=True)
+    lines = done.stdout.splitlines()
+    assert done.returncode == 0 and lines[-1:] == ["ALL OK"], (done.returncode, done.stdout[-3000:], done.stderr[-3000:])
+    print("OK (i) this file run again in a subprocess with the safetensors package hidden (the converter on its built-in reader): {} OK lines, then ALL OK".format(sum(line.startswith("OK (") for line in lines)))
 
 print("ALL OK")

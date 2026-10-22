@@ -4,7 +4,8 @@ model.safetensors.index.json) into Meta's state-dict layout, so it loads through
 
 Run from base/:  python convert_hf_dinov3_to_meta.py [--model vit_base_dinov3] <hf_dir_or_file> <out.pth>
 <hf_dir_or_file> is the HF directory (its model.safetensors, else its model.safetensors.index.json and the shards that lists, loaded
-one at a time) or one .safetensors / .index.json file. Needs `safetensors` in the Python that runs it.
+one at a time) or one .safetensors / .index.json file. Reads them with the `safetensors` package, or with a built-in stdlib reader when the Python has none
+(the Sol container's has none and cannot install one); the first line printed says which.
 Tensors are written in the HF file's dtype (no upcast). The buffers HF drops (rope periods, k-bias masks) come from the Meta model, fp32.
 Output names (Meta's release names; the hash suffix is Meta's, not this file's): dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth,
 dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth, dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth, dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth.
@@ -13,12 +14,14 @@ the Meta model itself is only shapes (torch's meta device).
 """
 import argparse
 import json
+import math
+import mmap
 import os
 import re
+import struct
 import sys
 
 import torch
-from safetensors.torch import load_file
 
 from dinov3.models.vision_transformer import DinoVisionTransformer
 from models import DINOV3_VITB16_KWARGS, DINOV3_VITH16PLUS_KWARGS, DINOV3_VITL16_KWARGS, DINOV3_VIT7B16_KWARGS
@@ -45,6 +48,48 @@ RENAMES = [
 ]
 # The only buffers allowed to come from the template: HF drops both (non-persistent inv_freq, bias_mask). The 7B has no qkv bias, so no bias_mask.
 KEPT = r"rope_embed\.periods|blocks\.\d+\.attn\.qkv\.bias_mask"
+
+# safetensors dtype names -> torch dtypes: the ten this reader handles. The format has others (float8, unsigned 16/32/64 bit): refused.
+SAFETENSORS_DTYPES = {"F64": torch.float64, "F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16, "I64": torch.int64,
+                      "I32": torch.int32, "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool}
+
+
+def load_file_stdlib(path):
+    """safetensors.torch.load_file with the standard library alone: {name: tensor} in the header's order. The format: an 8-byte little-endian header length N,
+    N bytes of JSON {name: {"dtype", "shape", "data_offsets": [begin, end]}, optional "__metadata__"}, then the raw bytes that the offsets count from.
+    The tensors are views of one copy-on-write mmap of the file, not copies: pages are read as they are used and the file is never written. Never close() the mmap:
+    torch.frombuffer holds the mmap object, not a buffer export, so a close would unmap the memory under live tensors. Dropping the last tensor releases it."""
+    if sys.byteorder != "little":
+        raise RuntimeError("safetensors data is little-endian; torch.frombuffer reads native order")
+    with open(path, "rb") as f:
+        if os.fstat(f.fileno()).st_size < 8:
+            raise ValueError("{}: shorter than the 8-byte header length".format(path))
+        buffer = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY)  # copy-on-write is writable, so torch.frombuffer does not warn about a read-only buffer
+    (header_len,) = struct.unpack_from("<Q", buffer)
+    start = 8 + header_len  # the first byte of tensor data
+    if start > len(buffer):
+        raise ValueError("{}: header length {} runs past the end of the file".format(path, header_len))
+    header = json.loads(buffer[8:start])
+    header.pop("__metadata__", None)
+    tensors = {}
+    for name, info in header.items():
+        if info["dtype"] not in SAFETENSORS_DTYPES:
+            raise ValueError("{}: {} has dtype {}, but only {} are read".format(path, name, info["dtype"], ", ".join(SAFETENSORS_DTYPES)))
+        dtype, shape = SAFETENSORS_DTYPES[info["dtype"]], info["shape"]
+        begin, end = info["data_offsets"]
+        numel = math.prod(shape)
+        # ponytail: holes and overlaps between tensors are not refused (the package does); this bounds check keeps every read inside the file
+        if not 0 <= begin <= end <= len(buffer) - start or end - begin != numel * torch.empty((), dtype=dtype).element_size():
+            raise ValueError("{}: {} has data_offsets {}, which do not hold {} {} values of shape {}".format(path, name, [begin, end], numel, info["dtype"], shape))
+        tensors[name] = torch.frombuffer(buffer, dtype=dtype, count=numel, offset=start + begin).reshape(shape) if numel else torch.empty(shape, dtype=dtype)
+    return tensors
+
+
+try:
+    from safetensors.torch import load_file
+    READER = "safetensors package"
+except ImportError:  # the Sol container's Python has none and cannot install one
+    load_file, READER = load_file_stdlib, "built-in stdlib reader (safetensors cannot be imported here)"
 
 
 def read_hf(src):
@@ -131,6 +176,7 @@ def main(argv=None):
     parser.add_argument("src", help="the HF directory, or one .safetensors / .index.json file")
     parser.add_argument("dst", help="the output .pth")
     args = parser.parse_args(argv)
+    print("safetensors reader: {}".format(READER))
     try:
         out, kept, n_hf = convert(args.src, args.model)
     except ValueError as error:
