@@ -20,7 +20,7 @@
 # usage: sbatch run_emb_gaudi.sh <tag> <model> <in-container weights path> <normalization> [--max_images N] [--datasets NAME...] [--workers N]
 #   <tag>            names the backbone: letters, digits, . _ - only. The cache and the results are keyed by it. Results that already exist for the tag stop the job in seconds, before the card
 #                    check and the extraction (the fit would refuse to overwrite them after the extraction had spent the allocation); an existing cache is refused by the extractor.
-#   <model>          base/models.py's model name, passed through: vit_base_dinov3, vit_base_dinov2, vit_base_raddino, vit_large_raydino, swin_base, swin_large, swin_large_384, swin_large_768 (an Ark+ .pth.tar: its TEACHER
+#   <model>          base/models.py's model name, passed through: vit_base_dinov3, vit_large_dinov3, vit_huge_plus_dinov3, vit_7b_dinov3, vit_base_dinov2, vit_base_raddino, vit_large_raydino, swin_base, swin_large, swin_large_384, swin_large_768 (an Ark+ .pth.tar: its TEACHER
 #                    is embedded, see models.build_omni_model_from_checkpoint).
 #   <weights>        under /workspace (= the repo root on the host): the stock .pth, a Stage A export/teacher_backbone_epoch_NNNN.pth or an Ark+ .pth.tar.
 #   <normalization>  imagenet | chestx-ray | none | raddino.

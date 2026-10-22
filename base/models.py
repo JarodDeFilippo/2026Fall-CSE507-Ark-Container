@@ -124,6 +124,13 @@ DINOV3_VITB16_KWARGS = dict(
     mask_k_bias=True,
 )
 
+# The larger stock DINOv3 ViTs (LVD-1689M): Meta's hub entries dinov3_vitl16 / dinov3_vith16plus / dinov3_vit7b16 (dinov3/hub/backbones.py) are the ViT-B config above with these sizes.
+# The ViT-H+ and the 7B have a SwiGLU FFN (the 7B's swiglu64 aligns its hidden width to 64); the 7B has no qkv bias, and the hub builds it with untie_global_and_local_cls_norm=True and loads its file strictly, so the
+# file holds a local_cls_norm LayerNorm. Only the second (local-crop) entry of a training-mode multi-crop forward uses it, so Ark's single-tensor forward never does, but the strict key guard needs the module.
+DINOV3_VITL16_KWARGS = dict(DINOV3_VITB16_KWARGS, embed_dim=1024, depth=24, num_heads=16)
+DINOV3_VITH16PLUS_KWARGS = dict(DINOV3_VITB16_KWARGS, embed_dim=1280, depth=32, num_heads=20, ffn_ratio=6.0, ffn_layer="swiglu")
+DINOV3_VIT7B16_KWARGS = dict(DINOV3_VITB16_KWARGS, embed_dim=4096, depth=40, num_heads=32, ffn_ratio=3, qkv_bias=False, ffn_layer="swiglu64", untie_global_and_local_cls_norm=True)
+
 # dinov2_vitb14 from Meta's hub: _make_dinov2_model's defaults (dinov2/hub/backbones.py), then the arguments vit_base
 # (dinov2/models/vision_transformer.py) fixes. img_size 518 only sizes the learned pos_embed (37x37 + CLS); a 224 px input
 # gets it resampled to 16x16 by DINOv2's own interpolate_pos_encoding. Used for both DINOv2 (LVD-142M) and RAD-DINO weights.
@@ -152,9 +159,10 @@ DINOV2_VITB14_KWARGS = dict(
 # file's block keys first (flatten_chunked_blocks).
 DINOV2_VITL16_KWARGS = dict(DINOV2_VITB14_KWARGS, img_size=512, patch_size=16, embed_dim=1024, depth=24, num_heads=16)
 
-# --model name -> the label of its pretrained file in build_omni_model's strict key guard. All four are DINO backbones in
-# the Ark wrapper below (three ViT-B, one ViT-L), so they share vit_param_groups (--layer-decay / --patch-embed-lr-mult).
-DINO_VIT_MODELS = {"vit_base_dinov3": "DINOv3", "vit_base_dinov2": "DINOv2", "vit_base_raddino": "RAD-DINO", "vit_large_raydino": "RayDINO"}
+# --model name -> the label of its pretrained file in build_omni_model's strict key guard. All seven are DINO backbones in the Ark
+# wrapper below (three ViT-B, RayDINO's ViT-L, and the stock DINOv3 ViT-L, ViT-H+ and ViT-7B), so they share vit_param_groups (--layer-decay / --patch-embed-lr-mult).
+DINO_VIT_MODELS = {"vit_base_dinov3": "DINOv3", "vit_large_dinov3": "DINOv3", "vit_huge_plus_dinov3": "DINOv3", "vit_7b_dinov3": "DINOv3",
+                   "vit_base_dinov2": "DINOv2", "vit_base_raddino": "RAD-DINO", "vit_large_raydino": "RayDINO"}
 
 class ArkDinoHeads:
     """The Ark wrapper API of the DINO ViTs: projector, omni_heads, forward, generate_embeddings. Mixed in ahead of the
@@ -360,12 +368,18 @@ def build_omni_model_from_checkpoint(args, num_classes_list, key):
         model = ArkConvNeXt(num_classes_list, args.projector_features, args.use_mlp, depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024])
     elif args.model_name == "vit_base_dinov3":
         model = ArkViT(num_classes_list, args.projector_features, args.use_mlp, **DINOV3_VITB16_KWARGS)
+    elif args.model_name == "vit_large_dinov3":  # stock DINOv3 ViT-L/16: CLS ++ mean patch = 2 * 1024 = 2048-d
+        model = ArkViT(num_classes_list, args.projector_features, args.use_mlp, encoder_features=2048, **DINOV3_VITL16_KWARGS)
+    elif args.model_name == "vit_huge_plus_dinov3":  # stock DINOv3 ViT-H+/16 (SwiGLU FFN): 2 * 1280 = 2560-d
+        model = ArkViT(num_classes_list, args.projector_features, args.use_mlp, encoder_features=2560, **DINOV3_VITH16PLUS_KWARGS)
+    elif args.model_name == "vit_7b_dinov3":  # stock DINOv3 ViT-7B/16 (SwiGLU FFN, 6.7 B parameters, about 27 GB in fp32): 2 * 4096 = 8192-d
+        model = ArkViT(num_classes_list, args.projector_features, args.use_mlp, encoder_features=8192, **DINOV3_VIT7B16_KWARGS)
     elif args.model_name in ("vit_base_dinov2", "vit_base_raddino"):  # one architecture; --pretrained_weights picks DINOv2 or RAD-DINO
         model = ArkViTDinoV2(num_classes_list, args.projector_features, args.use_mlp, **DINOV2_VITB14_KWARGS)
     elif args.model_name == "vit_large_raydino":  # RayDINO: DINOv2's ViT-L/16, CLS ++ mean patch = 2 * 1024 = 2048-d
         model = ArkViTDinoV2(num_classes_list, args.projector_features, args.use_mlp, encoder_features=2048, **DINOV2_VITL16_KWARGS)
     else:
-        raise ValueError("--model {} is not built by build_omni_model_from_checkpoint (it builds swin_base, swin_large, swin_large_384, swin_large_768, conv_base, vit_base_dinov3, vit_base_dinov2, vit_base_raddino, vit_large_raydino)".format(args.model_name))
+        raise ValueError("--model {} is not built by build_omni_model_from_checkpoint (it builds swin_base, swin_large, swin_large_384, swin_large_768, conv_base, vit_base_dinov3, vit_large_dinov3, vit_huge_plus_dinov3, vit_7b_dinov3, vit_base_dinov2, vit_base_raddino, vit_large_raydino)".format(args.model_name))
 
     if args.pretrained_weights is not None:
         checkpoint = torch.load(args.pretrained_weights, map_location='cpu', weights_only=False)
@@ -434,6 +448,12 @@ def build_omni_model(args, num_classes_list):
         # url='https://dl.fbaipublicfiles.com/convnext/convnext_base_22k_1k_224.pth'
     elif args.model_name == "vit_base_dinov3":
         model = ArkViT(num_classes_list, args.projector_features, args.use_mlp, **DINOV3_VITB16_KWARGS)
+    elif args.model_name == "vit_large_dinov3":  # stock DINOv3 ViT-L/16: CLS ++ mean patch = 2 * 1024 = 2048-d
+        model = ArkViT(num_classes_list, args.projector_features, args.use_mlp, encoder_features=2048, **DINOV3_VITL16_KWARGS)
+    elif args.model_name == "vit_huge_plus_dinov3":  # stock DINOv3 ViT-H+/16 (SwiGLU FFN): 2 * 1280 = 2560-d
+        model = ArkViT(num_classes_list, args.projector_features, args.use_mlp, encoder_features=2560, **DINOV3_VITH16PLUS_KWARGS)
+    elif args.model_name == "vit_7b_dinov3":  # stock DINOv3 ViT-7B/16 (SwiGLU FFN, 6.7 B parameters, about 27 GB in fp32): 2 * 4096 = 8192-d
+        model = ArkViT(num_classes_list, args.projector_features, args.use_mlp, encoder_features=8192, **DINOV3_VIT7B16_KWARGS)
     elif args.model_name in ("vit_base_dinov2", "vit_base_raddino"):  # one architecture; --pretrained_weights picks DINOv2 or RAD-DINO
         model = ArkViTDinoV2(num_classes_list, args.projector_features, args.use_mlp, **DINOV2_VITB14_KWARGS)
     elif args.model_name == "vit_large_raydino":  # RayDINO: DINOv2's ViT-L/16, CLS ++ mean patch = 2 * 1024 = 2048-d
