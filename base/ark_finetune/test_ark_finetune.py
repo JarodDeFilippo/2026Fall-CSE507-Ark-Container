@@ -1077,8 +1077,8 @@ print("OK (h2) extract_features: [N, 1536] float16, one embedding per image (no 
       "another device than requested raise RuntimeError; progress lines at batches 1, 2 and every 20th")
 
 # the width: by model name (embedding_dim), from a cache's meta.json (feature_dim), and as extract_features' parameter (the built backbone's; the default is the ViT-B 1536)
-assert embedding_mode.EMBEDDING_DIM == 1536 and [embedding_mode.embedding_dim(m) for m in ("vit_base_dinov3", "vit_base_dinov2", "vit_base_raddino", "vit_large_raydino", "swin_base", "swin_large", "swin_large_384", "swin_large_768")] == \
-    [1536, 1536, 1536, 2048, 1024, 1536, 1536, 1536]
+assert embedding_mode.EMBEDDING_DIM == 1536 and [embedding_mode.embedding_dim(m) for m in ("vit_base_dinov3", "vit_base_dinov2", "vit_base_raddino", "vit_large_raydino", "vit_large_dinov3", "vit_huge_plus_dinov3", "vit_7b_dinov3", "swin_base", "swin_large", "swin_large_384", "swin_large_768")] == \
+    [1536, 1536, 1536, 2048, 2048, 2560, 8192, 1024, 1536, 1536, 1536]
 assert embedding_mode.embedding_dim("some_other_model") == 1536 and embedding_mode.feature_dim({}) == 1536 and embedding_mode.feature_dim({"feature_dim": 2048}) == 2048
 for bad_dim in (0, -1, 1536.0, "2048", None, True, [2048]):
     rejects(ValueError, lambda: embedding_mode.feature_dim({"feature_dim": bad_dim}), "meta.json feature_dim {!r} is not a positive integer".format(bad_dim))
@@ -1086,7 +1086,7 @@ wide = extract_embeddings.extract_features(FakeModel(lambda x: torch.ones(len(x)
 assert wide.shape == (5, 2048) and wide.dtype == np.float16 and (wide == 1).all()
 rejects(RuntimeError, lambda: extract_embeddings.extract_features(FakeModel(lambda x: torch.zeros(len(x), 1536)), Loader([(x4, None)]), Accelerator("cpu"), dim=2048), "returned 1536-d features, the probe's head takes 2048")
 rejects(RuntimeError, lambda: extract_embeddings.extract_features(FakeModel(lambda x: torch.zeros(len(x), 2048)), Loader([(x4, None)]), Accelerator("cpu")), "returned 2048-d features, the probe's head takes 1536")
-print("OK (h2b) width: embedding_dim is 1536 for the three ViT-B names and the three Swin-L names, 2048 for vit_large_raydino and 1024 for swin_base (EMBEDDING_DIM stays 1536); feature_dim reads meta.json (absent = 1536; 0, -1, 1536.0, '2048', null, true and a list "
+print("OK (h2b) width: embedding_dim is 1536 for the three ViT-B names and the three Swin-L names, 2048 for vit_large_raydino and vit_large_dinov3, 2560 for vit_huge_plus_dinov3, 8192 for vit_7b_dinov3 and 1024 for swin_base (EMBEDDING_DIM stays 1536); feature_dim reads meta.json (absent = 1536; 0, -1, 1536.0, '2048', null, true and a list "
       "are refused); extract_features takes the width as a parameter: 2048 gives (N, 2048) float16 and a 1536-wide model is refused at dim=2048, a 2048-wide one at the default")
 
 stock_kwargs, stock_extractor_entry = models.DINOV3_VITB16_KWARGS, extract_embeddings.dataset_entry
@@ -1406,7 +1406,7 @@ try:
             rejects(KeyError, lambda: load_swin("swin_base", other), "has no 'teacher' entry")
 
             # two refusals that were a bare traceback from inside the loader: a model name it does not build (a typo for swin_large_768 here: UnboundLocalError) and a ViT's file under a swin name (a KeyError in swin_architecture)
-            rejects(ValueError, lambda: load_swin("swin_large_1152"), "--model swin_large_1152 is not built by build_omni_model_from_checkpoint (it builds swin_base, swin_large, swin_large_384, swin_large_768, conv_base, vit_base_dinov3, vit_base_dinov2, vit_base_raddino, vit_large_raydino)")
+            rejects(ValueError, lambda: load_swin("swin_large_1152"), "--model swin_large_1152 is not built by build_omni_model_from_checkpoint (it builds swin_base, swin_large, swin_large_384, swin_large_768, conv_base, vit_base_dinov3, vit_large_dinov3, vit_huge_plus_dinov3, vit_7b_dinov3, vit_base_dinov2, vit_base_raddino, vit_large_raydino)")
             save_ark(other, ArkViT([], None, False, **TINY).state_dict())  # a ViT-shaped teacher: patch_embed.proj.weight and blocks.*, no relative_position_bias_table
             message = rejects(RuntimeError, lambda: load_swin("swin_base", other), "is not a Swin state dict")
             assert message == "Ark checkpoint {} ('teacher') is not a Swin state dict: it has no layers.0.blocks.0.attn.relative_position_bias_table; --model swin_base is a Swin".format(other), message

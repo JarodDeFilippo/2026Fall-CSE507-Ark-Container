@@ -33,7 +33,7 @@ def get_args_parser():
 
     parser.add_option("--GPU", dest="GPU", help="the index of gpu is used", default=None, action="callback",
                       callback=vararg_callback_int)
-    parser.add_option("--model", dest="model_name", help="swin_base|swin_large|swin_large_384|swin_large_768|conv_base|vit_base_dinov3|vit_base_dinov2|vit_base_raddino|vit_large_raydino", default="swin_base", type="string")
+    parser.add_option("--model", dest="model_name", help="swin_base|swin_large|swin_large_384|swin_large_768|conv_base|vit_base_dinov3|vit_large_dinov3|vit_huge_plus_dinov3|vit_7b_dinov3|vit_base_dinov2|vit_base_raddino|vit_large_raydino", default="swin_base", type="string")
     parser.add_option("--init", dest="init",help="Random| ImageNet_1k| ImageNet_21k| SAM| DeiT| BEiT| DINO| MoCo_V3| MoBY | MAE| SimMIM", default="Random", type="string")
     parser.add_option("--pretrained_weights", dest="pretrained_weights", help="Path to a checkpoint or saved-weights directory", default=None, type="string")
     parser.add_option("--num_class", dest="num_class", help="number of the classes in the downstream task",
@@ -102,9 +102,9 @@ def get_args_parser():
     parser.add_option('--weight-decay', type=float, default=0.0,
                         help='weight decay (default: 0.05)')
     parser.add_option('--layer-decay', type=float, default=None, metavar='RATE',
-                        help='layer-wise LR decay for vit_base_dinov3 / vit_base_dinov2 / vit_base_raddino / vit_large_raydino (default: None, off)')
+                        help='layer-wise LR decay for vit_base_dinov3 / vit_large_dinov3 / vit_huge_plus_dinov3 / vit_7b_dinov3 / vit_base_dinov2 / vit_base_raddino / vit_large_raydino (default: None, off)')
     parser.add_option('--patch-embed-lr-mult', type=float, default=1.0, metavar='MULT',
-                        help='patch-embedding LR multiplier for vit_base_dinov3 / vit_base_dinov2 / vit_base_raddino / vit_large_raydino (default: 1.0)')
+                        help='patch-embedding LR multiplier for vit_base_dinov3 / vit_large_dinov3 / vit_huge_plus_dinov3 / vit_7b_dinov3 / vit_base_dinov2 / vit_base_raddino / vit_large_raydino (default: 1.0)')
     parser.add_option("--freeze_backbone", dest="freeze_backbone", help="true | false: train only the projector and task heads, backbone frozen (linear-probe phase); needs the value, e.g. --freeze_backbone true",
                       default=False, action="callback", callback=freeze_backbone_callback)
     # Learning rate schedule parameters

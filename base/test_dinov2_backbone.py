@@ -451,12 +451,12 @@ built = engine._create_vit_finetune_optimizer(ray_recipe, ray)
 assert isinstance(built, torch.optim.AdamW) and len(built.param_groups) == 53
 message = rejects(ValueError, lambda: engine._create_vit_finetune_optimizer(SimpleNamespace(model_name="swin_base", opt="adamw", lr=1e-4, opt_eps=1e-8, momentum=0.9,
                                                                                       weight_decay=0.04, layer_decay=0.9, patch_embed_lr_mult=0.2), ray), "only implemented for --model vit_base_dinov3")
-assert message.endswith("vit_base_dinov3 | vit_base_dinov2 | vit_base_raddino | vit_large_raydino"), message
+assert message.endswith("vit_base_dinov3 | vit_large_dinov3 | vit_huge_plus_dinov3 | vit_7b_dinov3 | vit_base_dinov2 | vit_base_raddino | vit_large_raydino"), message
 ray_summary = engine._freeze_backbone(ray)
 ray_frozen = [n for n, p in ray.named_parameters() if not p.requires_grad]
 ray_trainable = [n for n, p in ray.named_parameters() if p.requires_grad]
 assert len(ray_frozen) == 343 and all(n.startswith(HEAD_PREFIXES) for n in ray_trainable) and len(ray_trainable) == 6
-print("OK (i3) recipe: --layer-decay builds the 53-group AdamW for vit_large_raydino (the refusal for other models lists all four names); --freeze_backbone: " + ray_summary)
+print("OK (i3) recipe: --layer-decay builds the 53-group AdamW for vit_large_raydino (the refusal for other models lists all seven names); --freeze_backbone: " + ray_summary)
 del ray, built, embeddings, tokens, feats, outs, ray_named, ray_groups, ray_group_of  # the full-size model (1.2 GB) goes before the next ones are built
 
 # (i4) the key guard, on a backbone of the real width with one block (2048-d features, cheap on the CPU): the same file shapes as above, labelled RayDINO
