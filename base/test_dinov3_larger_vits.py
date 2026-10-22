@@ -13,11 +13,12 @@ from models import (ArkViT, DINO_VIT_MODELS, DINOV3_VITB16_KWARGS, DINOV3_VITH16
                     build_omni_model)
 
 # name -> (config, the keys that differ from the ViT-B's, blocks, embed_dim, FFN class, parameters), written out here rather than read off the config under test.
-# The parameters are counted by hand from Meta's hub configs (dinov3/hub/backbones.py); they match the README's 300M (L), 840M (H+) and 6,716M (7B).
+# The parameters are counted by hand from Meta's hub configs (dinov3/hub/backbones.py); they match the README's 300M (L), 840M (H+) and 6,716M (7B). The 7B's 6,716,035,072 is Meta's 6,716,043,264 less the
+# 2 * 4096 of the local_cls_norm LayerNorm: Meta's native file has it, our HF-derived file does not (untie_global_and_local_cls_norm=False in DINOV3_VIT7B16_KWARGS).
 SIZES = {
     "vit_large_dinov3": (DINOV3_VITL16_KWARGS, {"embed_dim", "depth", "num_heads"}, 24, 1024, Mlp, 303154176),
     "vit_huge_plus_dinov3": (DINOV3_VITH16PLUS_KWARGS, {"embed_dim", "depth", "num_heads", "ffn_ratio", "ffn_layer"}, 32, 1280, SwiGLUFFN, 840633600),
-    "vit_7b_dinov3": (DINOV3_VIT7B16_KWARGS, {"embed_dim", "depth", "num_heads", "ffn_ratio", "qkv_bias", "ffn_layer", "untie_global_and_local_cls_norm"}, 40, 4096, SwiGLUFFN, 6716043264),
+    "vit_7b_dinov3": (DINOV3_VIT7B16_KWARGS, {"embed_dim", "depth", "num_heads", "ffn_ratio", "qkv_bias", "ffn_layer", "untie_global_and_local_cls_norm"}, 40, 4096, SwiGLUFFN, 6716035072),
 }
 
 
@@ -41,7 +42,7 @@ def check(name, model):
     assert type(model) is ArkViT and len(model.blocks) == model.n_blocks == blocks and model.embed_dim == config["embed_dim"] == embed
     assert model.projector is None and model.num_features == embedding_dim(name) == 2 * embed  # no projector built: the encoder's width, CLS ++ mean patch
     assert type(model.blocks[0].mlp) is ffn and (model.blocks[0].attn.qkv.bias is not None) == config["qkv_bias"]
-    assert (model.local_cls_norm is not None) == (name == "vit_7b_dinov3")  # only the 7B's hub entry builds the untied local CLS norm
+    assert model.local_cls_norm is None  # none of the three builds the untied local CLS norm: the 7B's hub entry does for Meta's native file, but our HF-derived file has no such tensors
     assert sum(p.numel() for p in model.parameters()) == params
 
 
@@ -49,8 +50,9 @@ def check(name, model):
 for name, (config, differing, *_) in SIZES.items():
     assert set(DINOV3_VITB16_KWARGS) <= set(config) and {k for k, v in config.items() if DINOV3_VITB16_KWARGS.get(k) != v} == differing, name
     assert DINO_VIT_MODELS[name] == "DINOv3", name
+assert DINOV3_VIT7B16_KWARGS["untie_global_and_local_cls_norm"] is False  # True in Meta's hub for Meta's native file; False for the HF-derived one (transformers' conversion drops local_cls_norm)
 print("OK (a) configs: vit_large_dinov3 differs from the ViT-B's in embed_dim, depth and num_heads only; the H+ adds ffn_ratio 6.0 and the swiglu FFN; the 7B adds ffn_ratio 3, no qkv bias, swiglu64 "
-      "and untie_global_and_local_cls_norm; all three are in DINO_VIT_MODELS as DINOv3")
+      "and untie_global_and_local_cls_norm=False (True in Meta's hub; the HF-derived file has no local_cls_norm); all three are in DINO_VIT_MODELS as DINOv3")
 
 # (b) vit_large_dinov3 with real tensors: 24 blocks of width 1024, 2048-d features = CLS ++ mean patch at 224 px
 large = build_omni_model(ark_args("vit_large_dinov3"), []).eval()
@@ -72,7 +74,7 @@ for name in ("vit_huge_plus_dinov3", "vit_7b_dinov3"):
     assert all(t.is_meta for t in (*model.parameters(), *model.buffers()))  # nothing was allocated
     check(name, model)
 print("OK (c) vit_huge_plus_dinov3 / vit_7b_dinov3 built on the meta device (no tensors, no forward): 32 / 40 blocks of width 1280 / 4096, a SwiGLU FFN, "
-      "840,633,600 / 6,716,043,264 parameters, no qkv bias and a local_cls_norm for the 7B only; embedding widths 2560 / 8192 = embedding_dim()")
+      "840,633,600 / 6,716,035,072 parameters, no qkv bias for the 7B, no local_cls_norm in either; embedding widths 2560 / 8192 = embedding_dim()")
 
 # (d) a ViT-B file (the likeliest wrong one: the stock ViT-B/16's) under --model vit_large_dinov3 is refused under the DINOv3 label, with torch's size-mismatch lines (the key and both shapes)
 vit_b = build_omni_model(ark_args("vit_base_dinov3"), [])
