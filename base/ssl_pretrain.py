@@ -148,6 +148,9 @@ def parse_args(argv=None):
     p.add_argument("--device", default=os.environ.get("PROJECT_ACCELERATOR", "cuda"))
     p.add_argument("--bf16", action="store_true", help="bf16 autocast for the forward passes (default fp32)")
     args = p.parse_args(argv)
+    for name in ("init_from_checkpoint", "branch_from"):  # an empty path (an unset variable in a launch line) would pass the presence checks below but not run()'s
+        if getattr(args, name) == "":
+            p.error(f"--{name} is empty: pass a checkpoint path, or leave the flag out")
     if args.pretrained_weights is None and args.init_from_checkpoint is None and args.branch_from is None:
         p.error("--pretrained_weights is required unless --init_from_checkpoint is given (or --branch_from)")
     if args.branch_from is not None:  # a branch continues a no-Gram run exactly with the Gram teacher on; these would contradict that
