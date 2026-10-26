@@ -45,8 +45,12 @@ log-uniform factor in [1/S, S] (drawn anew per block, crop group and forward), a
 of the local crops (entry 1 of the student's list forward). All three act in train mode only: the EMA and Gram teachers are copies of the student but
 run in eval, so none of the three reaches the teacher forwards, the probe or the export. The draws come from torch's generator on the training device:
 on CPU the checkpoint's torch RNG state covers them, so a resumed run is bitwise the uninterrupted one; a device generator (HPU) is not in the
-checkpoint, so there a resumed run draws other (equally distributed) factors and subsets. Every rank starts from the same seed, so the ranks draw
-alike (Meta seeds seed + rank). The defaults (0.0, none, off) are the behaviour before the flags existed, so every earlier checkpoint resumes and
+checkpoint, so there a resumed run draws other (equally distributed) factors and subsets. Every rank builds the models from the same --seed (the
+heads' init and the teachers' copies are then alike on all ranks), then re-seeds python / numpy / torch with --seed + rank (Meta seeds seed + rank), so
+each rank draws its own drop-path subsets and RoPE factors; rank 0 keeps --seed. A multi-rank checkpoint holds every rank's RNG states (rng_per_rank,
+entry r = rank r's; rng is rank 0's as before, and all a one-rank checkpoint has) and a --resume or --branch_from restores each rank its own; one
+written before that holds a single state, which every rank restores (one line says so).
+The defaults (0.0, none, off) are the behaviour before the flags existed, so every earlier checkpoint resumes and
 branches unchanged: the three are locked on --resume (a checkpoint without the keys reads as the defaults), recorded in args.json, and a --branch_from
 source must match them. With --untie_local_cls_norm the stock --pretrained_weights file loads strictly and local_cls_norm starts as a copy of its
 norm (one line says so); the epoch checkpoints carry local_cls_norm (student, EMA teacher, Gram teacher) and the exports leave it out (the stock 188
@@ -355,6 +359,11 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     student, teacher, gram_teacher = build_models(dict(vit_kwargs or DINOV3_VITB16_KWARGS, **recipe),
                                                   None if weights_from else args.pretrained_weights,
                                                   head_kwargs or HEAD_KWARGS, gram=not args.no_gram)
+    # the init and the EMA / Gram copies are done: from here each rank draws its own model-side randomness (drop path, RoPE rescale), as Meta seeds
+    # seed + rank; rank 0 keeps args.seed. The data loaders seed per rank themselves (build_data_loader, set_epoch)
+    random.seed(args.seed + rank)
+    np.random.seed(args.seed + rank)
+    torch.manual_seed(args.seed + rank)
     if (args.drop_path_rate, args.rope_rescale_coords, args.untie_local_cls_norm) != (0.0, None, False):  # the defaults print nothing new
         say(f"recipe (student, train mode only; the EMA / Gram teachers run in eval): drop path {args.drop_path_rate:g}, RoPE coordinate rescale "
             f"{'none' if args.rope_rescale_coords is None else format(args.rope_rescale_coords, 'g')}, local-crop CLS norm "
@@ -456,9 +465,17 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
         optimizer.load_state_dict(ckpt["optimizer"])
         step, epochs_done = ckpt["step"], ckpt["epoch"]
         gram_refreshes = [] if branching else list(ckpt["gram_refreshes"])  # a branch's refreshes are its own
-        random.setstate(ckpt["rng"]["python"])
-        np.random.set_state(ckpt["rng"]["numpy"])
-        torch.set_rng_state(ckpt["rng"]["torch"])
+        if "rng_per_rank" in ckpt:  # entry r = rank r's states: the ranks keep drawing differently across a resume / branch
+            states = ckpt["rng_per_rank"]
+            assert len(states) == world_size, f"the checkpoint holds {len(states)} per-rank RNG states, this run has {world_size} ranks"
+            rng = states[rank]
+        else:  # one rank, or written before the per-rank states: its one state (rank 0's), on every rank
+            rng = ckpt["rng"]
+            if world_size > 1:
+                say(f"RNG: the checkpoint predates the per-rank RNG states and holds one: it is restored on every rank ({world_size})")
+        random.setstate(rng["python"])
+        np.random.set_state(rng["numpy"])
+        torch.set_rng_state(rng["torch"])
         if branching:
             say(f"branched from {args.branch_from}: its step {step}, epoch {epochs_done}; student/teacher/optimizer/RNG restored; Gram teacher <- its "
                 f"EMA teacher backbone; Gram ON, weight {args.gram_weight:g}, refreshes after steps {args.gram_refresh_steps}")
@@ -485,6 +502,11 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
         return summary()
 
     def save_state(ckpt_path, export_path):
+        rng = dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state())
+        per_rank = {}  # one rank: rng says it all, and its checkpoint keeps the layout it had before the per-rank states (and runs no extra collective)
+        if world_size > 1:  # every rank's states, so --resume / --branch_from hand each rank its own back; a collective: every rank calls it, rank 0 writes
+            per_rank["rng_per_rank"] = [None] * world_size
+            dist.all_gather_object(per_rank["rng_per_rank"], rng)
         if main:  # export first: the checkpoint is the commit record --resume looks for
             save_atomic(export_backbone(teacher.backbone), export_path)
             save_atomic(to_cpu(dict(
@@ -492,7 +514,7 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                 gram_teacher=None if gram_teacher is None else gram_teacher.state_dict(),  # --no_gram: the key stays, holding None
                 optimizer=optimizer.state_dict(), step=step, epoch=epochs_done,
                 gram_refreshes=list(gram_refreshes), args=vars(args), world_size=world_size, data_fingerprint=data_fingerprint,
-                rng=dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state()))), ckpt_path)
+                rng=rng, **per_rank)), ckpt_path)  # rng: rank 0's, as before
         accelerator.barrier()
 
     refresh_steps, first_step = set(args.gram_refresh_steps), step
