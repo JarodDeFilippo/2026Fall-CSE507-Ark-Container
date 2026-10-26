@@ -29,12 +29,14 @@ counts a blank as unreadable.
 EMA teacher, optimizer, step, epoch and the python / numpy / torch RNG states are restored as a --resume of the trunk would restore them (same
 schedule position, same data order), and the Gram teacher is anchored to that checkpoint's EMA teacher backbone (the mapping --init_from_checkpoint
 uses); its Gram refreshes start empty. --gram_refresh_steps is required and absolute (global steps, each after the branch step); --gram_weight and
---gram_teacher_size keep their defaults (2.0, 2 x global) unless given. Epochs continue the trunk's numbering (a branch from epoch 10 first writes
-ckpt/epoch_0011.pth and export/teacher_backbone_epoch_0011.pth) and ssl_losses.csv holds only the branch's rows, from the branch step on. The source
-is read only when the branch starts: a --resume restores the branch's own epoch checkpoint, so the trunk pruning the source cannot break it, and
-branch_from is locked on --resume. Refused before anything on disk is touched: a source that is not a file, not a full epoch checkpoint or not a
---no_gram run's; --no_gram or --init_from_checkpoint with it; a source that differs on any --resume-locked setting but the Gram ones, or in its image
-list, world size or epoch length; a refresh step at or before the branch step; a stop epoch at or before the source's.
+--gram_teacher_size keep their defaults (2.0, 2 x global) unless given. An explicit --gram_teacher_size other than the source's (its 2 x global)
+also changes the size the global crops are cut at, so the crops are then no longer the trunk's. Epochs continue the trunk's numbering (a branch from
+epoch 10 first writes ckpt/epoch_0011.pth and export/teacher_backbone_epoch_0011.pth) and ssl_losses.csv holds only the branch's rows, from the
+branch step on. The source is read only when the branch starts: a --resume restores the branch's own epoch checkpoint, so the trunk pruning the
+source cannot break it, and branch_from is locked on --resume. Refused before anything on disk is touched: a source that is not a file, not a full
+epoch checkpoint or not a --no_gram run's; --no_gram or --init_from_checkpoint with it; a source that differs on any --resume-locked setting but the
+Gram ones and its own --init_from_checkpoint, or in its image list, world size or epoch length; a refresh step at or before the branch step; a stop
+epoch at or before the source's.
 """
 import argparse
 import csv
@@ -79,8 +81,9 @@ RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_
 CROP_DEFAULTS = dict(global_crops_size=224, local_crops_size=96, gram_teacher_size=448)
 # keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off and no --branch_from
 ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None)
-# what a --branch_from start may differ from its source in (check_resume skips these): the Gram switch and knobs the branch turns on, and the path itself
-BRANCH_FREE = ("no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from")
+# what a --branch_from start may differ from its source in (check_resume skips these): the Gram switch and knobs the branch turns on, the path itself,
+# and the source's own init provenance (its full state is restored; a branch cannot pass --init_from_checkpoint, so it would always differ)
+BRANCH_FREE = ("no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from", "init_from_checkpoint")
 BRANCH_SOURCE_KEYS = ("student", "teacher", "optimizer", "step", "epoch", "rng", "args", "world_size")  # a full epoch checkpoint (save_state)
 PATCH_SIZE = 16  # DINOV3_VITB16_KWARGS patch_size: every crop side must be a multiple of it
 DEFAULT_GRAM_REFRESH_STEPS = "10000,20000,30000"  # --gram_refresh_steps when not given (Meta's three refreshes); --no_gram: none

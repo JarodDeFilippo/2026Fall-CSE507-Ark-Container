@@ -922,7 +922,7 @@ print("OK (s) --no_gram --init_from_checkpoint: a Gram run's full checkpoint loa
 # parse: --branch_from stands in for --pretrained_weights, needs --gram_refresh_steps (none allowed: an anchor that never refreshes) and refuses --no_gram / --init_from_checkpoint
 PB = lambda *extra: ssl_pretrain.parse_args(["--data_set", "MIMIC", "--output_dir", "o", "--branch_from", "x.pth"] + list(extra))
 assert P().branch_from is None and ssl_pretrain.ARG_DEFAULTS["branch_from"] is None and "branch_from" in ssl_pretrain.RESUME_MATCH
-assert set(ssl_pretrain.BRANCH_FREE) == {"no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from"}
+assert set(ssl_pretrain.BRANCH_FREE) == {"no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from", "init_from_checkpoint"}
 branch_parsed = PB("--gram_refresh_steps", "5")  # no --pretrained_weights
 assert (branch_parsed.branch_from, branch_parsed.pretrained_weights, branch_parsed.no_gram, branch_parsed.gram_weight, branch_parsed.gram_teacher_size,
         branch_parsed.gram_refresh_steps) == ("x.pth", None, False, 2.0, 448, [5])
@@ -1060,6 +1060,18 @@ ssl_pretrain.check_resume(ck_old, make_args(BR_T, "--no_gram"), 1, 6, ck_t["data
 print("OK (t) branch resume: branch -> epoch 2 -> source deleted -> --resume continues to epoch 3 ('resumed from', Gram refreshes [8, 10] restored, no 'branched from'; "
       "path still recorded); a resume naming another (missing) source is refused by the comparison, and so is --branch_from on a trunk's resume (checkpoint None), args.json "
       "untouched both times; a trunk checkpoint without the branch_from key still resumes as no branch")
+
+# a source that was itself started with --init_from_checkpoint (the (s) DIR_NGH run: INIT, --no_gram, global 64 / local 32 / Gram size 128) still branches: its full state is
+# restored, and a branch cannot pass --init_from_checkpoint, so the recorded init would always differ (Codex r1, P2)
+BR_INIT, SRC_NGH = os.path.join(TMP, "BR_INIT"), os.path.join(DIR_NGH, "ckpt", "epoch_0001.pth")
+assert ck_ngh["args"]["init_from_checkpoint"] == INIT and (ck_ngh["step"], ck_ngh["epoch"]) == (6, 1)
+summary_bi, text_bi = go(BR_INIT, "--branch_from", SRC_NGH, "--global_crops_size", "64", "--local_crops_size", "32", "--warmup_epochs", "0", "--freeze_backbone_epochs", "0",
+                         "--epochs", "2", "--gram_refresh_steps", "100", "--stop_after_epochs", "2")
+assert (summary_bi["step"], summary_bi["epoch"]) == (12, 2) and "branched from %s: its step 6, epoch 1;" % SRC_NGH in text_bi, (summary_bi, text_bi)
+ck_bi = load_ckpt(BR_INIT, "epoch_0002.pth")
+assert ck_bi["args"]["init_from_checkpoint"] is None and ck_bi["args"]["branch_from"] == SRC_NGH and ck_bi["gram_teacher"] is not None
+print("OK (t) init-started source: a --no_gram run started with --init_from_checkpoint branches (its recorded init is skipped): step 12 / epoch 2, the 'branched from' line, "
+      "and the branch's checkpoint records init_from_checkpoint None and branch_from the source")
 
 # refusals: each in a fresh dir, naming the cause, with nothing created on disk
 BRX = ["--branch_from", SRC1, "--gram_refresh_steps", "100", "--stop_after_epochs", "2"]  # the base args of every run below: valid, each adds one fault (a later flag wins)
