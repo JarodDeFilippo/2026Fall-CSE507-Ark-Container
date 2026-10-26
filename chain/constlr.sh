@@ -14,14 +14,30 @@
 # sbatch run_d1_8_chain_gaudi.sh; it resumes from its last epoch checkpoint. Both files are read relative to the repo root (cwd), and a
 # missing, empty or invalid one stops the phase before anything is launched; so does a stop epoch above the ceiling, which the trainer would
 # only refuse after the allocation had started.
+# One env override, unset in the chain's phase (so the phase's run dir, launch line and messages are unchanged): CONSTLR_NOGRAM=1 makes this the no-Gram trunk,
+# "DINO-X ConstLR 224, no Gram": the same launch line with --no_gram (no Gram teacher built, loaded or run) in place of --gram_refresh_steps 10000,20000,30000, into its own
+# run dir ssl_dinov3_cxr_constlr_nogram_seed_100, with the stop epoch read from chain/constlr_nogram_stop_after.txt instead (the same rules, cluster-only too; chain/constlr_stop_after.txt
+# is not read then), and one `run:` line printed before the launch. Any other non-empty value is refused before anything is read. run_d1_8_constlr_nogram_gaudi.sh sets it: its own
+# 4-card job outside the chain, never a phase.
 set -euo pipefail
+NOGRAM=${CONSTLR_NOGRAM:-}  # first, before anything is read or launched
+[[ -z $NOGRAM || $NOGRAM == 1 ]] || { echo "ERROR: CONSTLR_NOGRAM holds '$NOGRAM', which is not empty or 1" >&2; exit 1; }
 source "$(dirname "${BASH_SOURCE[0]}")/ssl_common.sh"
 
 EPOCHS=1000  # the --epochs ceiling (never reached): the stop epoch's upper limit and the launch line both use it, so they cannot drift
+RUN=ssl_dinov3_cxr_constlr_seed_100
+STOP_FILE=chain/constlr_stop_after.txt
+GRAM_ARGS=(--gram_refresh_steps 10000,20000,30000)
+if [[ -n $NOGRAM ]]; then
+  RUN=ssl_dinov3_cxr_constlr_nogram_seed_100
+  STOP_FILE=chain/constlr_nogram_stop_after.txt
+  GRAM_ARGS=(--no_gram)
+fi
 LR=$(read_setting chain/main_lr.txt '^([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$' 'a positive number such as 2e-3 or 0.0003')
 awk -v v="$LR" 'BEGIN { exit !(v + 0 > 0) }' || { echo "ERROR: chain/main_lr.txt holds '$LR', which is not positive" >&2; exit 1; }
-STOP_AFTER=$(read_setting chain/constlr_stop_after.txt '^[1-9][0-9]*$' 'a positive integer')
+STOP_AFTER=$(read_setting "$STOP_FILE" '^[1-9][0-9]*$' 'a positive integer')
 # awk, not (( )): bash arithmetic wraps silently past 2^63 (18446744073709551617 would read as 1)
-awk -v v="$STOP_AFTER" -v cap="$EPOCHS" 'BEGIN { exit !(v + 0 <= cap + 0) }' || { echo "ERROR: chain/constlr_stop_after.txt holds '$STOP_AFTER', which is above the --epochs ceiling of $EPOCHS" >&2; exit 1; }
+awk -v v="$STOP_AFTER" -v cap="$EPOCHS" 'BEGIN { exit !(v + 0 <= cap + 0) }' || { echo "ERROR: $STOP_FILE holds '$STOP_AFTER', which is above the --epochs ceiling of $EPOCHS" >&2; exit 1; }
+[[ -z $NOGRAM ]] || echo "run: $RUN (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; stop after epoch $STOP_AFTER from $STOP_FILE)"
 
-ssl_launch ssl_dinov3_cxr_constlr_seed_100 --lr "$LR" --min_lr "$LR" --no_lr_scaling --epochs "$EPOCHS" --stop_after_epochs "$STOP_AFTER" --gram_refresh_steps 10000,20000,30000
+ssl_launch "$RUN" --lr "$LR" --min_lr "$LR" --no_lr_scaling --epochs "$EPOCHS" --stop_after_epochs "$STOP_AFTER" "${GRAM_ARGS[@]}"

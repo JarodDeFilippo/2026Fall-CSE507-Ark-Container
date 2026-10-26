@@ -195,6 +195,9 @@ def make_args(out, *extra):
             "--pretrained_weights", "unused", "--output_dir", out, "--device", "cpu", "--workers", "0",
             "--batch_size_per_gpu", "2", "--epochs", "3", "--warmup_epochs", "1", "--teacher_temp_warmup_epochs", "1",
             "--gram_refresh_steps", "4,8", "--freeze_backbone_epochs", "1", "--print_freq", "2"]
+    if "--no_gram" in extra:  # parse_args refuses --gram_refresh_steps under --no_gram: drop the base pair
+        i = argv.index("--gram_refresh_steps")
+        del argv[i:i + 2]
     args = ssl_pretrain.parse_args(argv + list(extra))
     args.pretrained_weights = None  # random init (tests have no stock weights to load into the tiny ViT)
     return args
@@ -715,14 +718,214 @@ print("OK (r) --init_from_checkpoint: a NEW run whose student and teacher (heads
       "too -> WARNING, the checkpoint wins; a re-submit resumes the run itself; refused: another init, an init into a resumable run that had none, "
       "no --resume, a missing file, a shape mismatch, a missing or unexpected key (strict), a backbone-only export")
 
+# (s) --no_gram: no Gram teacher built, loaded or run; no Gram loss; no refreshes ---------------------------------------------------------------
+from dinov3.loss import GramLoss
+
+# parse: the Gram knobs resolve per mode, and an explicit one under --no_gram is refused (the text after "error: " names it; the usage text above it names all)
+assert (P().no_gram, P().gram_weight, P().gram_refresh_steps) == (False, 2.0, [10000, 20000, 30000])
+assert ssl_pretrain.DEFAULT_GRAM_REFRESH_STEPS == "10000,20000,30000" and P("--gram_weight", "3").gram_weight == 3.0
+ng_parsed = P("--no_gram")
+assert (ng_parsed.no_gram, ng_parsed.gram_weight, ng_parsed.gram_refresh_steps, ng_parsed.gram_teacher_size) == (True, 0.0, [], 448)
+assert P("--no_gram", "--global_crops_size", "512").gram_teacher_size == 1024  # still 2 x global: the size the global crops are cut at
+for extra, flag in ((["--gram_weight", "2"], "--gram_weight"), (["--gram_weight", "0"], "--gram_weight"),
+                    (["--gram_refresh_steps", "10000"], "--gram_refresh_steps"), (["--gram_refresh_steps", "none"], "--gram_refresh_steps"),
+                    (["--gram_refresh_steps", ""], "--gram_refresh_steps"), (["--gram_teacher_size", "448"], "--gram_teacher_size")):
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        raises(SystemExit, P, "--no_gram", *extra)
+    complaint = err.getvalue().split("error: ", 1)[1]
+    assert flag in complaint and "--no_gram" in complaint, (extra, err.getvalue())
+print("OK (s) parse: no flag -> no_gram False, gram_weight 2.0, refreshes 10000,20000,30000; --no_gram -> gram_weight 0.0, refreshes [], Gram size 2 x global "
+      "(448); an explicit --gram_weight (2 or 0), --gram_refresh_steps (10000, none, empty) or --gram_teacher_size with --no_gram exits 2 naming the flag")
+
+
+def ng_seeded(fn, *args, **kwargs):  # run() seeds random, numpy and torch before it builds anything
+    torch.manual_seed(0)
+    random.seed(0)
+    np.random.seed(0)
+    return fn(*args, **kwargs)
+
+
+# models: no Gram teacher is built, and student / teacher come out bitwise as with one (deepcopy draws no RNG)
+models_on = ng_seeded(build_models, TINY_VIT, None, TINY_HEADS)
+models_off = ng_seeded(build_models, TINY_VIT, None, TINY_HEADS, gram=False)
+assert models_on[2] is not None and models_off[2] is None
+for with_gram, without_gram in zip(models_on[:2], models_off[:2]):
+    assert list(with_gram.state_dict()) == list(without_gram.state_dict())
+    assert all(torch.equal(v, without_gram.state_dict()[k]) for k, v in with_gram.state_dict().items())
+# data: emit_gram_teacher_crops=False drops the Gram crops and changes nothing else (same seeds: bitwise the same student / teacher crops, same decode side)
+ng_image = Image.fromarray(np.random.RandomState(3).randint(0, 255, (300, 400), dtype=np.uint8), "L")
+crops_on = ng_seeded(DataAugmentationCXR(), ng_image)
+crops_off = ng_seeded(DataAugmentationCXR(emit_gram_teacher_crops=False), ng_image)
+assert tuple(crops_on["gram_teacher_crops"][0].shape) == (3, 448, 448) and tuple(crops_off["global_crops"][0].shape) == (3, 224, 224)
+assert "gram_teacher_crops" not in crops_off and set(crops_off) == set(crops_on) - {"gram_teacher_crops"}
+for key in ("global_crops", "global_crops_teacher", "local_crops"):
+    assert len(crops_off[key]) == len(crops_on[key]) and all(torch.equal(a, b) for a, b in zip(crops_off[key], crops_on[key])), key
+assert DataAugmentationCXR().decode_min_side == DataAugmentationCXR(emit_gram_teacher_crops=False).decode_min_side == 1024
+print("OK (s) models + data: build_models(gram=False) -> no Gram teacher, student and teacher bitwise those of gram=True; the transform without Gram crops "
+      "gives bitwise the same global / teacher / local crops and decode side (1024) from the same seeds")
+
+
+def ng_refuse(*args, **kwargs):
+    raise AssertionError("a Gram code path ran in --no_gram mode")
+
+
+@contextlib.contextmanager
+def gram_code_forbidden():  # SSLMetaArch's Gram forward and refresh, and GramLoss.forward, raise while this is active
+    saved = SSLMetaArch.get_gram_teacher_output, SSLMetaArch.update_gram, GramLoss.forward
+    SSLMetaArch.get_gram_teacher_output = SSLMetaArch.update_gram = GramLoss.forward = ng_refuse
+    try:
+        yield
+    finally:
+        SSLMetaArch.get_gram_teacher_output, SSLMetaArch.update_gram, GramLoss.forward = saved
+
+
+# meta step: SSLMetaArch with gram_teacher=None on a batch without Gram crops runs, and the total has no Gram term
+assert dist.is_initialized()  # the trainer runs above leave their world-size-1 group up, which SSLMetaArch's Sinkhorn-Knopp needs
+ng_student, ng_teacher, ng_gram = ng_seeded(build_models, TINY_VIT, None, TINY_HEADS, gram=False)
+meta_ng = SSLMetaArch(ng_student, ng_teacher, None, n_local_crops=8).train()
+ng_dataset = build_dataset(list(DATASET_NAMES), CFG, DataAugmentationCXR(emit_gram_teacher_crops=False), check_exists=False)
+ng_batch = make_collate_fn()([ng_dataset[i] for i in range(4)])
+assert ng_gram is None and meta_ng.gram_teacher is None and meta_ng.gram_loss is None
+assert "collated_gram_teacher_crops" not in ng_batch and tuple(ng_batch["collated_global_crops"].shape) == (8, 3, 224, 224)
+with gram_code_forbidden():
+    ng_loss, ng_dict = meta_ng.forward_backward(ng_batch, teacher_temp=0.04)
+assert set(ng_dict) == LOSS_KEYS - {"gram_loss"} and torch.isfinite(ng_loss) and all(torch.isfinite(v) for v in ng_dict.values())
+ng_want = (16 / 18 * ng_dict["dino_local_crops_loss"].item() + 2 / 18 * ng_dict["dino_global_crops_loss"].item()
+           + 0.1 * 2 * ng_dict["koleo_loss"].item() + 1.0 * ng_dict["ibot_loss"].item())  # 2 global x 8 local crops: 16 local terms, 2 global, scale 2 for KoLeo
+assert math.isclose(ng_loss.item(), ng_want, rel_tol=1e-6), (ng_loss.item(), ng_want)
+print("OK (s) meta step: SSLMetaArch(gram_teacher=None) on a batch without collated_gram_teacher_crops runs with the Gram forward and GramLoss.forward "
+      "set to raise; loss keys = the four others; total %.5f = 16/18 dino_local + 2/18 dino_global + 0.1 x 2 koleo + ibot (no Gram term)" % ng_loss.item())
+
+# end to end: A = 1 epoch then --resume to 2, B = 2 epochs straight, both --no_gram; the spies see what run() hands SSLMetaArch and what it trains on
+ng_inits, ng_batches = [], []
+
+
+def ng_meta_init(self, student, teacher, gram_teacher, **kwargs):  # the models as run() hands them over, before any step
+    ng_inits.append(dict(gram_teacher=gram_teacher, **{name: {k: v.detach().clone() for k, v in m.state_dict().items()}
+                                                     for name, m in (("student", student), ("teacher", teacher))}))
+    return real_meta_init(self, student, teacher, gram_teacher, **kwargs)
+
+
+def ng_forward_backward(self, data, *, teacher_temp):
+    ng_batches.append(set(data))
+    return real_forward_backward(self, data, teacher_temp=teacher_temp)
+
+
+@contextlib.contextmanager
+def spying_on_meta():  # SSLMetaArch.__init__ / forward_backward record into ng_inits / ng_batches (cleared on entry) while this is active
+    ng_inits.clear()
+    ng_batches.clear()
+    SSLMetaArch.__init__, SSLMetaArch.forward_backward = ng_meta_init, ng_forward_backward
+    try:
+        yield
+    finally:
+        SSLMetaArch.__init__, SSLMetaArch.forward_backward = real_meta_init, real_forward_backward
+
+
+OFF_LINE = "Gram: OFF (--no_gram): no Gram teacher built or loaded, no Gram loss, no Gram refreshes; ssl_losses.csv gram and gram_weight columns are 0.0"
+NG_A, NG_B = os.path.join(TMP, "NG_A"), os.path.join(TMP, "NG_B")
+with spying_on_meta(), gram_code_forbidden():
+    summary_nga1, text_nga1 = go(NG_A, "--no_gram", "--stop_after_epochs", "1")
+    summary_nga2, text_nga2 = go(NG_A, "--no_gram", "--resume", "--stop_after_epochs", "2")
+    summary_ngb, text_ngb = go(NG_B, "--no_gram", "--stop_after_epochs", "2")
+assert [m["gram_teacher"] for m in ng_inits] == [None] * 3  # run() never built a Gram teacher: SSLMetaArch got None in all three runs
+assert len(ng_batches) == 6 + 6 + 12 and all("collated_global_crops" in keys and "collated_gram_teacher_crops" not in keys for keys in ng_batches)
+for text in (text_nga1, text_nga2, text_ngb):
+    lines = text.splitlines()
+    # no "Gram refresh scheduled" / "Gram refresh k/n" line, or any other Gram refresh text: only the OFF line ("no Gram refreshes") and the resumed line
+    # ("Gram refreshes []") may name it
+    assert OFF_LINE in lines and not any("Gram refresh" in line for line in lines if line != OFF_LINE and not line.startswith("resumed from"))
+    assert ("crops: global 224, local 96 (x8), no Gram teacher (global crops cut at 448 and resized to 224, as in the Gram runs); "
+            "JPEG decode min side 1024") in lines, text
+resumed = [line for line in text_nga2.splitlines() if line.startswith("resumed from")]
+assert len(resumed) == 1 and resumed[0].endswith("1 epochs / 6 steps done, Gram refreshes [], student/teacher/optimizer/RNG restored"), resumed
+assert summary_nga2 == summary_ngb and (summary_ngb["step"], summary_ngb["epoch"], summary_ngb["gram_refreshes"]) == (12, 2, [])
+export_nga = torch.load(os.path.join(NG_A, "export", "teacher_backbone_epoch_0002.pth"), weights_only=True)
+export_ngb = torch.load(os.path.join(NG_B, "export", "teacher_backbone_epoch_0002.pth"), weights_only=True)
+assert set(export_nga) == set(export_ngb)
+ng_bitwise = all(torch.equal(export_nga[k], export_ngb[k]) for k in export_ngb)
+if not ng_bitwise:
+    assert all(torch.allclose(export_nga[k], export_ngb[k], rtol=1e-5, atol=1e-6) for k in export_ngb)
+    print("NOTE (s) the resumed --no_gram teacher backbone matches the uninterrupted run only to allclose, not bitwise")
+ck_ng = load_ckpt(NG_A, "epoch_0002.pth")
+assert set(ck_ng) == set(ck2) and ck_ng["gram_teacher"] is None and load_ckpt(NG_B, "epoch_0002.pth")["gram_teacher"] is None  # the key stays, holding None
+assert (ck_ng["step"], ck_ng["epoch"], ck_ng["gram_refreshes"], ck_ng["world_size"]) == (12, 2, [], 1)
+assert ck_ng["args"]["no_gram"] is True and ck2["args"]["no_gram"] is False  # the Gram run's checkpoint records the flag too
+info_ng = json.load(open(os.path.join(NG_A, "args.json")))
+assert (info_ng["no_gram"], info_ng["gram_weight"], info_ng["gram_refresh_steps"]) == (True, 0.0, [])
+assert json.load(open(os.path.join(DIR_A, "args.json")))["no_gram"] is False
+ng_backbone = backbone_of(ck_ng["teacher"])
+assert set(export_nga) == set(ng_backbone) and all(torch.equal(export_nga[k], v) for k, v in ng_backbone.items())  # the export IS the EMA teacher's backbone
+ng_cols = CSV_HEADER.split(",")
+ng_gram, ng_gram_weight = ng_cols.index("gram"), ng_cols.index("gram_weight")
+for out in (NG_A, NG_B):
+    rows = read_csv(out)
+    assert ",".join(rows[0]) == CSV_HEADER and len(rows) > 3
+    for row in rows[1:]:
+        assert len(row) == 15 and row[ng_gram] == "0.0" and row[ng_gram_weight] == "0.0", row  # both columns present and numeric, never blank
+        dg, dl, ko, ib, total = (float(row[ng_cols.index(c)]) for c in ("dino_global", "dino_local", "koleo", "ibot", "total"))
+        assert all(map(math.isfinite, (dg, dl, ko, ib, total))) and math.isclose(total, 16 / 18 * dl + 2 / 18 * dg + 0.2 * ko + ib, rel_tol=1e-5), row
+print("OK (s) end to end: A (1 epoch, then --resume to 2) and B (2 epochs) with --no_gram: SSLMetaArch got gram_teacher None in all 3 runs, none of the %d "
+      "batches had Gram crops, the Gram forward / GramLoss / refresh were never called; printed the OFF line and no 'Gram refresh' lines; the resume restored "
+      "student/teacher/optimizer/RNG; final teacher backbone %s; checkpoint keys as a Gram run's with gram_teacher None; args.json no_gram True, gram_weight "
+      "0.0, refreshes []; CSV: 15 columns, gram and gram_weight exactly 0.0 in every row, total = the four non-Gram terms"
+      % (len(ng_batches), "bitwise equal" if ng_bitwise else "allclose"))
+
+# --no_gram is locked on --resume both ways, and a checkpoint written before the flag reads as no_gram False
+ng_args_b, ng_args_dir_b = open(os.path.join(NG_B, "args.json")).read(), open(os.path.join(DIR_B, "args.json")).read()
+message = raises(ValueError, go, NG_B, "--resume")
+assert "cannot --resume" in message and "no_gram: checkpoint True, now False" in message, message
+message = raises(ValueError, go, DIR_B, "--resume", "--no_gram")
+assert "cannot --resume" in message and "no_gram: checkpoint False, now True" in message, message
+assert open(os.path.join(NG_B, "args.json")).read() == ng_args_b and open(os.path.join(DIR_B, "args.json")).read() == ng_args_dir_b  # the record is left alone
+assert "no_gram" in ck_b["args"] and "no_gram" in ssl_pretrain.RESUME_MATCH
+ck_b_old = dict(ck_b, args={k: v for k, v in ck_b["args"].items() if k != "no_gram"})  # as written before the flag existed
+assert "no_gram" not in ck_b_old["args"]
+ssl_pretrain.check_resume(ck_b_old, make_args(DIR_B), 1, 6, ck_b["data_fingerprint"])  # reads as no_gram False: a Gram resume passes
+ssl_pretrain.check_resume(ck_b, make_args(DIR_B), 1, 6, ck_b["data_fingerprint"])  # a checkpoint that has the key passes too
+ssl_pretrain.check_resume(ck_ng, make_args(NG_A, "--no_gram"), 1, 6, ck_ng["data_fingerprint"])  # ... a no-Gram one with --no_gram
+assert "no_gram: checkpoint False, now True" in raises(ValueError, ssl_pretrain.check_resume, ck_b_old, make_args(DIR_B, "--no_gram"), 1, 6,
+                                                       ck_b["data_fingerprint"])
+print("OK (s) refusals: --resume without --no_gram into a no-Gram run (checkpoint True, now False) and with it into a Gram run (checkpoint False, now True) "
+      "raise ValueError and leave args.json alone; a checkpoint without the no_gram key reads as False (passes a Gram resume, refuses --no_gram), one with it passes")
+
+# --init_from_checkpoint with --no_gram: student and teacher load, the Gram-teacher load is skipped (--gram_teacher_size is not passed: global 64 -> 128)
+DIR_NGH = os.path.join(TMP, "NGH")
+with spying_on_meta(), gram_code_forbidden():
+    _, text_ngh = go(DIR_NGH, "--no_gram", "--init_from_checkpoint", INIT, "--global_crops_size", "64", "--local_crops_size", "32",
+                     "--warmup_epochs", "0", "--freeze_backbone_epochs", "0", "--epochs", "2", "--stop_after_epochs", "1")
+init_line = next(line for line in text_ngh.splitlines() if line.startswith("initialized from"))
+assert init_line.endswith("teacher (heads included) loaded strictly, no Gram teacher (--no_gram); fresh optimizer, step 0"), init_line
+assert "Gram teacher <- its EMA teacher backbone" not in text_ngh and OFF_LINE in text_ngh.splitlines()
+assert "crops: global 64, local 32 (x8), no Gram teacher (global crops cut at 128 and resized to 64, as in the Gram runs);" in text_ngh
+assert len(ng_inits) == 1 and ng_inits[0]["gram_teacher"] is None and len(ng_batches) == 6
+assert all(torch.equal(ng_inits[0]["student"][k], v) for k, v in src["student"].items()) and set(ng_inits[0]["student"]) == set(src["student"])
+assert all(torch.equal(ng_inits[0]["teacher"][k], v) for k, v in src["teacher"].items()) and set(ng_inits[0]["teacher"]) == set(src["teacher"])  # heads included
+ck_ngh = load_ckpt(DIR_NGH, "epoch_0001.pth")
+assert ck_ngh["gram_teacher"] is None and (ck_ngh["step"], ck_ngh["epoch"], ck_ngh["gram_refreshes"]) == (6, 1, [])
+assert (ck_ngh["args"]["no_gram"], ck_ngh["args"]["init_from_checkpoint"], ck_ngh["args"]["gram_teacher_size"]) == (True, INIT, 128)
+assert any(not torch.equal(ck_ngh["student"][k], v) for k, v in src["student"].items())  # and the student trained
+# the planned use: a Gram run branches from that no-Gram checkpoint; its Gram teacher is the trunk's EMA teacher backbone, as for any init
+DIR_NGG = os.path.join(TMP, "NGG")
+_, text_ngg = go(DIR_NGG, *[os.path.join(DIR_NGH, "ckpt", "epoch_0001.pth") if a == INIT else a for a in HIRES], "--stop_after_epochs", "1")
+assert "teacher (heads included) loaded strictly, Gram teacher <- its EMA teacher backbone; fresh optimizer, step 0" in text_ngg and OFF_LINE not in text_ngg.splitlines()
+ck_ngg = load_ckpt(DIR_NGG, "epoch_0001.pth")
+assert ck_ngg["args"]["no_gram"] is False and ck_ngg["gram_teacher"] is not None
+assert all(torch.equal(ck_ngg["gram_teacher"]["backbone." + k], v) for k, v in backbone_of(ck_ngh["teacher"]).items())  # no refresh: still the trunk's teacher
+assert all(float(row[ng_gram]) > 0 and row[ng_gram_weight] == "2.0" for row in read_csv(DIR_NGG)[1:])  # and the Gram loss is on
+print("OK (s) --no_gram --init_from_checkpoint: a Gram run's full checkpoint loads (student and teacher bitwise, heads included), no Gram teacher is loaded "
+      "('no Gram teacher (--no_gram)' in the initialized line), the new checkpoint's gram_teacher is None; a Gram run initialized from that no-Gram "
+      "checkpoint anchors its Gram teacher to the trunk's EMA teacher and trains with the Gram loss")
+
 # (k) launch scripts ------------------------------------------------------------------------------------------------------------
 scripts = [os.path.join(REPO, "chain", f) for f in ("ssl_common.sh", "pilot_a.sh", "pilot_b.sh", "main.sh", "constlr.sh", "hires.sh")]
 scripts.append(os.path.join(REPO, "run_d1_8s_timing_gaudi.sh"))
 scripts.append(os.path.join(REPO, "run_d1_8hires_gram512_gaudi.sh"))  # the Gram-512 twin's sbatch wrapper; its contents are checked after the hires checks
+scripts.append(os.path.join(REPO, "run_d1_8_constlr_nogram_gaudi.sh"))  # the no-Gram trunk's sbatch wrapper; its contents are checked after the constlr checks
 for script in scripts:
     assert os.access(script, os.X_OK), script
     subprocess.run(["bash", "-n", script], check=True)
-CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "HABANA_VISIBLE_", "HIRES_")) and k != "ARK_ROOT"}
+CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith(("SLURM_", "HABANA_VISIBLE_", "HIRES_", "CONSTLR_")) and k != "ARK_ROOT"}
 ALLOC4 = dict(CLEAN_ENV, SLURM_JOB_GPUS="0,1,2,3")  # the chain's 4-card allocation: ssl_launch counts its entries as Ark's ark_device_count does
 
 
@@ -876,6 +1079,86 @@ result = run_script(root, "chain/constlr.sh")
 boundary = launched(root)
 assert result.returncode == 0 and boundary == constlr_argv("1000"), (result.stderr, boundary)
 assert ssl_pretrain.check_args(ssl_pretrain.parse_args(boundary[boundary.index("ssl_pretrain.py") + 1:])) == 1000
+
+# the no-Gram trunk ("DINO-X ConstLR 224, no Gram"): CONSTLR_NOGRAM=1 (what run_d1_8_constlr_nogram_gaudi.sh sets) makes constlr.sh launch its line with --no_gram in place of
+# --gram_refresh_steps 10000,20000,30000, into its own run dir, with the stop epoch from its own cluster-only file (chain/constlr_stop_after.txt is then not read)
+NOGRAM_ENV, NOGRAM_RUN = dict(ALLOC4, CONSTLR_NOGRAM="1"), "/workspace/ssl_dinov3_cxr_constlr_nogram_seed_100"
+CONSTLR_FILES = {"main_lr.txt": "0.002\n", "constlr_stop_after.txt": "30\n", "constlr_nogram_stop_after.txt": " 100 \n"}  # 30 vs 100: the argv shows which file was read
+
+
+def constlr_run(root, env=ALLOC4, **override):  # write the setting files (None: absent), run constlr.sh; returns (result, argv or None)
+    for name, content in dict(CONSTLR_FILES, **override).items():
+        path = os.path.join(root, "chain", name)
+        if os.path.exists(path):
+            os.remove(path)
+        if content is not None:
+            open(path, "w").write(content)
+    if os.path.exists(os.path.join(root, "argv.txt")):
+        os.remove(os.path.join(root, "argv.txt"))
+    return run_script(root, "chain/constlr.sh", env=env), launched(root)
+
+
+def nogram_argv_for(stop):  # constlr_argv(stop) with the run dir swapped and the Gram refresh list replaced by --no_gram
+    argv = constlr_argv(stop)
+    assert argv[-2:] == ["--gram_refresh_steps", "10000,20000,30000"]
+    return [NOGRAM_RUN if arg == "/workspace/ssl_dinov3_cxr_constlr_seed_100" else arg for arg in argv[:-2]] + ["--no_gram"]
+
+
+root = sandbox()
+result, nogram_argv = constlr_run(root, env=NOGRAM_ENV)  # constlr_nogram_stop_after.txt " 100 ", constlr_stop_after.txt 30 (not read)
+assert result.returncode == 0, result.stderr
+assert nogram_argv == nogram_argv_for("100"), nogram_argv
+assert result.stdout.splitlines() == ["run: ssl_dinov3_cxr_constlr_nogram_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; "
+                                      "stop after epoch 100 from chain/constlr_nogram_stop_after.txt)"] and result.stderr == "", (result.stdout, result.stderr)
+expanded["constlr.sh with CONSTLR_NOGRAM=1"] = "./gaudi.sh " + " ".join(nogram_argv)
+# the same stop epoch in the chain's phase (variable unset, or set but empty): the only differences are the run dir and the tail, and nothing new is printed
+result, default_100 = constlr_run(root, **{"constlr_stop_after.txt": "100\n"})
+assert result.returncode == 0 and default_100 == constlr_argv("100") and (result.stdout, result.stderr) == ("", ""), (result.stderr, default_100)
+assert default_100[-2:] == ["--gram_refresh_steps", "10000,20000,30000"] and nogram_argv[-1:] == ["--no_gram"] and len(nogram_argv) == len(default_100) - 1
+assert [(a, b) for a, b in zip(default_100[:-2], nogram_argv[:-1]) if a != b] == [("/workspace/ssl_dinov3_cxr_constlr_seed_100", NOGRAM_RUN)], (default_100, nogram_argv)
+result, empty_argv = constlr_run(root, env=dict(ALLOC4, CONSTLR_NOGRAM=""), **{"constlr_stop_after.txt": "100\n"})
+assert result.returncode == 0 and empty_argv == default_100 and (result.stdout, result.stderr) == ("", ""), (result.stderr, empty_argv)
+# a missing or invalid no-Gram stop file is refused naming itself (not constlr_stop_after.txt, which stays valid) before gaudi.sh is reached, and before any run: line
+for stop in (None, "", "0", "2.5", "thirty", "-3", "1001", "18446744073709551617"):  # None: absent; 1001: one past the ceiling; 2**64 + 1: bash arithmetic would read it as 1
+    result, refused_argv = constlr_run(root, env=NOGRAM_ENV, **{"constlr_nogram_stop_after.txt": stop})
+    assert result.returncode == 1 and "ERROR" in result.stderr and "constlr_nogram_stop_after.txt" in result.stderr and refused_argv is None, (stop, result.stderr)
+    assert "constlr_stop_after.txt" not in result.stderr and result.stdout == "", (stop, result.stderr, result.stdout)
+assert "ceiling of 1000" in result.stderr, result.stderr  # the last one is refused for being above the ceiling, and the message names it
+# the two stop files are independent: the no-Gram run does not need the phase's, and the phase does not take the no-Gram file instead of its own
+result, solo_argv = constlr_run(root, env=NOGRAM_ENV, **{"constlr_stop_after.txt": None})
+assert result.returncode == 0 and solo_argv == nogram_argv, (result.stderr, solo_argv)
+result, refused_argv = constlr_run(root, **{"constlr_stop_after.txt": None})
+assert result.returncode == 1 and "ERROR" in result.stderr and "constlr_stop_after.txt" in result.stderr and "nogram" not in result.stderr and refused_argv is None, result.stderr
+# any other CONSTLR_NOGRAM is refused naming itself, before anything is read (the bare sandbox has no setting file to miss) and so before anything is launched (the other has them all)
+bare = sandbox()
+for value in ("0", "yes", "2", " 1"):
+    expected_error = "ERROR: CONSTLR_NOGRAM holds '%s', which is not empty or 1\n" % value
+    result, refused_argv = constlr_run(root, env=dict(ALLOC4, CONSTLR_NOGRAM=value))
+    assert result.returncode == 1 and result.stderr == expected_error and result.stdout == "" and refused_argv is None, (value, result.stderr)
+    result = run_script(bare, "chain/constlr.sh", env=dict(ALLOC4, CONSTLR_NOGRAM=value))
+    assert result.returncode == 1 and result.stderr == expected_error and result.stdout == "" and launched(bare) is None, (value, result.stderr)
+# the trainer reads the no-Gram argv as the run means it: stop after epoch 100 of the 1000-epoch ceiling, no Gram teacher at all (weight 0, no refreshes, the size left at the
+# 2 x global default), and every other setting --resume locks the same as constlr.sh's argv gives it (world_size is the trainer's, not an arg)
+nogram_parsed = ssl_pretrain.parse_args(nogram_argv[nogram_argv.index("ssl_pretrain.py") + 1:])
+default_parsed = ssl_pretrain.parse_args(default_100[default_100.index("ssl_pretrain.py") + 1:])
+assert ssl_pretrain.check_args(nogram_parsed) == 100 and nogram_parsed.epochs == 1000
+assert (nogram_parsed.no_gram, nogram_parsed.gram_weight, nogram_parsed.gram_refresh_steps, nogram_parsed.gram_teacher_size) == (True, 0.0, [], 448)
+assert (default_parsed.no_gram, default_parsed.gram_weight, default_parsed.gram_refresh_steps) == (False, 2.0, [10000, 20000, 30000])
+assert "no_gram" in ssl_pretrain.RESUME_MATCH and "stop_after_epochs" not in ssl_pretrain.RESUME_MATCH  # --resume locks the Gram switch, not where a run stops
+locked_alike = set(ssl_pretrain.RESUME_MATCH) - {"no_gram", "gram_weight", "gram_refresh_steps", "world_size"}
+assert all(getattr(nogram_parsed, k) == getattr(default_parsed, k) for k in locked_alike), \
+    {k: (getattr(nogram_parsed, k), getattr(default_parsed, k)) for k in locked_alike if getattr(nogram_parsed, k) != getattr(default_parsed, k)}
+assert nogram_parsed.pretrained_weights == default_parsed.pretrained_weights and nogram_parsed.stop_after_epochs == default_parsed.stop_after_epochs == 100
+assert nogram_parsed.output_dir == NOGRAM_RUN != default_parsed.output_dir
+# the wrapper: bash -n and the executable bit are checked with the other scripts above; here its sbatch header, its guards and its last line
+nogram_lines = open(os.path.join(REPO, "run_d1_8_constlr_nogram_gaudi.sh")).read().splitlines()
+assert [line[len("#SBATCH "):] for line in nogram_lines if line.startswith("#SBATCH ")] == [
+    "--job-name=d1-8-nogram", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"], nogram_lines
+nogram_code = [line for line in nogram_lines if line and not line.startswith("#")]
+assert nogram_code[-1] == "CONSTLR_NOGRAM=1 exec ./chain/constlr.sh", nogram_code
+for needle in ("export PT_HPU_LAZY_MODE=1", "CONSTLR_NOGRAM=1", "exec ./chain/constlr.sh", "./gaudi_check_cards.sh || exit 1", "[[ -x ./gaudi_verify_busy.sh ]]", "./gaudi_verify_busy.sh 900 &"):
+    assert any(needle in line for line in nogram_code), needle  # in a command, not only in a comment
+assert all(line.startswith("#") for line in nogram_lines if "phases.txt" in line), nogram_lines  # not a chain phase: phases.txt is named in comments only
 
 # hires.sh ("DINO-X ConstLR 512 px"): a separate run from the stock weights, constlr.sh with only the crops and the batch changed. Four setting files,
 # each missing or invalid one refused naming it before gaudi.sh is reached (the LR file is constlr's own main_lr.txt)
@@ -1032,7 +1315,10 @@ print("OK (k) scripts: bash -n passes and all are executable; pilot A/B, main (n
       "missing or invalid setting file (the batch and Gram files included) and a stop epoch above the 1000 ceiling before launching; with HIRES_GRAM=512 "
       "HIRES_RUN_SUFFIX=_gram512 (the Gram-512 twin) only the Gram size and the run dir change, the file's Gram is ignored, and a bad override (Gram not x16 / outside "
       "512..1024 / not a number, a suffix without _ / uppercase / with a space) is refused naming itself; run_d1_8hires_gram512_gaudi.sh: 4 cards, ends in "
-      "HIRES_GRAM=512 HIRES_RUN_SUFFIX=_gram512 exec ./chain/hires.sh, names phases.txt only in comments")
+      "HIRES_GRAM=512 HIRES_RUN_SUFFIX=_gram512 exec ./chain/hires.sh, names phases.txt only in comments; constlr.sh with CONSTLR_NOGRAM=1 (the no-Gram trunk; "
+      "run_d1_8_constlr_nogram_gaudi.sh: 4 cards, ends in CONSTLR_NOGRAM=1 exec ./chain/constlr.sh) launches its line with --no_gram in place of the Gram refreshes, into its own run dir "
+      "and with the stop epoch from constlr_nogram_stop_after.txt only; a bad stop file or CONSTLR_NOGRAM is refused before launching; the argv parses to no_gram with "
+      "every other locked setting = constlr's")
 
 # (l) data paths: our list parsing == Ark's dataset classes on the real lists -----------------------------------------------------------
 try:
