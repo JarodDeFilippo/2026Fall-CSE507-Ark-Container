@@ -27,8 +27,10 @@
 # the trunk's args.json (the trainer writes it there; never assumed), so every resubmit passes the same list, which --resume locks. Refused before anything is launched:
 # CONSTLR_NOGRAM set as well (the branch's line replaces --no_gram itself); any of the four empty or invalid once one is set (K and STOP positive integers without a
 # leading zero, which printf %04d would read as octal; EVERY at most 9 digits, COUNT at most 4); STOP above the ceiling or not after K; a trunk args.json without a
-# positive epoch_length; and a missing source checkpoint while the branch dir has no epoch checkpoint of its own yet (once it has one, the trainer resumes from it and
-# never reads the source again, so the trunk may have pruned it). `run:` and `gram refresh steps:` lines are printed before the launch.
+# positive epoch_length; a last refresh (K x epoch_length + COUNT x EVERY) past the end of the 1000-epoch schedule (1000 x epoch_length), which could never run even with the
+# branch extended to the ceiling (a last refresh exactly on that step is accepted); and a missing source checkpoint while the branch dir has no epoch checkpoint of its own
+# yet (a regular file named epoch_<digits>.pth, the names the trainer's epoch_checkpoints() takes; once it has one, the trainer resumes from it and never reads the source again, so the
+# trunk may have pruned it). `run:` and `gram refresh steps:` lines are printed before the launch.
 set -euo pipefail
 NOGRAM=${CONSTLR_NOGRAM:-}  # first, before anything is read or launched
 [[ -z $NOGRAM || $NOGRAM == 1 ]] || { echo "ERROR: CONSTLR_NOGRAM holds '$NOGRAM', which is not empty or 1" >&2; exit 1; }
@@ -70,13 +72,19 @@ if [[ -n $BRANCH ]]; then
   EK=$(printf %04d "$K")
   SOURCE=$TRUNK/ckpt/epoch_$EK.pth
   RUN=${TRUNK%_seed_100}_e${EK}_gram_every${EVERY}x${COUNT}_seed_100
-  # the branch's own epoch checkpoints: once there is one, the trainer resumes from it and never reads the source again
-  OWN=$(compgen -G "$RUN/ckpt/epoch_*.pth" || true)
+  # the branch's own epoch checkpoints: once there is one, the trainer resumes from it and never reads the source again. The name test is the trainer's epoch_checkpoints():
+  # epoch_<digits>.pth (epoch_backup.pth, epoch_0011.pth.tmp and maxsteps_*.pth do not count), and it must be a regular file, not a directory of that name
+  OWN=
+  for f in "$RUN"/ckpt/epoch_*.pth; do [[ -f $f && ${f##*/} =~ ^epoch_[0-9]+\.pth$ ]] && OWN=$f; done
   [[ -n $OWN || -f $SOURCE ]] || { echo "ERROR: $SOURCE not found and $RUN has no epoch checkpoint of its own yet: nothing to branch from (the trunk keeps every 10th epoch and its last 3)" >&2; exit 1; }
   BRANCH_STEP=$(( K * EPOCH_LENGTH ))
   STEPS=()
   for (( i = 1; i <= COUNT; i++ )); do STEPS+=("$(( BRANCH_STEP + i * EVERY ))"); done
   REFRESH=$(IFS=,; echo "${STEPS[*]}")
+  # a refresh after the last step of the --epochs schedule (EPOCHS x EPOCH_LENGTH) could never run, even with the branch extended to the ceiling; equal to it is fine. The digit caps keep every product below 2^63
+  LAST=${STEPS[COUNT - 1]}
+  END=$(( EPOCHS * EPOCH_LENGTH ))
+  (( LAST <= END )) || { echo "ERROR: the last Gram refresh, after step $LAST, is past the end of the $EPOCHS-epoch schedule (step $END): it could never run; lower EVERY (CONSTLR_BRANCH_EVERY) or COUNT (CONSTLR_BRANCH_COUNT)" >&2; exit 1; }
   GRAM_ARGS=(--branch_from "/workspace/$SOURCE" --gram_refresh_steps "$REFRESH")
   echo "run: $RUN (Gram-anchored branch of $TRUNK from its epoch $K: --branch_from /workspace/$SOURCE --gram_refresh_steps in place of --no_gram; stop after epoch $STOP_AFTER)"
   echo "gram refresh steps: $REFRESH (branch step $BRANCH_STEP = epoch $K x epoch_length $EPOCH_LENGTH from $TRUNK_ARGS, then every $EVERY steps, $COUNT times)"

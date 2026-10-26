@@ -1444,10 +1444,14 @@ assert "gram refresh steps: 36650,46650,56650 (branch step 26650 = epoch 10 x ep
 open(os.path.join(branch_dir, BRANCH_TRUNK, "ckpt", "epoch_0007.pth"), "w").close()
 bres, bargv7 = branch_run(branch_dir, "7", "12", "500", "2")
 assert bres.returncode == 0 and bargv7 == branch_argv_for("12", "ssl_dinov3_cxr_constlr_nogram_e0007_gram_every500x2_seed_100", NOGRAM_RUN + "/ckpt/epoch_0007.pth", "19162,19662"), (bres.stderr, bargv7)
-# the limits themselves launch: STOP at the 1000 ceiling, EVERY of 9 digits, COUNT of 4 (one more digit of either is refused below)
-steps_max = ",".join(str(26660 + 999999999 * i) for i in range(1, 1001))
-bres, bargv_max = branch_run(branch_dir, "10", "1000", "999999999", "1000")
-assert bres.returncode == 0 and bargv_max == branch_argv_for("1000", "ssl_dinov3_cxr_constlr_nogram_e0010_gram_every999999999x1000_seed_100", BRANCH_SRC10, steps_max), (bres.stderr, bargv_max and bargv_max[-4:])
+# the limits themselves launch: STOP at the 1000 ceiling, EVERY of 9 digits, COUNT of 4 (one more digit of either is refused below). Not in one launch: the last refresh must stay inside the 1000-epoch schedule (checked below),
+# which 999999999 x 1000 cannot. EVERY of 9 digits gets the largest epoch_length (also 9 digits) for its one refresh, after the branch step 10 x 999999999; COUNT of 4 digits gets a small EVERY
+steps_max = str(10 * 999999999 + 999999999)
+bres, bargv_max = branch_run(branch_root(epoch_length=999999999), "10", "1000", "999999999", "1")
+assert bres.returncode == 0 and bargv_max == branch_argv_for("1000", "ssl_dinov3_cxr_constlr_nogram_e0010_gram_every999999999x1_seed_100", BRANCH_SRC10, steps_max), (bres.stderr, bargv_max and bargv_max[-4:])
+steps_count = ",".join(str(26660 + i) for i in range(1, 10000))
+bres, bargv_count = branch_run(branch_dir, "10", "40", "1", "9999")
+assert bres.returncode == 0 and bargv_count == branch_argv_for("40", "ssl_dinov3_cxr_constlr_nogram_e0010_gram_every1x9999_seed_100", BRANCH_SRC10, steps_count), (bres.stderr, bargv_count and bargv_count[-4:])
 # the trainer reads the branch argv as meant: --branch_from the source, the absolute refresh list (all after the branch step), the Gram teacher ON at the trainer's weight 2.0 and teacher 448, stop after
 # epoch 40 of the 1000-epoch ceiling, and every other setting --resume locks (the Gram ones, branch_from and the trainer's world_size aside) the same as the trunk's argv gives it
 bparsed = ssl_pretrain.parse_args(bargv[bargv.index("ssl_pretrain.py") + 1:])
@@ -1477,6 +1481,15 @@ for value in ("0", "abc", "1234567890"):  # the last has 10 digits
     branch_refused(branch_dir, ("10", "40", value), "EVERY (CONSTLR_BRANCH_EVERY)")
 for value in ("0", "12345", "x"):
     branch_refused(branch_dir, ("10", "40", "10000", value), "COUNT (CONSTLR_BRANCH_COUNT)")
+# the last refresh, K x epoch_length + COUNT x EVERY, is at most 1000 x epoch_length (the last step of the --epochs 1000 schedule); a later one could never run, even with the branch extended to the ceiling.
+# `10 40 2666 990` ends exactly on it (26660 + 990 x 2666 = 2666000) and launches; one refresh more, or one 9-digit EVERY, passes it: refused naming both steps, before anything is printed
+steps_end = ",".join(str(26660 + 2666 * i) for i in range(1, 991))
+assert steps_end.endswith(",2666000")
+bres, bargv_end = branch_run(branch_dir, "10", "40", "2666", "990")
+assert bres.returncode == 0 and bres.stderr == "" and bargv_end == branch_argv_for("40", "ssl_dinov3_cxr_constlr_nogram_e0010_gram_every2666x990_seed_100", BRANCH_SRC10, steps_end), (bres.stderr, bargv_end and bargv_end[-4:])
+branch_refused(branch_dir, ("10", "40", "2666", "991"), "past the end", "after step 2668666", "(step 2666000)")  # 26660 + 991 x 2666
+branch_refused(branch_dir, ("10", "40", "999999999", "1"), "past the end", "after step 1000026659", "(step 2666000)")  # 26660 + 999999999
+branch_refused(branch_root(epoch_length=2665), ("10", "40", "2666", "990"), "past the end", "(step 2665000)")  # the end is 1000 x the trunk's own epoch_length, not an assumed 2666
 # no source: refused on a first start, naming it (the K the trunk never kept as well); once the branch has an epoch checkpoint of its own a resume needs no source
 nosrc_dir = branch_root(source=False)
 branch_refused(nosrc_dir, ("10", "40"), BRANCH_TRUNK + "/ckpt/epoch_0010.pth", "nothing to branch from")
@@ -1485,7 +1498,11 @@ own_ckpt = os.path.join(nosrc_dir, BRANCH_E10, "ckpt")
 os.makedirs(own_ckpt)
 for name in ("epoch_0011.pth.tmp", "maxsteps_0000003.pth"):  # not epoch checkpoints (the trainer resumes from epoch_<digits>.pth only)
     open(os.path.join(own_ckpt, name), "w").close()
+open(os.path.join(own_ckpt, "epoch_backup.pth"), "w").close()  # matches the glob epoch_*.pth, but is no epoch_<digits>.pth
+os.mkdir(os.path.join(own_ckpt, "epoch_0011.pth"))  # nor is a directory of that name
 branch_refused(nosrc_dir, ("10", "40"), BRANCH_TRUNK + "/ckpt/epoch_0010.pth")
+os.rmdir(os.path.join(own_ckpt, "epoch_0011.pth"))
+# a real one, which the glob lists before epoch_backup.pth: the loop's last iteration fails its test and constlr.sh must still go on under set -e
 open(os.path.join(own_ckpt, "epoch_0011.pth"), "w").close()
 bres, bargv_resume = branch_run(nosrc_dir, "10", "40")
 assert bres.returncode == 0 and bres.stderr == "" and bargv_resume == bargv, (bres.stderr, bargv_resume)
@@ -1533,6 +1550,9 @@ print("OK (k) branch launcher: run_d1_8_branch_gram_gaudi.sh (mode 755, 4 cards,
       "CONSTLR_BRANCH_COUNT=${4:-3} exec ./chain/constlr.sh, names phases.txt only in comments) makes constlr.sh launch the no-Gram trunk's line with only --no_gram replaced by --branch_from "
       "<trunk>/ckpt/epoch_<K>.pth --gram_refresh_steps <list> and no stop file read: `10 40` -> " + BRANCH_E10 + " refreshing after 36660,46660,56660 (10 x the epoch_length 2666 read from the "
       "trunk's args.json, 36650,... at 2665, then every 10000 steps, 3 times), `10 40 2666 30` -> ..._every2666x30_ (one refresh per epoch for 30 epochs), `7 12 500 2` -> ..._e0007_ 19162,19662; "
+      "a refresh list must end inside the 1000-epoch schedule, whose last step is 1000 x the trunk's own epoch_length: `10 40 2666 990` (26660 + 990 x 2666 = 1000 x 2666) launches, 991 refreshes or a "
+      "9-digit EVERY pass it and are refused; a branch's own epoch checkpoint is a regular file named epoch_<digits>.pth, the trainer's names (epoch_backup.pth, *.tmp, maxsteps_*.pth and a directory of "
+      "that name leave a missing source refused); "
       "the argv parses to branch_from the source, Gram ON (2.0, 448), stop 40 of 1000, every other locked setting = the trunk's; refused before launching: a wrong argument count (before the "
       "card check), K / STOP / EVERY / COUNT that are not positive integers (no leading zero; EVERY at most 9 digits, COUNT 4, both accepted at the limit), STOP above the 1000 ceiling "
       "(accepted at 1000) or not after K, a trunk args.json without a positive epoch_length, CONSTLR_NOGRAM set as well, one of the four variables alone or emptied, and a missing source "
