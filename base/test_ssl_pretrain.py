@@ -937,8 +937,14 @@ for extra, flags in ((["--no_gram"], ("--branch_from", "--no_gram")),
         raises(SystemExit, PB, *extra)
     complaint = err.getvalue().split("error: ", 1)[1]
     assert all(flag in complaint for flag in flags), (extra, err.getvalue())
+for flag, extra in (("--branch_from", ["--gram_refresh_steps", "5"]), ("--init_from_checkpoint", [])):  # an empty source path is never a silent no-op, with or without --pretrained_weights
+    for weights in ([], ["--pretrained_weights", "w"]):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            assert raises(SystemExit, ssl_pretrain.parse_args, ["--data_set", "MIMIC", "--output_dir", "o", flag, ""] + extra + weights) == "2"
+        assert f"{flag} is empty" in err.getvalue().split("error: ", 1)[1], (flag, weights, err.getvalue())
 print("OK (t) parse: no --branch_from -> None (read as None in an old checkpoint, locked on --resume); --branch_from alone (with --gram_refresh_steps 5 or none) needs no "
-      "--pretrained_weights and keeps gram_weight 2.0, Gram size 448; --no_gram, --init_from_checkpoint, or no --gram_refresh_steps with it exits 2 naming both flags")
+      "--pretrained_weights and keeps gram_weight 2.0, Gram size 448; --no_gram, --init_from_checkpoint, or no --gram_refresh_steps with it exits 2 naming both flags; "
+      "an empty --branch_from / --init_from_checkpoint exits 2")
 
 
 def same_state(a, b):  # bitwise: tensors torch.equal (and the same dtype), arrays array_equal, containers recursively, the rest ==
