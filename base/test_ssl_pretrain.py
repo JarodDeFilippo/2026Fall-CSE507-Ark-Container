@@ -1597,6 +1597,136 @@ finally:
 assert gathers == [] and "rng_per_rank" not in load_ckpt(os.path.join(TMP, "V_SINGLE"), "epoch_0001.pth") and "rng_per_rank" not in ck2
 print("OK (v) one process: its checkpoints carry no rng_per_rank and its run gathers nothing, so a one-process run saves, resumes and branches exactly as before (rng is the one state)")
 
+# (w) DDP find_unused_parameters: False for the SSL student (all of its parameters get a gradient every step), True by default (Ark+ fine-tuning) -----------------------------------------------------
+# run() wraps backbone, dino_head and ibot_head each in DDP with find_unused_parameters=False; Accelerator.wrap_model without the keyword keeps True. A one-process run builds no DDP (what (g), (s), (t),
+# (u), (v) run on), so (a) checks the premise itself, a grad on every parameter after each backward, and (b), (c) the wrappers on two real ranks (gloo on this CPU, as (v)).
+w_steps = []
+
+
+def w_forward_backward(self, data, *, teacher_temp):  # per student parameter: (its grad was None before the backward, requires_grad, it has a grad after it); run() sets the grads to None before every step
+    fresh = {name: p.grad is None for name, p in self.student.named_parameters()}
+    result = real_forward_backward(self, data, teacher_temp=teacher_temp)
+    w_steps.append({name: (fresh[name], p.requires_grad, p.grad is not None) for name, p in self.student.named_parameters()})
+    return result
+
+
+# (a) 2 epochs of 6 steps: in epoch 0 the backbone and the heads' last layer are at LR 0 ((h): they do not move, and stay requires_grad), in epoch 1 they train. The 4 settings are the 4 kinds of run the chain
+# launches: the constlr phase and its Gram branches (Gram; recipe off / on), the no-Gram trunk (no Gram, recipe) and the plain trunk (no Gram, no recipe)
+W_SETTINGS = (("recipe off, Gram", ()), ("recipe on, Gram", RECIPE), ("recipe off, no Gram", ("--no_gram",)), ("recipe on, no Gram", (*RECIPE, "--no_gram")))
+w_counts = set()
+for w_i, (w_setting, w_extra) in enumerate(W_SETTINGS):
+    w_steps.clear()
+    SSLMetaArch.forward_backward = w_forward_backward
+    try:
+        summary_w, _ = go(os.path.join(TMP, "W_ONE%d" % w_i), "--stop_after_epochs", "2", *w_extra)
+    finally:
+        SSLMetaArch.forward_backward = real_forward_backward
+    w_names = set(w_steps[0])
+    assert len(w_steps) == 2 * summary_w["epoch_length"] == 12 and all(set(step) == w_names for step in w_steps), w_setting
+    assert all(fresh and trainable and has_grad for step in w_steps for fresh, trainable, has_grad in step.values()), w_setting  # grads start from None, none is frozen, none is missing afterwards
+    assert {n.split(".")[0] for n in w_names} == {"backbone", "dino_head", "ibot_head"}, w_setting
+    assert {"backbone.mask_token", "backbone.storage_tokens", "dino_head.last_layer.weight", "ibot_head.last_layer.weight"} <= w_names, w_setting
+    assert ("backbone.local_cls_norm.weight" in w_names) == ("--untie_local_cls_norm" in w_extra), w_setting
+    w_counts.add(len(w_names))
+assert len(w_counts) == 2  # the untied CLS norm adds its weight and bias
+print("OK (w) one process, 4 settings (recipe off / on x Gram / --no_gram): all %d student parameters (%d with --untie_local_cls_norm: backbone incl. mask_token, storage_tokens and local_cls_norm; both heads "
+      "incl. last_layer) are trainable and have a grad after each of the 12 backwards, in epoch 0 (backbone and last layer at LR 0) and in epoch 1, every grad starting from None" % (min(w_counts), max(w_counts)))
+
+# (b), (c) two real processes (gloo on this CPU, loopback rendezvous), the driver written like (v)'s: mode "run" is run() with the tiny ViT and notes the student's DDP modules, mode "wrap" calls
+# Accelerator.wrap_model directly on a module with a parameter in no forward (as Ark+'s inactive dataset heads are in a step)
+W_DRIVER, W_DRIVER_SOURCE = os.path.join(TMP, "w_driver.py"), '''# one rank of a real two-process (gloo, CPU) job, written by test_ssl_pretrain.py (w); argv: base dir, spec json
+import argparse, json, os, sys
+import torch
+import torch.distributed as dist
+
+base, spec = sys.argv[1], json.load(open(sys.argv[2]))
+sys.path.insert(0, base)
+os.chdir(base)
+import ssl_pretrain
+from accelerator import Accelerator
+from ssl_dinov3.meta import SSLMetaArch
+
+found = {}
+flag = lambda ddp: int(ddp._get_ddp_logging_data()["find_unused_parameters"])  # held as 1 / 0
+
+
+class Net(torch.nn.Module):  # `unused` is in no forward
+    def __init__(self):
+        super().__init__()
+        self.used, self.unused = torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)
+
+    def forward(self, x):
+        return self.used(x)
+
+
+if spec["mode"] == "run":
+    real_init = SSLMetaArch.__init__
+
+    def init(self, student, *args, **kwargs):  # the student's DDP modules as run() hands them over
+        found["student"] = {name: flag(module) for name, module in student.items()}
+        return real_init(self, student, *args, **kwargs)
+
+    SSLMetaArch.__init__ = init
+    ssl_pretrain.run(argparse.Namespace(**spec["args"]), spec["vit"], spec["heads"], spec["cfg"])
+else:
+    accelerator = Accelerator("cpu")
+    accelerator.initialize_distributed()
+    for name, kwargs in (("default", {}), ("true", dict(find_unused_parameters=True)), ("false", dict(find_unused_parameters=False))):  # the one that raises last
+        ddp, error = accelerator.wrap_model(Net(), **kwargs), None
+        try:
+            for _ in range(3):
+                ddp(torch.randn(2, 4)).sum().backward()
+        except RuntimeError as exc:
+            error = str(exc).split(".")[0]
+        found[name] = [flag(ddp), error]
+with open(os.path.join(spec["dump"], "found_rank%s.json" % os.environ["RANK"]), "w") as f:
+    json.dump(found, f)
+dist.destroy_process_group()
+'''
+with open(W_DRIVER, "w") as f:
+    f.write(W_DRIVER_SOURCE)
+
+
+def w_two_ranks(tag, **spec):  # the driver on two real ranks, spec = what it is told; returns what each rank found and both ranks' output
+    dump = os.path.join(TMP, "w_dump_" + tag)
+    os.makedirs(dump)
+    spec_path = os.path.join(TMP, "w_spec_%s.json" % tag)
+    with open(spec_path, "w") as f:
+        json.dump(dict(spec, dump=dump), f)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        env = dict(os.environ, WORLD_SIZE="2", MASTER_ADDR="127.0.0.1", MASTER_PORT=str(s.getsockname()[1]))
+    procs = [subprocess.Popen([sys.executable, W_DRIVER, BASE, spec_path], env=dict(env, RANK=str(r), LOCAL_RANK=str(r)), stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True) for r in range(2)]
+    try:
+        outputs = [p.communicate(timeout=120)[0] for p in procs]
+    finally:
+        for p in procs:
+            p.kill()  # a rank stuck in a collective must not outlive the test
+            p.wait()
+    assert [p.returncode for p in procs] == [0, 0], outputs
+    return [json.load(open(os.path.join(dump, "found_rank%d.json" % r))) for r in range(2)], outputs
+
+
+# (b) the no-Gram trunk's run (recipe on): 2 epochs of 3 steps on 2 ranks, to completion; the student's three DDP modules report find_unused_parameters False on both ranks; the losses are finite
+W_OUT = os.path.join(TMP, "W_TWO")
+w_found, _ = w_two_ranks("run", mode="run", args=vars(make_args(W_OUT, "--no_gram", *RECIPE, "--stop_after_epochs", "2")), vit=TINY_VIT, heads=TINY_HEADS, cfg=CFG)
+assert w_found == [dict(student=dict(backbone=0, dino_head=0, ibot_head=0))] * 2, w_found
+ck_w, w_rows = load_ckpt(W_OUT, "epoch_0002.pth"), read_csv(W_OUT)
+assert (ck_w["step"], ck_w["epoch"], ck_w["world_size"]) == (6, 2, 2)  # past the second step, where an unused parameter would have raised
+assert len(w_rows) > 3 and all(math.isfinite(float(x)) for row in w_rows[1:] for x in row[2:8])  # dino_global .. total: global means over the 2 ranks
+print("OK (w) two real ranks, --no_gram + recipe: the student's backbone, dino_head and ibot_head DDP modules report find_unused_parameters False on both ranks, and the run goes through its 6 steps (epoch 0 with the "
+      "backbone at LR 0, epoch 1) to a step-6 epoch-2 checkpoint with finite losses (%d CSV rows)" % (len(w_rows) - 1))
+
+# (c) Accelerator.wrap_model: without the keyword it is True (Ark+ fine-tuning, which never passes it: test_freeze_backbone.py (d2)), as with True; the module with a parameter in no forward trains 3 steps with
+# those and raises at the second forward with False, so "False" is only for a model like the student
+w_wrapped, _ = w_two_ranks("wrap", mode="wrap")
+for w_rank in w_wrapped:
+    assert w_rank["default"] == w_rank["true"] == [1, None], w_rank
+    assert w_rank["false"][0] == 0 and "Expected to have finished reduction in the prior iteration" in w_rank["false"][1], w_rank
+print("OK (w) two real ranks, Accelerator.wrap_model: called without the keyword it reports find_unused_parameters True (as with True) and trains a module with a parameter in no forward for 3 steps; with False it "
+      "reports False and that module raises '%s' at its second forward, on both ranks" % w_wrapped[0]["false"][1])
+
 # (k) launch scripts ------------------------------------------------------------------------------------------------------------
 scripts = [os.path.join(REPO, "chain", f) for f in ("ssl_common.sh", "pilot_a.sh", "pilot_b.sh", "main.sh", "constlr.sh", "hires.sh")]
 scripts.append(os.path.join(REPO, "run_d1_8s_timing_gaudi.sh"))
