@@ -1122,6 +1122,265 @@ print("OK (t) refusals: a missing source (FileNotFoundError), an export/teacher_
       "a refresh step at (6) or before (3) the branch step, and a stop epoch not after the source's: each ValueError (or FileNotFoundError) names its cause and leaves the "
       "output dir uncreated")
 
+# (u) DINOv3 recipe: --drop_path_rate, --rope_rescale_coords, --untie_local_cls_norm (the student's; train mode only) ------------------------------------------
+from dinov3.models.vision_transformer import DinoVisionTransformer
+from ssl_dinov3.model import build_backbone
+
+RECIPE = ["--drop_path_rate", "0.3", "--rope_rescale_coords", "2", "--untie_local_cls_norm"]  # what chain/constlr.sh passes the no-Gram trunk and its branches
+RECIPE_KEYS = ("drop_path_rate", "rope_rescale_coords", "untie_local_cls_norm")
+RECIPE_ON = dict(drop_path_rate=0.3, pos_embed_rope_rescale_coords=2.0, untie_global_and_local_cls_norm=True)  # the kwargs run() adds to the student's for RECIPE
+CLS_NORM_KEYS = {"local_cls_norm.weight", "local_cls_norm.bias"}
+
+# parse: the defaults are the behaviour before the flags existed (and what an old checkpoint reads as); locked on --resume; a branch must match its source on them
+assert tuple(getattr(P(), k) for k in RECIPE_KEYS) == (0.0, None, False) == tuple(ssl_pretrain.ARG_DEFAULTS[k] for k in RECIPE_KEYS)
+assert set(RECIPE_KEYS) <= set(ssl_pretrain.RESUME_MATCH) and not set(RECIPE_KEYS) & set(ssl_pretrain.BRANCH_FREE)
+assert tuple(getattr(P(*RECIPE), k) for k in RECIPE_KEYS) == (0.3, 2.0, True)
+assert P("--rope_rescale_coords", " None ").rope_rescale_coords is None and P("--rope_rescale_coords", "1.5").rope_rescale_coords == 1.5
+for extra in (["--drop_path_rate", "-0.1"], ["--drop_path_rate", "1"], ["--drop_path_rate", "nan"], ["--rope_rescale_coords", "1"], ["--rope_rescale_coords", "0.5"],
+              ["--rope_rescale_coords", "-2"], ["--rope_rescale_coords", "inf"], ["--rope_rescale_coords", "nan"], ["--rope_rescale_coords", "two"]):
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        raises(SystemExit, P, *extra)
+    assert extra[0] in err.getvalue().split("error: ", 1)[1], (extra, err.getvalue())
+print("OK (u) parse: defaults drop path 0.0, rescale None, tied (= ARG_DEFAULTS, what a checkpoint without the keys reads as); RECIPE -> 0.3, 2.0, True; the three are "
+      "--resume-locked and not branch-free; a drop path outside [0, 1) or NaN, a rescale <= 1, inf, NaN or a word exits 2 naming the flag")
+
+# models: run() hands build_models the student's kwargs plus the recipe; at the defaults that builds bitwise what the kwargs alone built, drawing the same RNG
+plain = ng_seeded(build_models, TINY_VIT, None, TINY_HEADS), torch.get_rng_state()
+dflt = ng_seeded(build_models, dict(TINY_VIT, drop_path_rate=0.0, pos_embed_rope_rescale_coords=None, untie_global_and_local_cls_norm=False), None, TINY_HEADS), torch.get_rng_state()
+for a, b in zip(plain[0], dflt[0]):
+    assert list(a.state_dict()) == list(b.state_dict()) and all(torch.equal(v, b.state_dict()[k]) for k, v in a.state_dict().items())
+assert torch.equal(plain[1], dflt[1])
+recipe_seen = []
+
+
+def recipe_meta_init(self, student, teacher, gram_teacher, **kwargs):  # (local_cls_norm built?, drop path rates, RoPE rescale) of each backbone run() hands over
+    recipe_seen.append([(m.backbone.local_cls_norm is not None, {blk.sample_drop_ratio for blk in m.backbone.blocks}, m.backbone.rope_embed.rescale_coords)
+                        for m in (student, teacher, gram_teacher) if m is not None])
+    return real_meta_init(self, student, teacher, gram_teacher, **kwargs)
+
+
+SSLMetaArch.__init__ = recipe_meta_init
+try:
+    _, text_u0 = go(os.path.join(TMP, "U0"), "--max_steps", "1")
+    _, text_u0r = go(os.path.join(TMP, "U0R"), *RECIPE, "--max_steps", "1")
+finally:
+    SSLMetaArch.__init__ = real_meta_init
+assert recipe_seen == [[(False, {0.0}, None)] * 3, [(True, {0.3}, 2.0)] * 3], recipe_seen  # student, EMA teacher, Gram teacher: all off / all on
+assert "recipe (" not in text_u0 and "local_cls_norm" not in text_u0  # the defaults print nothing new
+assert "recipe (student, train mode only; the EMA / Gram teachers run in eval): drop path 0.3, RoPE coordinate rescale 2, local-crop CLS norm untied" in text_u0r.splitlines(), text_u0r
+assert json.load(open(os.path.join(DIR_A, "args.json")))["drop_path_rate"] == 0.0 and json.load(open(os.path.join(DIR_A, "args.json")))["untie_local_cls_norm"] is False
+info_u0r = json.load(open(os.path.join(TMP, "U0R", "args.json")))
+assert tuple(info_u0r[k] for k in RECIPE_KEYS) == (0.3, 2.0, True) and ck2["args"]["rope_rescale_coords"] is None
+print("OK (u) models: the default recipe kwargs build bitwise the models the plain kwargs build (same keys, values and RNG state after); through run() the defaults give "
+      "student, EMA teacher and Gram teacher local_cls_norm None, drop path 0, rescale None, and RECIPE gives all three local_cls_norm, 0.3, 2.0 and prints one recipe line; "
+      "args.json records the three (0.0 / None / False by default)")
+
+# the stock load: with the CLS norm untied, every stock key loads strictly and local_cls_norm starts as a copy (not a share) of the stock norm; any other missing,
+# unexpected or misshapen key is still refused. A tiny "stock" file whose norm is not a fresh LayerNorm's ones / zeros, so a copy is told apart from an init
+tiny_stock = export_backbone(ng_seeded(build_backbone, TINY_VIT))
+tiny_stock["norm.weight"], tiny_stock["norm.bias"] = torch.linspace(0.5, 1.5, 64), torch.linspace(-0.1, 0.1, 64)
+TINY_STOCK = os.path.join(TMP, "tiny_stock.pth")
+torch.save(tiny_stock, TINY_STOCK)
+untied = build_backbone(dict(TINY_VIT, untie_global_and_local_cls_norm=True), TINY_STOCK)
+untied_sd = untied.state_dict()
+assert set(untied_sd) == set(tiny_stock) | CLS_NORM_KEYS and all(torch.equal(untied_sd[k], v) for k, v in tiny_stock.items())
+assert torch.equal(untied_sd["local_cls_norm.weight"], tiny_stock["norm.weight"]) and torch.equal(untied_sd["local_cls_norm.bias"], tiny_stock["norm.bias"])
+assert untied.local_cls_norm.weight.data_ptr() != untied.norm.weight.data_ptr() and untied.local_cls_norm.bias.data_ptr() != untied.norm.bias.data_ptr()
+with torch.no_grad():
+    untied.local_cls_norm.weight.add_(1.0)
+assert torch.equal(untied.norm.weight, tiny_stock["norm.weight"])  # moving the copy leaves the norm alone
+assert set(build_backbone(TINY_VIT, TINY_STOCK).state_dict()) == set(tiny_stock)  # tied: the stock load exactly as before
+for name, broken, words in (("missing", {k: v for k, v in tiny_stock.items() if k != "blocks.0.attn.qkv.weight"}, "Missing key(s)"),
+                            ("unexpected", dict(tiny_stock, extra=torch.zeros(1)), "Unexpected key(s)"),
+                            ("shape", dict(tiny_stock, cls_token=torch.zeros(1, 1, 32)), "size mismatch")):
+    path = os.path.join(TMP, "tiny_stock_%s.pth" % name)
+    torch.save(broken, path)
+    message = raises(RuntimeError, build_backbone, dict(TINY_VIT, untie_global_and_local_cls_norm=True), path)
+    assert words in message and "local_cls_norm" not in message, (name, message)
+print("OK (u) stock load, untied: every stock key bitwise, local_cls_norm.weight / .bias bitwise the stock norm's in their own storage (moving the copy leaves norm alone); "
+      "a missing, unexpected or misshapen other key still raises (not naming local_cls_norm); tied, the stock key set exactly as before")
+
+# one step through run() from that file (Gram run, backbone not frozen, no warmup, teacher momentum 0.9 so the EMA move is many ulps): before it the student's, the EMA
+# teacher's and the Gram teacher's local_cls_norm are the stock norm; after it the student's has left its norm, the EMA teacher's follows it, and the export is the stock
+# key set, loading strictly
+U1 = os.path.join(TMP, "U1")
+args_u1 = make_args(U1, *RECIPE, "--warmup_epochs", "0", "--freeze_backbone_epochs", "0", "--momentum_teacher", "0.9", "--max_steps", "1")
+args_u1.pretrained_weights = TINY_STOCK
+u_first = []
+
+
+def u_forward_backward(self, data, *, teacher_temp):  # the backbones as the first step sees them (cloned)
+    if not u_first:
+        u_first.append({name: {k: v.detach().clone() for k, v in module.backbone.state_dict().items()}
+                        for name, module in (("student", self.student), ("teacher", self.teacher), ("gram_teacher", self.gram_teacher))})
+    return real_forward_backward(self, data, teacher_temp=teacher_temp)
+
+
+SSLMetaArch.forward_backward = u_forward_backward
+try:
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ssl_pretrain.run(args_u1, TINY_VIT, TINY_HEADS, CFG)
+    text_u1 = buf.getvalue()
+finally:
+    SSLMetaArch.forward_backward = real_forward_backward
+assert ("local_cls_norm: initialized as a copy of norm.weight / norm.bias from %s (the stock file has no local_cls_norm)" % TINY_STOCK) in text_u1.splitlines(), text_u1
+for name in ("student", "teacher", "gram_teacher"):
+    assert all(torch.equal(u_first[0][name]["local_cls_norm." + p], tiny_stock["norm." + p]) for p in ("weight", "bias")), name
+ck_u1 = load_ckpt(U1, "maxsteps_0000001.pth")
+stu, tea = backbone_of(ck_u1["student"]), backbone_of(ck_u1["teacher"])
+assert CLS_NORM_KEYS <= set(stu) and CLS_NORM_KEYS <= set(tea) and CLS_NORM_KEYS <= set(backbone_of(ck_u1["gram_teacher"]))  # the full checkpoint carries it, all three models
+assert not torch.equal(stu["local_cls_norm.weight"], stu["norm.weight"]) and not torch.equal(stu["local_cls_norm.weight"], tiny_stock["norm.weight"])
+for p in ("weight", "bias"):
+    want = 0.9 * tiny_stock["norm." + p].double() + 0.1 * stu["local_cls_norm." + p].double()
+    assert torch.allclose(tea["local_cls_norm." + p].double(), want, rtol=1e-6, atol=1e-7), p
+assert not torch.equal(tea["local_cls_norm.weight"], tiny_stock["norm.weight"])  # the EMA really moved it
+export_u1 = torch.load(os.path.join(U1, "export", "teacher_backbone_maxsteps_0000001.pth"), weights_only=True)
+assert set(export_u1) == set(tiny_stock) and all(torch.equal(v, tea[k]) for k, v in export_u1.items())
+DinoVisionTransformer(**TINY_VIT).load_state_dict(export_u1, strict=True)  # the tiny ViT's own kwargs, no recipe: as Ark builds it
+print("OK (u) one step from a stock file: the student's, EMA teacher's and Gram teacher's local_cls_norm start as the stock norm (and run() says so); after the step the "
+      "student's differs from its norm, the EMA teacher's is 0.9 x stock + 0.1 x the student's (momentum 0.9), the checkpoint carries it for all three models, and the export has "
+      "exactly the stock keys (the EMA teacher's backbone without it), loading strictly into a backbone built without the recipe")
+
+# the real ViT-B/16: the stock file with the recipe, the export into Ark's strict vit_base_dinov3 guard
+if WEIGHTS is None:
+    print("SKIP (u) ViT-B/16 stock load + export with the recipe: %s not found" % WEIGHT_NAME)
+else:
+    stock_b = torch.load(WEIGHTS, map_location="cpu", weights_only=True)
+    models_b = build_models(dict(DINOV3_VITB16_KWARGS, **RECIPE_ON), WEIGHTS, TINY_HEADS)
+    for model in models_b:
+        sd_b = model.backbone.state_dict()
+        assert set(sd_b) == set(stock_b) | CLS_NORM_KEYS and all(torch.equal(sd_b[k], v) for k, v in stock_b.items())
+        assert torch.equal(sd_b["local_cls_norm.weight"], stock_b["norm.weight"]) and torch.equal(sd_b["local_cls_norm.bias"], stock_b["norm.bias"])
+    teacher_b = models_b[1]
+    with torch.no_grad():
+        for p in teacher_b.backbone.parameters():
+            p.add_(1e-3)  # no longer the stock weights
+    exported_b = export_backbone(teacher_b.backbone)
+    assert len(exported_b) == 188 == len(stock_b) and set(exported_b) == set(stock_b) and any(not torch.equal(exported_b[k], stock_b[k]) for k in stock_b)
+    DinoVisionTransformer(**DINOV3_VITB16_KWARGS).load_state_dict(exported_b, strict=True)  # Ark's kwargs, unchanged
+    path_b = os.path.join(TMP, "export_recipe.pth")
+    torch.save(exported_b, path_b)
+    ark_vit_b = build_omni_model(SimpleNamespace(model_name="vit_base_dinov3", pretrained_weights=path_b, projector_features=1376, use_mlp=False), [6, 14, 14, 14])
+    assert all(torch.equal(ark_vit_b.state_dict()[k], v) for k, v in exported_b.items())
+    del stock_b, models_b, teacher_b, exported_b, ark_vit_b
+    print("OK (u) ViT-B/16 with the recipe: student, EMA teacher and Gram teacher load every stock key bitwise with local_cls_norm = the stock norm; the export of a moved "
+          "teacher has the 188 stock keys, loads strictly into DinoVisionTransformer(**DINOV3_VITB16_KWARGS) and into build_omni_model(vit_base_dinov3) bitwise")
+
+# the forward: the EMA and Gram teachers (eval) are deterministic with the recipe on; the student (train) is not, through drop path and the RoPE rescale each on its own;
+# local_cls_norm normalizes entry 1 of the student's list forward, which SSLMetaArch fills with the local crops (8 x B rows, not the 2 x B global ones)
+meta_u = SSLMetaArch(*ng_seeded(build_models, dict(TINY_VIT, **RECIPE_ON), None, TINY_HEADS), n_local_crops=8).train()
+batch_u = batches[0]  # (a): 4 images, Gram crops 448
+g_u, l_u, m_u = batch_u["collated_global_crops"], batch_u["collated_local_crops"], batch_u["collated_masks"]
+assert meta_u.student.backbone.training and not meta_u.teacher.backbone.training and not meta_u.gram_teacher.backbone.training
+same_out = lambda a, b: all(torch.equal(a[k], b[k]) for k in ("x_norm_clstoken", "x_storage_tokens", "x_norm_patchtokens"))
+with torch.no_grad():
+    for module, crops in ((meta_u.teacher.backbone, g_u), (meta_u.gram_teacher.backbone, batch_u["collated_gram_teacher_crops"])):
+        assert same_out(module(crops, is_training=True), module(crops, is_training=True))
+    s1, s2 = (meta_u.student.backbone([g_u, l_u], masks=[m_u, None], is_training=True) for _ in range(2))
+    assert not same_out(s1[0], s2[0]) and not same_out(s1[1], s2[1])
+    for kwargs, varies in ((dict(drop_path_rate=0.3), True), (dict(pos_embed_rope_rescale_coords=2.0), True),
+                           (dict(untie_global_and_local_cls_norm=True), False), ({}, False)):
+        alone = build_backbone(dict(TINY_VIT, **kwargs)).train()
+        o1, o2 = alone([g_u, l_u], masks=[m_u, None], is_training=True), alone([g_u, l_u], masks=[m_u, None], is_training=True)
+        assert (not (same_out(o1[0], o2[0]) and same_out(o1[1], o2[1]))) == varies, kwargs
+cls_norm_calls = []
+hooks = [meta_u.student.backbone.local_cls_norm.register_forward_hook(lambda mod, inp, out: cls_norm_calls.append(("student", tuple(inp[0].shape), out[:, 0].clone()))),
+         meta_u.teacher.backbone.local_cls_norm.register_forward_hook(lambda mod, inp, out: cls_norm_calls.append(("teacher", tuple(inp[0].shape), None))),
+         meta_u.gram_teacher.backbone.local_cls_norm.register_forward_hook(lambda mod, inp, out: cls_norm_calls.append(("gram", tuple(inp[0].shape), None)))]
+try:
+    with torch.no_grad():
+        _, student_local_u = meta_u.get_student_output(global_crops=g_u.unflatten(0, (2, 4)), local_crops=l_u.unflatten(0, (8, 4)), upperbound=batch_u["upperbound"],
+                                                       masks=m_u, mask_indices_list=batch_u["mask_indices_list"])
+    calls_student = list(cls_norm_calls)
+    cls_norm_calls.clear()
+    _, loss_dict_u = meta_u.forward_backward(batch_u, teacher_temp=0.04)
+finally:
+    for hook in hooks:
+        hook.remove()
+assert [(who, shape) for who, shape, _ in calls_student] == [("student", (32, 5, 64))]  # 8 local crops x 4 images; CLS + 4 registers
+assert torch.equal(calls_student[0][2], student_local_u["cls_pre_head"].flatten(0, 1))  # the local CLS the DINO local loss uses
+assert [(who, shape) for who, shape, _ in cls_norm_calls] == [("student", (32, 5, 64))] and set(loss_dict_u) == LOSS_KEYS  # a whole step: once, never by a teacher
+print("OK (u) forward: with the recipe on, two EMA-teacher and two Gram-teacher forwards of one batch are bitwise equal (eval); two student forwards differ, and so they do "
+      "with drop path 0.3 alone or rescale 2 alone (not with the untied norm alone, nor with nothing); local_cls_norm runs once per step, on the student's entry 1 = the 32 "
+      "local crops (8 x 4 images, CLS + 4 registers), and gives the local CLS the DINO loss uses; the teachers never call it. Crop order: get_student_output passes "
+      "[global_crops, local_crops], so Meta's idx == 1 rule picks the local crops")
+
+# resume lock: a recipe checkpoint refuses a --resume / --branch_from without the recipe and the reverse, naming the keys, before anything on disk is touched;
+# a checkpoint written before the flags reads as the defaults
+U_T = os.path.join(TMP, "U_T")
+go(U_T, "--no_gram", *RECIPE, "--stop_after_epochs", "1")
+U_SRC1 = os.path.join(U_T, "ckpt", "epoch_0001.pth")
+before_ut = open(os.path.join(U_T, "args.json")).read()
+RECIPE_DIFFS = ("drop_path_rate: checkpoint 0.3, now 0.0", "rope_rescale_coords: checkpoint 2.0, now None", "untie_local_cls_norm: checkpoint True, now False")
+message = raises(ValueError, go, U_T, "--no_gram", "--resume", "--stop_after_epochs", "2")
+assert "cannot --resume" in message and all(d in message for d in RECIPE_DIFFS), message
+message = raises(ValueError, go, U_T, "--no_gram", "--resume", "--stop_after_epochs", "2", *RECIPE[:4])  # tied only
+assert "untie_local_cls_norm: checkpoint True, now False" in message and "drop_path_rate" not in message and "rope_rescale_coords" not in message, message
+assert open(os.path.join(U_T, "args.json")).read() == before_ut
+before_b = open(os.path.join(DIR_B, "args.json")).read()
+message = raises(ValueError, go, DIR_B, "--resume", *RECIPE)
+assert all(d in message for d in ("drop_path_rate: checkpoint 0.0, now 0.3", "rope_rescale_coords: checkpoint None, now 2.0", "untie_local_cls_norm: checkpoint False, now True")), message
+assert open(os.path.join(DIR_B, "args.json")).read() == before_b
+for name, extra, diffs in (("u_branch_off", ["--branch_from", U_SRC1], RECIPE_DIFFS),  # a recipe trunk branched without it
+                           ("u_branch_on", ["--branch_from", SRC1, *RECIPE], ("drop_path_rate: checkpoint 0.0, now 0.3", "untie_local_cls_norm: checkpoint False, now True"))):
+    out = os.path.join(TMP, name)
+    message = raises(ValueError, go, out, *extra, "--gram_refresh_steps", "100", "--stop_after_epochs", "2")
+    assert "cannot --branch_from" in message and all(d in message for d in diffs) and not os.path.exists(out), (name, message)
+ck_ut = load_ckpt(U_T, "epoch_0001.pth")
+assert tuple(ck_ut["args"][k] for k in RECIPE_KEYS) == (0.3, 2.0, True)
+ck_old_recipe = dict(ck_t, args={k: v for k, v in ck_t["args"].items() if k not in RECIPE_KEYS})  # the (t) trunk, as written before the flags existed
+ssl_pretrain.check_resume(ck_old_recipe, make_args(BR_T, "--no_gram"), 1, 6, ck_t["data_fingerprint"])  # reads as the defaults: passes
+message = raises(ValueError, ssl_pretrain.check_resume, ck_old_recipe, make_args(BR_T, "--no_gram", *RECIPE), 1, 6, ck_t["data_fingerprint"])
+assert all(d in message for d in ("drop_path_rate: checkpoint 0.0, now 0.3", "rope_rescale_coords: checkpoint None, now 2.0", "untie_local_cls_norm: checkpoint False, now True")), message
+print("OK (u) resume lock: a recipe trunk's checkpoint refuses --resume without the recipe (naming drop_path_rate 0.3 / rope_rescale_coords 2.0 / untie_local_cls_norm True "
+      "against the defaults; a partial recipe names only the missing key) and a recipe-less run refuses --resume with it; --branch_from a recipe trunk without it, or a "
+      "recipe-less trunk with it, is refused naming the keys; args.json untouched and no branch dir created; a checkpoint without the keys reads as the defaults")
+
+# resume bitwise: a recipe trunk stopped after epoch 1 and resumed equals the uninterrupted one, with set_epoch acting as it does with --workers > 0 (the cluster's 16):
+# the main process's random / numpy / torch RNGs are then not re-seeded per epoch, so epoch 2's draws (drop path, RoPE rescale, and here the in-process transforms) start
+# from the checkpoint's saved RNG states. Control: the same resume from a copy whose saved torch RNG state was replaced differs. And a --gram_weight 0 branch of the recipe
+# trunk is bitwise its resume: the Gram teacher (eval, local_cls_norm included) draws nothing and adds exact zeros
+
+
+def set_epoch_main_rngs_untouched(loader, sampler, epoch, seed, rank):  # ssl_dinov3.data.set_epoch with num_workers > 0: sampler + worker base seed only
+    sampler.set_epoch(epoch)
+    loader.generator.manual_seed(seed + 1000 * epoch + rank)
+
+
+U_A, U_B, U_C, U_BR = (os.path.join(TMP, n) for n in ("U_A", "U_B", "U_C", "U_BR"))
+UA_SRC1 = os.path.join(U_A, "ckpt", "epoch_0001.pth")  # still there after the resume: the trainer keeps the last 3 epochs
+real_set_epoch, ssl_pretrain.set_epoch = ssl_pretrain.set_epoch, set_epoch_main_rngs_untouched
+try:
+    go(U_A, "--no_gram", *RECIPE, "--stop_after_epochs", "1")
+    shutil.copytree(U_A, U_C)
+    ck_c = load_ckpt(U_C, "epoch_0001.pth")
+    ck_c["rng"]["torch"] = torch.Generator().manual_seed(12345).get_state()
+    torch.save(ck_c, os.path.join(U_C, "ckpt", "epoch_0001.pth"))
+    go(U_A, "--no_gram", *RECIPE, "--resume", "--stop_after_epochs", "2")
+    go(U_B, "--no_gram", *RECIPE, "--stop_after_epochs", "2")
+    go(U_C, "--no_gram", *RECIPE, "--resume", "--stop_after_epochs", "2")
+    go(U_BR, "--branch_from", UA_SRC1, *RECIPE, "--gram_weight", "0", "--gram_refresh_steps", "100", "--stop_after_epochs", "2")
+finally:
+    ssl_pretrain.set_epoch = real_set_epoch
+ck_ua, ck_ub, ck_uc, ck_ubr = (load_ckpt(d, "epoch_0002.pth") for d in (U_A, U_B, U_C, U_BR))
+src_ua = torch.load(UA_SRC1, map_location="cpu", weights_only=False)
+assert not same_state(ck_ub["student"], src_ua["student"]) and not same_state(ck_ub["rng"], src_ua["rng"])  # epoch 2 trained and drew
+exports_u = {d: torch.load(os.path.join(d, "export", "teacher_backbone_epoch_0002.pth"), weights_only=True) for d in (U_A, U_B, U_C, U_BR)}
+assert same_state(exports_u[U_A], exports_u[U_B]) and same_state(exports_u[U_BR], exports_u[U_B]) and set(exports_u[U_B]) == set(tiny_stock)
+for part in ("student", "teacher", "optimizer", "rng"):
+    assert same_state(ck_ua[part], ck_ub[part]) and same_state(ck_ubr[part], ck_ub[part]), part
+assert CLS_NORM_KEYS <= set(backbone_of(ck_ubr["gram_teacher"])) and ck_ubr["args"]["untie_local_cls_norm"] is True
+assert not same_state(ck_uc["student"], ck_ub["student"]) and not same_state(exports_u[U_C], exports_u[U_B])  # the control: the saved RNG state is what makes it bitwise
+by_step_ub = {r[0]: r[2:13] for r in read_csv(U_B)[1:]}  # dino_global .. gram_weight, as strings
+common_ua = [r for r in read_csv(U_A)[1:] if r[0] in by_step_ub]  # a run's first step after a start or resume is logged off the print_freq grid
+common_ubr = [r for r in read_csv(U_BR)[1:] if r[0] in by_step_ub]
+assert len(common_ua) == 7 and all(r[2:13] == by_step_ub[r[0]] for r in common_ua)  # steps 0, 1, 3, 5, 7, 9, 11: every row the uninterrupted run logged
+assert len(common_ubr) >= 3 and all(r[2:6] + r[7:12] == by_step_ub[r[0]][:4] + by_step_ub[r[0]][5:10] for r in common_ubr)  # the branch: all but its gram column
+print("OK (u) resume bitwise, recipe on, set_epoch as with --workers > 0: 1 epoch + --resume to 2 == 2 epochs straight (export, student, EMA teacher, optimizer, RNG states, "
+      "the CSV rows both logged), and a --gram_weight 0 branch of epoch 1 == both (its Gram teacher carries local_cls_norm); the same resume from a checkpoint whose torch RNG state "
+      "was replaced differs (student, export)")
+
 # (k) launch scripts ------------------------------------------------------------------------------------------------------------
 scripts = [os.path.join(REPO, "chain", f) for f in ("ssl_common.sh", "pilot_a.sh", "pilot_b.sh", "main.sh", "constlr.sh", "hires.sh")]
 scripts.append(os.path.join(REPO, "run_d1_8s_timing_gaudi.sh"))
@@ -1263,6 +1522,7 @@ assert result.returncode == 0, result.stderr
 argv = launched(root)
 assert argv == constlr_argv("30"), argv
 expanded["constlr.sh"] = "./gaudi.sh " + " ".join(argv)
+assert not any(flag in argv for flag in RECIPE if flag.startswith("--"))  # the phase: none of the DINOv3 recipe flags the trunk and its branches pass
 # the trainer reads that argv the way the phase means it: stop after epoch 30 of the 1000-epoch ceiling, Meta's three Gram refreshes (passed
 # explicitly because --resume locks them; also the trainer's default, so the same as main.sh, which passes none), and an LR (and teacher
 # temperature) that is flat once its warmup is over; epoch_length 10 stands in for the real one (2666 on 4 cards), only the shape matters
@@ -1304,24 +1564,26 @@ def constlr_run(root, env=ALLOC4, **override):  # write the setting files (None:
     return run_script(root, "chain/constlr.sh", env=env), launched(root)
 
 
-def nogram_argv_for(stop):  # constlr_argv(stop) with the run dir swapped and the Gram refresh list replaced by --no_gram
+def nogram_argv_for(stop):  # constlr_argv(stop) with the run dir swapped and the Gram refresh list replaced by the DINOv3 recipe (RECIPE, (u)) and --no_gram
     argv = constlr_argv(stop)
     assert argv[-2:] == ["--gram_refresh_steps", "10000,20000,30000"]
-    return [NOGRAM_RUN if arg == "/workspace/ssl_dinov3_cxr_constlr_seed_100" else arg for arg in argv[:-2]] + ["--no_gram"]
+    return [NOGRAM_RUN if arg == "/workspace/ssl_dinov3_cxr_constlr_seed_100" else arg for arg in argv[:-2]] + RECIPE + ["--no_gram"]
 
 
 root = sandbox()
 result, nogram_argv = constlr_run(root, env=NOGRAM_ENV)  # constlr_nogram_stop_after.txt " 100 ", constlr_stop_after.txt 30 (not read)
 assert result.returncode == 0, result.stderr
 assert nogram_argv == nogram_argv_for("100"), nogram_argv
-assert result.stdout.splitlines() == ["run: ssl_dinov3_cxr_constlr_nogram_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; "
+assert result.stdout.splitlines() == ["run: ssl_dinov3_cxr_constlr_nogram_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; DINOv3 recipe: "
+                                      "--drop_path_rate 0.3 --rope_rescale_coords 2 --untie_local_cls_norm; "
                                       "stop after epoch 100 from chain/constlr_nogram_stop_after.txt)"] and result.stderr == "", (result.stdout, result.stderr)
 expanded["constlr.sh with CONSTLR_NOGRAM=1"] = "./gaudi.sh " + " ".join(nogram_argv)
 # the same stop epoch in the chain's phase (variable unset, or set but empty): the only differences are the run dir and the tail, and nothing new is printed
 result, default_100 = constlr_run(root, **{"constlr_stop_after.txt": "100\n"})
 assert result.returncode == 0 and default_100 == constlr_argv("100") and (result.stdout, result.stderr) == ("", ""), (result.stderr, default_100)
-assert default_100[-2:] == ["--gram_refresh_steps", "10000,20000,30000"] and nogram_argv[-1:] == ["--no_gram"] and len(nogram_argv) == len(default_100) - 1
-assert [(a, b) for a, b in zip(default_100[:-2], nogram_argv[:-1]) if a != b] == [("/workspace/ssl_dinov3_cxr_constlr_seed_100", NOGRAM_RUN)], (default_100, nogram_argv)
+assert default_100[-2:] == ["--gram_refresh_steps", "10000,20000,30000"] and nogram_argv[-6:] == RECIPE + ["--no_gram"] and len(nogram_argv) == len(default_100) + 4
+assert [(a, b) for a, b in zip(default_100[:-2], nogram_argv[:-6]) if a != b] == [("/workspace/ssl_dinov3_cxr_constlr_seed_100", NOGRAM_RUN)], (default_100, nogram_argv)
+assert len(default_100[:-2]) == len(nogram_argv[:-6])  # the zip above covers the whole common part
 result, empty_argv = constlr_run(root, env=dict(ALLOC4, CONSTLR_NOGRAM=""), **{"constlr_stop_after.txt": "100\n"})
 assert result.returncode == 0 and empty_argv == default_100 and (result.stdout, result.stderr) == ("", ""), (result.stderr, empty_argv)
 # a missing or invalid no-Gram stop file is refused naming itself (not constlr_stop_after.txt, which stays valid) before gaudi.sh is reached, and before any run: line
@@ -1351,7 +1613,8 @@ assert ssl_pretrain.check_args(nogram_parsed) == 100 and nogram_parsed.epochs ==
 assert (nogram_parsed.no_gram, nogram_parsed.gram_weight, nogram_parsed.gram_refresh_steps, nogram_parsed.gram_teacher_size) == (True, 0.0, [], 448)
 assert (default_parsed.no_gram, default_parsed.gram_weight, default_parsed.gram_refresh_steps) == (False, 2.0, [10000, 20000, 30000])
 assert "no_gram" in ssl_pretrain.RESUME_MATCH and "stop_after_epochs" not in ssl_pretrain.RESUME_MATCH  # --resume locks the Gram switch, not where a run stops
-locked_alike = set(ssl_pretrain.RESUME_MATCH) - {"no_gram", "gram_weight", "gram_refresh_steps", "world_size"}
+assert tuple(getattr(nogram_parsed, k) for k in RECIPE_KEYS) == (0.3, 2.0, True) and tuple(getattr(default_parsed, k) for k in RECIPE_KEYS) == (0.0, None, False)
+locked_alike = set(ssl_pretrain.RESUME_MATCH) - {"no_gram", "gram_weight", "gram_refresh_steps", "world_size"} - set(RECIPE_KEYS)
 assert all(getattr(nogram_parsed, k) == getattr(default_parsed, k) for k in locked_alike), \
     {k: (getattr(nogram_parsed, k), getattr(default_parsed, k)) for k in locked_alike if getattr(nogram_parsed, k) != getattr(default_parsed, k)}
 assert nogram_parsed.pretrained_weights == default_parsed.pretrained_weights and nogram_parsed.stop_after_epochs == default_parsed.stop_after_epochs == 100
@@ -1464,6 +1727,7 @@ bparsed = ssl_pretrain.parse_args(bargv[bargv.index("ssl_pretrain.py") + 1:])
 tparsed = ssl_pretrain.parse_args(trunk_argv[trunk_argv.index("ssl_pretrain.py") + 1:])
 assert ssl_pretrain.check_args(bparsed) == 40 and bparsed.epochs == 1000 and ssl_pretrain.check_args(ssl_pretrain.parse_args(bargv_max[bargv_max.index("ssl_pretrain.py") + 1:])) == 1000
 assert (bparsed.branch_from, bparsed.gram_refresh_steps, bparsed.no_gram, bparsed.gram_weight, bparsed.gram_teacher_size) == (BRANCH_SRC10, [36660, 46660, 56660], False, 2.0, 448)
+assert tuple(getattr(bparsed, k) for k in RECIPE_KEYS) == (0.3, 2.0, True) and bargv[-9:-4] == RECIPE  # the trunk's recipe, which --branch_from requires to match
 assert min(bparsed.gram_refresh_steps) > 10 * 2666 and bparsed.output_dir == "/workspace/" + BRANCH_E10 != tparsed.output_dir and bparsed.resume  # a resubmit resumes the branch
 assert tparsed.branch_from is None and tparsed.no_gram is True
 branch_locked_alike = set(ssl_pretrain.RESUME_MATCH) - set(ssl_pretrain.BRANCH_FREE) - {"world_size"}
@@ -1537,7 +1801,8 @@ bres, phase_argv = constlr_run(phase_dir, env=dict(ALLOC4, **no_branch))
 assert bres.returncode == 0 and phase_argv == constlr_argv("30") and (bres.stdout, bres.stderr) == ("", ""), (bres.stdout, bres.stderr, phase_argv)
 bres, trunk_argv100 = constlr_run(phase_dir, env=dict(NOGRAM_ENV, **no_branch))
 assert bres.returncode == 0 and trunk_argv100 == nogram_argv_for("100") and bres.stderr == "", (bres.stderr, trunk_argv100)
-assert bres.stdout.splitlines() == ["run: ssl_dinov3_cxr_constlr_nogram_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; "
+assert bres.stdout.splitlines() == ["run: ssl_dinov3_cxr_constlr_nogram_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; DINOv3 recipe: "
+                                      "--drop_path_rate 0.3 --rope_rescale_coords 2 --untie_local_cls_norm; "
                                     "stop after epoch 100 from chain/constlr_nogram_stop_after.txt)"], bres.stdout
 # the wrapper: bash -n and the executable bit are checked with the other scripts above; here its mode, sbatch header, guards and last line
 assert stat.S_IMODE(os.stat(BRANCH_SCRIPT).st_mode) == 0o755
@@ -1559,7 +1824,7 @@ print("OK (k) branch launcher: run_d1_8_branch_gram_gaudi.sh (mode 755, 4 cards,
       "a refresh list must end inside the 1000-epoch schedule, whose last step is 1000 x the trunk's own epoch_length: `10 40 2666 990` (26660 + 990 x 2666 = 1000 x 2666) launches, 991 refreshes or a "
       "9-digit EVERY pass it and are refused; a branch's own epoch checkpoint is a regular file named epoch_<digits>.pth, the trainer's names (epoch_backup.pth, *.tmp, maxsteps_*.pth and a directory of "
       "that name leave a missing source refused); "
-      "the argv parses to branch_from the source, Gram ON (2.0, 448), stop 40 of 1000, every other locked setting = the trunk's; refused before launching: a wrong argument count (before the "
+      "the argv parses to branch_from the source, Gram ON (2.0, 448), stop 40 of 1000, the trunk's DINOv3 recipe (drop path 0.3, rescale 2, untied local CLS norm), every other locked setting = the trunk's; refused before launching: a wrong argument count (before the "
       "card check), K / STOP / EVERY / COUNT that are not positive integers (no leading zero; EVERY at most 9 digits, COUNT 4, both accepted at the limit), STOP above the 1000 ceiling "
       "(accepted at 1000) or not after K, a trunk args.json without a positive epoch_length, CONSTLR_NOGRAM set as well, one of the four variables alone or emptied, and a missing source "
       "on a first start (a branch with an epoch checkpoint of its own resumes without it); the phase and the trunk launch and print exactly as before with all four variables empty")
@@ -1720,8 +1985,9 @@ print("OK (k) scripts: bash -n passes and all are executable; pilot A/B, main (n
       "HIRES_RUN_SUFFIX=_gram512 (the Gram-512 twin) only the Gram size and the run dir change, the file's Gram is ignored, and a bad override (Gram not x16 / outside "
       "512..1024 / not a number, a suffix without _ / uppercase / with a space) is refused naming itself; run_d1_8hires_gram512_gaudi.sh: 4 cards, ends in "
       "HIRES_GRAM=512 HIRES_RUN_SUFFIX=_gram512 exec ./chain/hires.sh, names phases.txt only in comments; constlr.sh with CONSTLR_NOGRAM=1 (the no-Gram trunk; "
-      "run_d1_8_constlr_nogram_gaudi.sh: 4 cards, ends in CONSTLR_NOGRAM=1 exec ./chain/constlr.sh) launches its line with --no_gram in place of the Gram refreshes, into its own run dir "
-      "and with the stop epoch from constlr_nogram_stop_after.txt only; a bad stop file or CONSTLR_NOGRAM is refused before launching; the argv parses to no_gram with "
+      "run_d1_8_constlr_nogram_gaudi.sh: 4 cards, ends in CONSTLR_NOGRAM=1 exec ./chain/constlr.sh) launches its line with the DINOv3 recipe (--drop_path_rate 0.3 --rope_rescale_coords 2 "
+      "--untie_local_cls_norm, which the phase's line lacks) and --no_gram in place of the Gram refreshes, into its own run dir "
+      "and with the stop epoch from constlr_nogram_stop_after.txt only; a bad stop file or CONSTLR_NOGRAM is refused before launching; the argv parses to no_gram and the recipe with "
       "every other locked setting = constlr's")
 
 # (l) data paths: our list parsing == Ark's dataset classes on the real lists -----------------------------------------------------------
