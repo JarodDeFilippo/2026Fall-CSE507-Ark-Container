@@ -1109,6 +1109,7 @@ scripts = [os.path.join(REPO, "chain", f) for f in ("ssl_common.sh", "pilot_a.sh
 scripts.append(os.path.join(REPO, "run_d1_8s_timing_gaudi.sh"))
 scripts.append(os.path.join(REPO, "run_d1_8hires_gram512_gaudi.sh"))  # the Gram-512 twin's sbatch wrapper; its contents are checked after the hires checks
 scripts.append(os.path.join(REPO, "run_d1_8_constlr_nogram_gaudi.sh"))  # the no-Gram trunk's sbatch wrapper; its contents are checked after the constlr checks
+scripts.append(os.path.join(REPO, "run_d1_8_branch_gram_gaudi.sh"))  # the Gram-anchored branches' sbatch wrapper; its contents are checked after the no-Gram wrapper's
 for script in scripts:
     assert os.access(script, os.X_OK), script
     subprocess.run(["bash", "-n", script], check=True)
@@ -1346,6 +1347,184 @@ assert nogram_code[-1] == "CONSTLR_NOGRAM=1 exec ./chain/constlr.sh", nogram_cod
 for needle in ("export PT_HPU_LAZY_MODE=1", "CONSTLR_NOGRAM=1", "exec ./chain/constlr.sh", "./gaudi_check_cards.sh || exit 1", "[[ -x ./gaudi_verify_busy.sh ]]", "./gaudi_verify_busy.sh 900 &"):
     assert any(needle in line for line in nogram_code), needle  # in a command, not only in a comment
 assert all(line.startswith("#") for line in nogram_lines if "phases.txt" in line), nogram_lines  # not a chain phase: phases.txt is named in comments only
+
+# the Gram-anchored branches (run_d1_8_branch_gram_gaudi.sh): CONSTLR_BRANCH_EPOCH=K / _STOP / _EVERY / _COUNT make constlr.sh launch the no-Gram trunk's line with --no_gram replaced by --branch_from
+# <trunk>/ckpt/epoch_<K>.pth --gram_refresh_steps <absolute list>, into a run dir that names K and the cadence; the list starts at K x the epoch_length in the trunk's args.json (read there, never assumed)
+import shlex
+import stat
+
+BRANCH_SCRIPT = os.path.join(REPO, "run_d1_8_branch_gram_gaudi.sh")
+BRANCH_CD = "cd /scratch/$USER/2026Fall-CSE507-Ark-Container || exit 1"
+BRANCH_TRUNK = "ssl_dinov3_cxr_constlr_nogram_seed_100"
+BRANCH_E10 = "ssl_dinov3_cxr_constlr_nogram_e0010_gram_every10000x3_seed_100"  # the planned run: from epoch 10, Meta's 10k x 3
+BRANCH_SRC10 = NOGRAM_RUN + "/ckpt/epoch_0010.pth"  # in-container path
+branch_elsewhere = tempfile.mkdtemp(dir=TMP)  # sbatch starts the job in its spool dir, not the repo: the wrapper's own cd must do the work
+
+
+def branch_root(epoch_length=2666, source=True):  # a sandbox with the wrapper (its cd pointed at the sandbox), main_lr.txt only, and a stub trunk
+    root = sandbox(timing=True)  # also the gaudi_check_cards.sh / gaudi_verify_busy.sh recorders
+    open(os.path.join(root, "chain", "main_lr.txt"), "w").write("0.002\n")  # the only setting file: a branch reads no stop file
+    os.makedirs(os.path.join(root, BRANCH_TRUNK, "ckpt"))
+    with open(os.path.join(root, BRANCH_TRUNK, "args.json"), "w") as f:  # the trainer's format (json.dump, indent=2): lists span lines, so epoch_length is not the only line
+        json.dump(dict(no_gram=True, gram_refresh_steps=[], data_set=["VinDrCXR", "ChestXray14", "MIMIC", "CheXpert"], epoch_length=epoch_length,
+                       total_steps=1000 * epoch_length), f, indent=2)
+    if source:
+        open(os.path.join(root, BRANCH_TRUNK, "ckpt", "epoch_0010.pth"), "w").close()
+    text = open(BRANCH_SCRIPT).read()
+    assert text.count(BRANCH_CD) == 1, BRANCH_CD
+    open(os.path.join(root, "run_d1_8_branch_gram_gaudi.sh"), "w").write(text.replace(BRANCH_CD, "cd %s || exit 1" % shlex.quote(root)))
+    return root
+
+
+def branch_run(root, *args, env=ALLOC4):  # runs the wrapper copy with these arguments; returns (result, argv or None), a stale argv.txt removed first
+    if os.path.exists(os.path.join(root, "argv.txt")):
+        os.remove(os.path.join(root, "argv.txt"))
+    result = subprocess.run(["bash", os.path.join(root, "run_d1_8_branch_gram_gaudi.sh")] + list(args), cwd=branch_elsewhere, env=env, capture_output=True, text=True)
+    return result, launched(root)
+
+
+def branch_argv_for(stop, run, source, steps):  # nogram_argv_for(stop) with the run dir swapped and the final --no_gram replaced by the branch pair
+    argv = nogram_argv_for(stop)
+    assert argv[-1:] == ["--no_gram"] and argv.count(NOGRAM_RUN) == 1
+    return [("/workspace/" + run) if arg == NOGRAM_RUN else arg for arg in argv[:-1]] + ["--branch_from", source, "--gram_refresh_steps", steps]
+
+
+def branch_refused(root, args, *needles, env=ALLOC4):  # the wrapper copy refuses these arguments: exit 1, an ERROR on stderr naming every needle, nothing printed, gaudi.sh never reached
+    result, refused = branch_run(root, *args, env=env)
+    assert result.returncode == 1 and "ERROR" in result.stderr and result.stdout == "" and refused is None, (args, result.returncode, result.stdout, result.stderr)
+    assert all(needle in result.stderr for needle in needles), (args, needles, result.stderr)
+
+
+# `10 40`: the trunk's line with the branch pair in place of --no_gram, into the run dir that names the cadence; this sandbox has no stop file at all (a branch reads none)
+branch_dir = branch_root()
+bres, bargv = branch_run(branch_dir, "10", "40")
+assert bres.returncode == 0 and bres.stderr == "", (bres.stdout, bres.stderr)
+assert bres.stdout.splitlines() == [
+    "run: ssl_dinov3_cxr_constlr_nogram_e0010_gram_every10000x3_seed_100 (Gram-anchored branch of ssl_dinov3_cxr_constlr_nogram_seed_100 from its epoch 10: "
+    "--branch_from /workspace/ssl_dinov3_cxr_constlr_nogram_seed_100/ckpt/epoch_0010.pth --gram_refresh_steps in place of --no_gram; stop after epoch 40)",
+    "gram refresh steps: 36660,46660,56660 (branch step 26660 = epoch 10 x epoch_length 2666 from ssl_dinov3_cxr_constlr_nogram_seed_100/args.json, then every 10000 steps, 3 times)"], bres.stdout
+assert bargv == branch_argv_for("40", BRANCH_E10, BRANCH_SRC10, "36660,46660,56660"), bargv
+assert os.path.exists(os.path.join(branch_dir, "cards_checked"))
+for _ in range(50):  # the busy check runs in the background
+    if os.path.exists(os.path.join(branch_dir, "busy_arg.txt")):
+        break
+    subprocess.run(["sleep", "0.1"])
+assert open(os.path.join(branch_dir, "busy_arg.txt")).read() == "900\n"
+expanded["run_d1_8_branch_gram_gaudi.sh 10 40"] = "./gaudi.sh " + " ".join(bargv)
+# ... which is the real trunk's line (constlr.sh with CONSTLR_NOGRAM=1, stop 40) except for the run dir and the tail
+tres, trunk_argv = constlr_run(sandbox(), env=NOGRAM_ENV, **{"constlr_nogram_stop_after.txt": "40\n"})
+assert tres.returncode == 0 and trunk_argv == nogram_argv_for("40"), (tres.stderr, trunk_argv)
+assert trunk_argv[-1:] == ["--no_gram"] and bargv[-4:] == ["--branch_from", BRANCH_SRC10, "--gram_refresh_steps", "36660,46660,56660"] and len(bargv) == len(trunk_argv) + 3
+assert [(a, b) for a, b in zip(trunk_argv[:-1], bargv[:-4]) if a != b] == [(NOGRAM_RUN, "/workspace/" + BRANCH_E10)], (trunk_argv, bargv)
+# `10 40 2666 30`, one refresh per epoch for 30 epochs: the cadence is in the run dir's name, so it never shares a dir with the 10k x 3 branch from the same epoch
+steps30 = ",".join(str(26660 + 2666 * i) for i in range(1, 31))
+run30 = "ssl_dinov3_cxr_constlr_nogram_e0010_gram_every2666x30_seed_100"
+bres, bargv30 = branch_run(branch_dir, "10", "40", "2666", "30")
+assert bres.returncode == 0 and bres.stderr == "" and bargv30 == branch_argv_for("40", run30, BRANCH_SRC10, steps30) != bargv, (bres.stderr, bargv30)
+assert len(bres.stdout.splitlines()) == 2 and bres.stdout.splitlines()[0].startswith("run: %s (Gram-anchored branch of " % run30), bres.stdout
+assert bres.stdout.splitlines()[1] == ("gram refresh steps: %s (branch step 26660 = epoch 10 x epoch_length 2666 from ssl_dinov3_cxr_constlr_nogram_seed_100/args.json, "
+                                       "then every 2666 steps, 30 times)" % steps30), bres.stdout
+expanded["run_d1_8_branch_gram_gaudi.sh 10 40 2666 30"] = "./gaudi.sh " + " ".join(bargv30)
+# the epoch length is read from the trunk's args.json, not assumed: 2665 moves every step; another K / STOP / EVERY / COUNT gets its own run dir, source and list
+bres, bargv2665 = branch_run(branch_root(epoch_length=2665), "10", "40")
+assert bres.returncode == 0 and bargv2665 == branch_argv_for("40", BRANCH_E10, BRANCH_SRC10, "36650,46650,56650"), (bres.stderr, bargv2665)
+assert "gram refresh steps: 36650,46650,56650 (branch step 26650 = epoch 10 x epoch_length 2665 from " in bres.stdout, bres.stdout
+open(os.path.join(branch_dir, BRANCH_TRUNK, "ckpt", "epoch_0007.pth"), "w").close()
+bres, bargv7 = branch_run(branch_dir, "7", "12", "500", "2")
+assert bres.returncode == 0 and bargv7 == branch_argv_for("12", "ssl_dinov3_cxr_constlr_nogram_e0007_gram_every500x2_seed_100", NOGRAM_RUN + "/ckpt/epoch_0007.pth", "19162,19662"), (bres.stderr, bargv7)
+# the limits themselves launch: STOP at the 1000 ceiling, EVERY of 9 digits, COUNT of 4 (one more digit of either is refused below)
+steps_max = ",".join(str(26660 + 999999999 * i) for i in range(1, 1001))
+bres, bargv_max = branch_run(branch_dir, "10", "1000", "999999999", "1000")
+assert bres.returncode == 0 and bargv_max == branch_argv_for("1000", "ssl_dinov3_cxr_constlr_nogram_e0010_gram_every999999999x1000_seed_100", BRANCH_SRC10, steps_max), (bres.stderr, bargv_max and bargv_max[-4:])
+# the trainer reads the branch argv as meant: --branch_from the source, the absolute refresh list (all after the branch step), the Gram teacher ON at the trainer's weight 2.0 and teacher 448, stop after
+# epoch 40 of the 1000-epoch ceiling, and every other setting --resume locks (the Gram ones, branch_from and the trainer's world_size aside) the same as the trunk's argv gives it
+bparsed = ssl_pretrain.parse_args(bargv[bargv.index("ssl_pretrain.py") + 1:])
+tparsed = ssl_pretrain.parse_args(trunk_argv[trunk_argv.index("ssl_pretrain.py") + 1:])
+assert ssl_pretrain.check_args(bparsed) == 40 and bparsed.epochs == 1000 and ssl_pretrain.check_args(ssl_pretrain.parse_args(bargv_max[bargv_max.index("ssl_pretrain.py") + 1:])) == 1000
+assert (bparsed.branch_from, bparsed.gram_refresh_steps, bparsed.no_gram, bparsed.gram_weight, bparsed.gram_teacher_size) == (BRANCH_SRC10, [36660, 46660, 56660], False, 2.0, 448)
+assert min(bparsed.gram_refresh_steps) > 10 * 2666 and bparsed.output_dir == "/workspace/" + BRANCH_E10 != tparsed.output_dir and bparsed.resume  # a resubmit resumes the branch
+assert tparsed.branch_from is None and tparsed.no_gram is True
+branch_locked_alike = set(ssl_pretrain.RESUME_MATCH) - set(ssl_pretrain.BRANCH_FREE) - {"world_size"}
+assert all(getattr(bparsed, k) == getattr(tparsed, k) for k in branch_locked_alike), \
+    {k: (getattr(bparsed, k), getattr(tparsed, k)) for k in branch_locked_alike if getattr(bparsed, k) != getattr(tparsed, k)}
+assert bparsed.pretrained_weights == tparsed.pretrained_weights and bparsed.stop_after_epochs == tparsed.stop_after_epochs == 40
+# refusals, each before anything is launched: exit 1, an ERROR naming the culprit, nothing on stdout, gaudi.sh never reached
+usage_dir = branch_root()
+for args in ((), ("10",), ("10", "40", "10000", "3", "x")):
+    branch_refused(usage_dir, args, "usage", "got %d arguments" % len(args))
+assert not os.path.exists(os.path.join(usage_dir, "cards_checked")), "the card check ran before the usage guard"  # not even the card check ran, so the argument count is the wrapper's first guard
+for value in ("abc", "0", "-1", "1.5", "010"):  # 010: printf %04d would read it as octal
+    branch_refused(branch_dir, (value, "40"), "K (CONSTLR_BRANCH_EPOCH)", "holds '%s'" % value, *(["leading zero"] if value == "010" else []))
+for value in ("x", "0", "2.5", "040"):
+    branch_refused(branch_dir, ("10", value), "STOP (CONSTLR_BRANCH_STOP)", "holds '%s'" % value)
+for value in ("10", "5"):  # equal to K and below it: the branch would train nothing
+    branch_refused(branch_dir, ("10", value), "not after K")
+for value in ("1001", "18446744073709551617"):  # one past the ceiling; 2**64 + 1, which bash arithmetic would read as 1
+    branch_refused(branch_dir, ("10", value), "STOP (CONSTLR_BRANCH_STOP)", "ceiling of 1000")
+for value in ("0", "abc", "1234567890"):  # the last has 10 digits
+    branch_refused(branch_dir, ("10", "40", value), "EVERY (CONSTLR_BRANCH_EVERY)")
+for value in ("0", "12345", "x"):
+    branch_refused(branch_dir, ("10", "40", "10000", value), "COUNT (CONSTLR_BRANCH_COUNT)")
+# no source: refused on a first start, naming it (the K the trunk never kept as well); once the branch has an epoch checkpoint of its own a resume needs no source
+nosrc_dir = branch_root(source=False)
+branch_refused(nosrc_dir, ("10", "40"), BRANCH_TRUNK + "/ckpt/epoch_0010.pth", "nothing to branch from")
+branch_refused(branch_dir, ("5", "40"), BRANCH_TRUNK + "/ckpt/epoch_0005.pth", "nothing to branch from")
+own_ckpt = os.path.join(nosrc_dir, BRANCH_E10, "ckpt")
+os.makedirs(own_ckpt)
+for name in ("epoch_0011.pth.tmp", "maxsteps_0000003.pth"):  # not epoch checkpoints (the trainer resumes from epoch_<digits>.pth only)
+    open(os.path.join(own_ckpt, name), "w").close()
+branch_refused(nosrc_dir, ("10", "40"), BRANCH_TRUNK + "/ckpt/epoch_0010.pth")
+open(os.path.join(own_ckpt, "epoch_0011.pth"), "w").close()
+bres, bargv_resume = branch_run(nosrc_dir, "10", "40")
+assert bres.returncode == 0 and bres.stderr == "" and bargv_resume == bargv, (bres.stderr, bargv_resume)
+# the branch step is never guessed: a trunk args.json that is missing, has no epoch_length line or a zero one is refused naming both
+json_dir = branch_root()
+trunk_args = os.path.join(json_dir, BRANCH_TRUNK, "args.json")
+open(trunk_args, "w").write(json.dumps(dict(no_gram=True, epoch_length=0, total_steps=0), indent=2))
+branch_refused(json_dir, ("10", "40"), "args.json", "epoch_length")
+open(trunk_args, "w").write(json.dumps(dict(no_gram=True, total_steps=2666000), indent=2))
+branch_refused(json_dir, ("10", "40"), "args.json", "epoch_length")
+os.remove(trunk_args)
+branch_refused(json_dir, ("10", "40"), "args.json", "epoch_length")
+# a branch replaces --no_gram itself, so CONSTLR_NOGRAM beside it is refused (through the wrapper and in constlr.sh); a lone variable, or one of the four emptied, is refused naming the first one missing
+env_dir = branch_root()
+branch_refused(env_dir, ("10", "40"), "both set", env=NOGRAM_ENV)
+branch_all = dict(CONSTLR_BRANCH_EPOCH="10", CONSTLR_BRANCH_STOP="40", CONSTLR_BRANCH_EVERY="10000", CONSTLR_BRANCH_COUNT="3")
+for env, culprits in ((dict(NOGRAM_ENV, CONSTLR_BRANCH_EPOCH="10"), ["both set"]), (dict(ALLOC4, CONSTLR_BRANCH_EVERY="10000"), ["CONSTLR_BRANCH_EPOCH"]),
+                      *((dict(ALLOC4, **dict(branch_all, **{name: ""})), [name]) for name in branch_all)):
+    bres = run_script(env_dir, "chain/constlr.sh", env=env)
+    assert bres.returncode == 1 and "ERROR" in bres.stderr and all(c in bres.stderr for c in culprits) and bres.stdout == "" and launched(env_dir) is None, (culprits, bres.stderr)
+    assert culprits == ["both set"] or [name for name in branch_all if name in bres.stderr] == culprits, (culprits, bres.stderr)  # only the culprit is named
+# the phase and the trunk are unchanged: with all four variables empty, constlr.sh launches and prints exactly as it did before they existed
+no_branch = dict(CONSTLR_BRANCH_EPOCH="", CONSTLR_BRANCH_STOP="", CONSTLR_BRANCH_EVERY="", CONSTLR_BRANCH_COUNT="")
+phase_dir = sandbox()
+bres, phase_argv = constlr_run(phase_dir, env=dict(ALLOC4, **no_branch))
+assert bres.returncode == 0 and phase_argv == constlr_argv("30") and (bres.stdout, bres.stderr) == ("", ""), (bres.stdout, bres.stderr, phase_argv)
+bres, trunk_argv100 = constlr_run(phase_dir, env=dict(NOGRAM_ENV, **no_branch))
+assert bres.returncode == 0 and trunk_argv100 == nogram_argv_for("100") and bres.stderr == "", (bres.stderr, trunk_argv100)
+assert bres.stdout.splitlines() == ["run: ssl_dinov3_cxr_constlr_nogram_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; "
+                                    "stop after epoch 100 from chain/constlr_nogram_stop_after.txt)"], bres.stdout
+# the wrapper: bash -n and the executable bit are checked with the other scripts above; here its mode, sbatch header, guards and last line
+assert stat.S_IMODE(os.stat(BRANCH_SCRIPT).st_mode) == 0o755
+branch_lines = open(BRANCH_SCRIPT).read().splitlines()
+assert [line[len("#SBATCH "):] for line in branch_lines if line.startswith("#SBATCH ")] == [
+    "--job-name=d1-8-branch", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"], branch_lines
+branch_code = [line for line in branch_lines if line and not line.startswith("#")]
+assert branch_code[-1] == "CONSTLR_BRANCH_EPOCH=$1 CONSTLR_BRANCH_STOP=$2 CONSTLR_BRANCH_EVERY=${3:-10000} CONSTLR_BRANCH_COUNT=${4:-3} exec ./chain/constlr.sh", branch_code
+branch_needles = ("export PT_HPU_LAZY_MODE=1", "[[ $# -ge 2 && $# -le 4 ]]", BRANCH_CD, "./gaudi_check_cards.sh || exit 1", "[[ -x ./gaudi_verify_busy.sh ]]", "./gaudi_verify_busy.sh 900 &")
+for needle in branch_needles:
+    assert any(needle in line for line in branch_code), needle  # in a command, not only in a comment
+positions = [min(i for i, line in enumerate(branch_code) if needle in line) for needle in branch_needles]
+assert all(a < b for a, b in zip(positions, positions[1:])), positions  # in this order: the usage guard comes before the cd and the card check
+assert all(line.startswith("#") for line in branch_lines if "phases.txt" in line), branch_lines  # not a chain phase: phases.txt is named in comments only
+print("OK (k) branch launcher: run_d1_8_branch_gram_gaudi.sh (mode 755, 4 cards, the usage guard first, ends in CONSTLR_BRANCH_EPOCH=$1 CONSTLR_BRANCH_STOP=$2 CONSTLR_BRANCH_EVERY=${3:-10000} "
+      "CONSTLR_BRANCH_COUNT=${4:-3} exec ./chain/constlr.sh, names phases.txt only in comments) makes constlr.sh launch the no-Gram trunk's line with only --no_gram replaced by --branch_from "
+      "<trunk>/ckpt/epoch_<K>.pth --gram_refresh_steps <list> and no stop file read: `10 40` -> " + BRANCH_E10 + " refreshing after 36660,46660,56660 (10 x the epoch_length 2666 read from the "
+      "trunk's args.json, 36650,... at 2665, then every 10000 steps, 3 times), `10 40 2666 30` -> ..._every2666x30_ (one refresh per epoch for 30 epochs), `7 12 500 2` -> ..._e0007_ 19162,19662; "
+      "the argv parses to branch_from the source, Gram ON (2.0, 448), stop 40 of 1000, every other locked setting = the trunk's; refused before launching: a wrong argument count (before the "
+      "card check), K / STOP / EVERY / COUNT that are not positive integers (no leading zero; EVERY at most 9 digits, COUNT 4, both accepted at the limit), STOP above the 1000 ceiling "
+      "(accepted at 1000) or not after K, a trunk args.json without a positive epoch_length, CONSTLR_NOGRAM set as well, one of the four variables alone or emptied, and a missing source "
+      "on a first start (a branch with an epoch checkpoint of its own resumes without it); the phase and the trunk launch and print exactly as before with all four variables empty")
 
 # hires.sh ("DINO-X ConstLR 512 px"): a separate run from the stock weights, constlr.sh with only the crops and the batch changed. Four setting files,
 # each missing or invalid one refused naming it before gaudi.sh is reached (the LR file is constlr's own main_lr.txt)
