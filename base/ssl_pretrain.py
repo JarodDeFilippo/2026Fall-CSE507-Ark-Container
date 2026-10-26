@@ -24,6 +24,17 @@ included) or run; no Gram loss is computed, nothing is refreshed, and the batche
 --gram_teacher_size is refused. The flag is locked on --resume, args.json records it, and the checkpoint's gram_teacher is None. ssl_losses.csv
 keeps all 15 columns and writes gram and gram_weight as 0.0 in every row, never blank: the DINO-X report builder parses them as numbers and
 counts a blank as unreadable.
+
+--branch_from <no-Gram run>/ckpt/epoch_NNNN.pth starts a NEW run dir that continues that --no_gram run exactly, with the Gram teacher on: student,
+EMA teacher, optimizer, step, epoch and the python / numpy / torch RNG states are restored as a --resume of the trunk would restore them (same
+schedule position, same data order), and the Gram teacher is anchored to that checkpoint's EMA teacher backbone (the mapping --init_from_checkpoint
+uses); its Gram refreshes start empty. --gram_refresh_steps is required and absolute (global steps, each after the branch step); --gram_weight and
+--gram_teacher_size keep their defaults (2.0, 2 x global) unless given. Epochs continue the trunk's numbering (a branch from epoch 10 first writes
+ckpt/epoch_0011.pth and export/teacher_backbone_epoch_0011.pth) and ssl_losses.csv holds only the branch's rows, from the branch step on. The source
+is read only when the branch starts: a --resume restores the branch's own epoch checkpoint, so the trunk pruning the source cannot break it, and
+branch_from is locked on --resume. Refused before anything on disk is touched: a source that is not a file, not a full epoch checkpoint or not a
+--no_gram run's; --no_gram or --init_from_checkpoint with it; a source that differs on any --resume-locked setting but the Gram ones, or in its image
+list, world size or epoch length; a refresh step at or before the branch step; a stop epoch at or before the source's.
 """
 import argparse
 import csv
@@ -59,14 +70,18 @@ LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "i
 # what shapes the run: a --resume must match its checkpoint on these (the other flags may change between invocations).
 # init_from_checkpoint: a run started from one resumes only with the same one (not re-applied then); any other run's checkpoint is refused
 # no_gram: a no-Gram run resumes only as one (its checkpoint has no Gram teacher), and a Gram run never as one
+# branch_from: a branch resumes only as the same branch (its source is read only at its start); a trunk or any other run never as one
 RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_lr_scaling", "warmup_epochs",
                 "weight_decay", "momentum_teacher", "teacher_temp_warmup_epochs", "gram_weight", "global_crops_size",
                 "local_crops_size", "gram_teacher_size", "gram_refresh_steps", "freeze_backbone_epochs", "local_crops_number",
-                "seed", "bf16", "world_size", "init_from_checkpoint", "no_gram")
+                "seed", "bf16", "world_size", "init_from_checkpoint", "no_gram", "branch_from")
 # checkpoints written before the crop-size flags existed (pilots, main, constlr) were all trained at these
 CROP_DEFAULTS = dict(global_crops_size=224, local_crops_size=96, gram_teacher_size=448)
-# keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, and --no_gram off
-ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False)
+# keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off and no --branch_from
+ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None)
+# what a --branch_from start may differ from its source in (check_resume skips these): the Gram switch and knobs the branch turns on, and the path itself
+BRANCH_FREE = ("no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from")
+BRANCH_SOURCE_KEYS = ("student", "teacher", "optimizer", "step", "epoch", "rng", "args", "world_size")  # a full epoch checkpoint (save_state)
 PATCH_SIZE = 16  # DINOV3_VITB16_KWARGS patch_size: every crop side must be a multiple of it
 DEFAULT_GRAM_REFRESH_STEPS = "10000,20000,30000"  # --gram_refresh_steps when not given (Meta's three refreshes); --no_gram: none
 
@@ -88,9 +103,12 @@ def parse_args(argv=None):
     p.add_argument("--data_set", action="append", choices=DATASET_NAMES, required=True)
     p.add_argument("--datasets_config", default="datasets_config.yaml")
     p.add_argument("--pretrained_weights", default=None,
-                   help="flat DINOv3 backbone .pth; required unless --init_from_checkpoint (which then wins, with a warning)")
+                   help="flat DINOv3 backbone .pth; required unless --init_from_checkpoint or --branch_from (which then win, with a warning)")
     p.add_argument("--init_from_checkpoint", default=None,
                    help="a full checkpoint (<run>/ckpt/epoch_NNNN.pth) to start a NEW run from: student + teacher, heads included")
+    p.add_argument("--branch_from", default=None,
+                   help="a --no_gram run's full checkpoint (<run>/ckpt/epoch_NNNN.pth) to continue exactly in a NEW run dir with the Gram teacher on, "
+                        "anchored to its EMA teacher; needs --gram_refresh_steps (absolute global steps, each after the branch step)")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--epochs", type=int, default=40, help="schedule length (LR warmup + cosine, teacher temperature)")
     p.add_argument("--stop_after_epochs", type=int, default=None,
@@ -127,8 +145,16 @@ def parse_args(argv=None):
     p.add_argument("--device", default=os.environ.get("PROJECT_ACCELERATOR", "cuda"))
     p.add_argument("--bf16", action="store_true", help="bf16 autocast for the forward passes (default fp32)")
     args = p.parse_args(argv)
-    if args.pretrained_weights is None and args.init_from_checkpoint is None:
-        p.error("--pretrained_weights is required unless --init_from_checkpoint is given")
+    if args.pretrained_weights is None and args.init_from_checkpoint is None and args.branch_from is None:
+        p.error("--pretrained_weights is required unless --init_from_checkpoint is given (or --branch_from)")
+    if args.branch_from is not None:  # a branch continues a no-Gram run exactly with the Gram teacher on; these would contradict that
+        for name, why in (("no_gram", "a branch is the no-Gram trunk continued with the Gram teacher on"),
+                          ("init_from_checkpoint", "a branch continues its source's optimizer, step and schedule; --init_from_checkpoint starts afresh at step 0")):
+            if getattr(args, name):
+                p.error(f"--branch_from cannot be combined with --{name} ({why})")
+        if args.gram_refresh_steps is None:
+            p.error("--branch_from needs --gram_refresh_steps: absolute global steps, each after the branch step (the launcher computes them, so the "
+                    "list, which --resume locks, is the same on every resubmit); none: no refresh")
     if args.no_gram:  # no Gram teacher: the Gram knobs have nothing to act on, so an explicit one is a mistake, not a no-op
         for name, why in (("gram_weight", "there is no Gram loss to weight"), ("gram_refresh_steps", "there is no Gram teacher to refresh"),
                           ("gram_teacher_size", "there is no Gram teacher to size; the global crops are cut at 2 x --global_crops_size")):
@@ -210,16 +236,36 @@ def save_atomic(obj, path):
     os.replace(path + ".tmp", path)
 
 
-def check_resume(ckpt, args, world_size, epoch_length, data_fingerprint):
-    saved = dict(ARG_DEFAULTS, **ckpt["args"], world_size=ckpt["world_size"])  # no crop / no_gram keys: an old checkpoint, 224 / 96 / 448, Gram on
+def check_resume(ckpt, args, world_size, epoch_length, data_fingerprint, skip=(), action="--resume"):
+    saved = dict(ARG_DEFAULTS, **ckpt["args"], world_size=ckpt["world_size"])  # no crop / no_gram / branch_from keys: an old checkpoint, 224 / 96 / 448, Gram on, no branch
     now = dict(vars(args), world_size=world_size)
-    diffs = [f"{k}: checkpoint {saved.get(k)!r}, now {now[k]!r}" for k in RESUME_MATCH if saved.get(k) != now[k]]
+    diffs = [f"{k}: checkpoint {saved.get(k)!r}, now {now[k]!r}" for k in RESUME_MATCH if k not in skip and saved.get(k) != now[k]]
     if ckpt.get("data_fingerprint") != data_fingerprint:  # same names and length, different (or reordered) image list
         diffs.append(f"training image list: checkpoint {ckpt.get('data_fingerprint')}, now {data_fingerprint}")
     if ckpt["step"] != ckpt["epoch"] * epoch_length:
         diffs.append(f"step {ckpt['step']} != epoch {ckpt['epoch']} x epoch_length {epoch_length} (dataset changed?)")
     if diffs:
-        raise ValueError("cannot --resume: this run differs from the checkpoint in " + "; ".join(diffs))
+        raise ValueError(f"cannot {action}: this run differs from the checkpoint in " + "; ".join(diffs))
+
+
+def load_branch_source(args, stop_epoch, world_size, epoch_length, data_fingerprint):
+    """The --branch_from checkpoint, loaded and checked: a full epoch checkpoint of a --no_gram run that this run continues exactly (raises otherwise)."""
+    src = torch.load(args.branch_from, map_location="cpu", weights_only=False)
+    if not isinstance(src, dict) or not set(BRANCH_SOURCE_KEYS) <= set(src):
+        raise ValueError(f"--branch_from {args.branch_from} is not a full epoch checkpoint ({', '.join(BRANCH_SOURCE_KEYS)}); "
+                         "an export/teacher_backbone_*.pth holds the backbone only")
+    if src["args"].get("no_gram") is not True:
+        raise ValueError(f"--branch_from {args.branch_from} is not a --no_gram run's checkpoint (its no_gram is {src['args'].get('no_gram')!r}): "
+                         "a branch adds the Gram teacher to a no-Gram trunk")
+    # every other --resume-locked setting, the image list, world size and epoch length (step = epoch x epoch_length) as a --resume of the trunk checks them
+    check_resume(src, args, world_size, epoch_length, data_fingerprint, skip=BRANCH_FREE, action="--branch_from")
+    early = [s for s in args.gram_refresh_steps if s <= src["step"]]
+    if early:
+        raise ValueError(f"--gram_refresh_steps {early} not after the branch step {src['step']} (epoch {src['epoch']} of {args.branch_from}): "
+                         "refresh steps are absolute global steps")
+    if stop_epoch <= src["epoch"]:
+        raise ValueError(f"--stop_after_epochs {stop_epoch} is not after the source's epoch {src['epoch']}: the branch would train nothing")
+    return src
 
 
 def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exists=True):
@@ -227,11 +273,14 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     arguments are the test seam: a tiny ViT / heads, an in-memory datasets config, no image-existence check."""
     args = argparse.Namespace(**vars(args))
     stop_epoch = args.stop_after_epochs = check_args(args)
-    # a --resume of a run that has its own epoch checkpoint restores that one (check_resume compares the recorded init path), so the
-    # init file is read, and must exist, only when the run starts
+    # a --resume of a run that has its own epoch checkpoint restores that one (check_resume compares the recorded init / branch path), so the
+    # init or branch source file is read, and must exist, only when the run starts
     resuming_own = bool(args.resume and epoch_checkpoints(os.path.join(args.output_dir, "ckpt")))
     if args.init_from_checkpoint and not resuming_own and not os.path.isfile(args.init_from_checkpoint):
         raise FileNotFoundError(f"--init_from_checkpoint {args.init_from_checkpoint} is not a file")
+    branching = bool(args.branch_from) and not resuming_own  # likewise the --branch_from source: read, and needed, only at the branch's start
+    if branching and not os.path.isfile(args.branch_from):
+        raise FileNotFoundError(f"--branch_from {args.branch_from} is not a file")
     accelerator = Accelerator(args.device)
     accelerator.initialize_distributed()
     ensure_process_group(accelerator)
@@ -248,18 +297,15 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
 
     out = args.output_dir
     ckpt_dir, export_dir = os.path.join(out, "ckpt"), os.path.join(out, "export")
-    if main:
-        os.makedirs(ckpt_dir, exist_ok=True)
-        os.makedirs(export_dir, exist_ok=True)
-    accelerator.barrier()
     if epoch_checkpoints(ckpt_dir) and not args.resume:
         raise FileExistsError(f"{ckpt_dir} already holds epoch checkpoints: pass --resume to continue that run, "
                               "or use a new --output_dir")
 
-    if args.init_from_checkpoint and args.pretrained_weights:
-        say(f"WARNING: --pretrained_weights {args.pretrained_weights} ignored: --init_from_checkpoint supplies every weight")
+    weights_from = "--init_from_checkpoint" if args.init_from_checkpoint else "--branch_from" if args.branch_from else None
+    if weights_from and args.pretrained_weights:
+        say(f"WARNING: --pretrained_weights {args.pretrained_weights} ignored: {weights_from} supplies every weight")
     student, teacher, gram_teacher = build_models(vit_kwargs or DINOV3_VITB16_KWARGS,
-                                                  None if args.init_from_checkpoint else args.pretrained_weights,
+                                                  None if weights_from else args.pretrained_weights,
                                                   head_kwargs or HEAD_KWARGS, gram=not args.no_gram)
     if args.no_gram:
         say("Gram: OFF (--no_gram): no Gram teacher built or loaded, no Gram loss, no Gram refreshes; "
@@ -330,29 +376,41 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     step, epochs_done, gram_refreshes, ckpt = 0, 0, [], None
     if args.resume:
         found = epoch_checkpoints(ckpt_dir)
-        if not found:
-            say(f"no checkpoint in {ckpt_dir}, starting from scratch")
-        else:
+        if found:
             ckpt = torch.load(found[-1][1], map_location="cpu", weights_only=False)
             check_resume(ckpt, args, world_size, epoch_length, data_fingerprint)  # raises before anything on disk is touched
-    if main:  # after the resume check: a rejected --resume must not overwrite the record of the real run
+        elif not branching:  # a branch's start prints its "branched from" line below instead
+            say(f"no checkpoint in {ckpt_dir}, starting from scratch")
+    if branching:  # its every refusal raises here, before anything on disk is touched
+        ckpt = load_branch_source(args, stop_epoch, world_size, epoch_length, data_fingerprint)
+    if main:  # after the resume / branch checks: a rejected run creates nothing and must not overwrite the record of the real run
+        os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(export_dir, exist_ok=True)
         info = dict(vars(args), decode_min_side=decode_side, effective_peak_lr=sch["peak_lr"], effective_end_lr=sch["end_lr"],
                     lr_scaling_factor=sch["factor"], world_size=world_size, global_batch_size=global_batch,
                     epoch_length=epoch_length, total_steps=total_steps)
         with open(os.path.join(out, "args.json"), "w") as f:
             json.dump(info, f, indent=2)
+    accelerator.barrier()
     if ckpt is not None:
         student_unwrapped.load_state_dict(ckpt["student"])
         teacher.load_state_dict(ckpt["teacher"])
-        if gram_teacher is not None:  # --no_gram: the checkpoint's gram_teacher is None
+        if branching:  # the anchor: the source's EMA teacher backbone, mapped as --init_from_checkpoint maps it (the source has no Gram teacher)
+            gram_teacher.load_state_dict({k: v for k, v in ckpt["teacher"].items() if k.startswith("backbone.")}, strict=True)
+        elif gram_teacher is not None:  # --no_gram: the checkpoint's gram_teacher is None
             gram_teacher.load_state_dict(ckpt["gram_teacher"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        step, epochs_done, gram_refreshes = ckpt["step"], ckpt["epoch"], list(ckpt["gram_refreshes"])
+        step, epochs_done = ckpt["step"], ckpt["epoch"]
+        gram_refreshes = [] if branching else list(ckpt["gram_refreshes"])  # a branch's refreshes are its own
         random.setstate(ckpt["rng"]["python"])
         np.random.set_state(ckpt["rng"]["numpy"])
         torch.set_rng_state(ckpt["rng"]["torch"])
-        restored = "student/teacher/optimizer/RNG restored" if args.no_gram else "student/teacher/Gram teacher/optimizer/RNG restored"
-        say(f"resumed from {found[-1][1]}: {epochs_done} epochs / {step} steps done, Gram refreshes {gram_refreshes}, {restored}")
+        if branching:
+            say(f"branched from {args.branch_from}: its step {step}, epoch {epochs_done}; student/teacher/optimizer/RNG restored; Gram teacher <- its "
+                f"EMA teacher backbone; Gram ON, weight {args.gram_weight:g}, refreshes after steps {args.gram_refresh_steps}")
+        else:
+            restored = "student/teacher/optimizer/RNG restored" if args.no_gram else "student/teacher/Gram teacher/optimizer/RNG restored"
+            say(f"resumed from {found[-1][1]}: {epochs_done} epochs / {step} steps done, Gram refreshes {gram_refreshes}, {restored}")
         del ckpt
     summary = lambda: dict(step=step, epoch=epochs_done, gram_refreshes=list(gram_refreshes),
                            peak_lr=sch["peak_lr"], epoch_length=epoch_length)
