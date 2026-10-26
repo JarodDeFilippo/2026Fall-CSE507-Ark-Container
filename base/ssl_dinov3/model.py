@@ -1,6 +1,8 @@
 """Student / EMA teacher / Gram teacher for Stage A, as dinov3/train/ssl_meta_arch.py builds them (SSLMetaArch.__init__ +
 init_weights), minus FSDP. Backbone = Meta's DinoVisionTransformer with Ark's DINOV3_VITB16_KWARGS (base/models.py), so the
-exported teacher backbone loads into Ark's vit_base_dinov3 unchanged."""
+exported teacher backbone loads into Ark's vit_base_dinov3 unchanged. ssl_pretrain.py adds the student's training-recipe kwargs
+(drop_path_rate, pos_embed_rope_rescale_coords, untie_global_and_local_cls_norm) to a copy of those kwargs; the teachers are copies of
+the student and run in eval mode, where none of the three acts."""
 import copy
 
 import torch
@@ -19,7 +21,10 @@ def build_backbone(vit_kwargs, weights_path=None):
     if weights_path:
         # Meta's hub loads this flat backbone file with strict=True; so do we
         state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
-        backbone.load_state_dict(state_dict, strict=True)
+        if backbone.local_cls_norm is not None:  # untie_global_and_local_cls_norm: the stock file has no local_cls_norm, so it starts as
+            for name in ("weight", "bias"):       # a copy of the stock norm (load_state_dict copies the values: its own parameters, not shared)
+                state_dict.setdefault("local_cls_norm." + name, state_dict["norm." + name])
+        backbone.load_state_dict(state_dict, strict=True)  # every other key exactly as before
     return backbone
 
 
@@ -48,5 +53,6 @@ def build_models(vit_kwargs, weights_path=None, head_kwargs=HEAD_KWARGS, gram=Tr
 
 
 def export_backbone(backbone):
-    """Flat CPU state dict of a backbone: the same keys as the stock file (188 for ViT-B/16), for Ark's strict guard."""
-    return {k: v.detach().cpu().clone() for k, v in backbone.state_dict().items()}
+    """Flat CPU state dict of a backbone: the same keys as the stock file (188 for ViT-B/16), for Ark's strict guard. local_cls_norm
+    (--untie_local_cls_norm) is left out: Meta applies it to the local crops in train mode only, never in eval."""
+    return {k: v.detach().cpu().clone() for k, v in backbone.state_dict().items() if not k.startswith("local_cls_norm.")}

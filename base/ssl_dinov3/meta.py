@@ -185,7 +185,8 @@ class SSLMetaArch(nn.Module):
 
         global_crops = global_crops.flatten(0, 1)
 
-        # Forward global and local crops through the student backbone jointly
+        # Forward global and local crops through the student backbone jointly. Entry 1 is the local crops: with
+        # untie_global_and_local_cls_norm, Meta's forward_features_list applies local_cls_norm to idx == 1 (train mode only)
         global_out, local_out = self.student.backbone(
             [global_crops, local_crops.flatten(0, 1)],
             masks=[masks, None],
