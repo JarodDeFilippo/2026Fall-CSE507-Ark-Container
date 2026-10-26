@@ -21,6 +21,12 @@
 # run dir ssl_dinov3_cxr_constlr_nogram_seed_100, with the stop epoch read from chain/constlr_nogram_stop_after.txt instead (the same rules, cluster-only too; chain/constlr_stop_after.txt
 # is not read then), and one `run:` line printed before the launch. Any other non-empty value is refused before anything is read. run_d1_8_constlr_nogram_gaudi.sh sets it: its own
 # 4-card job outside the chain, never a phase.
+# CONSTLR_PLAIN=1, only together with CONSTLR_NOGRAM=1, makes the no-Gram trunk the plain one, "DINO-X ConstLR 224, no Gram, plain": the same launch line WITHOUT RECIPE, so --no_gram in place of
+# --gram_refresh_steps 10000,20000,30000 is the only difference from the phase, the one-variable Gram-off control of ssl_dinov3_cxr_constlr_seed_100 (Jarod, 2026-10-26; the hypothesis: Gram anchoring
+# from step 0 capped the probe), into its own run dir ssl_dinov3_cxr_constlr_nogram_plain_seed_100, with the stop epoch read from chain/constlr_nogram_plain_stop_after.txt (the same rules, cluster-only
+# too; neither of the other two stop files is read then) and its own `run:` line. TRUNK below stays the no-Gram trunk's run dir (the one with RECIPE), which every branch starts from. Refused before anything is read: any other
+# non-empty value, CONSTLR_NOGRAM unset or empty, and any CONSTLR_BRANCH_* set (branches of the plain trunk are a later feature). run_d1_8_constlr_nogram_plain_gaudi.sh sets both CONSTLR_NOGRAM and
+# CONSTLR_PLAIN: its own 4-card job outside the chain, never a phase.
 # CONSTLR_BRANCH_EPOCH=K, CONSTLR_BRANCH_STOP=STOP, CONSTLR_BRANCH_EVERY=EVERY and CONSTLR_BRANCH_COUNT=COUNT (all four; run_d1_8_branch_gram_gaudi.sh sets them, never the
 # chain) make this a Gram-anchored branch of the no-Gram trunk: the trunk's launch line (RECIPE included, which --branch_from requires to match the source) with --no_gram replaced by --branch_from
 # /workspace/ssl_dinov3_cxr_constlr_nogram_seed_100/ckpt/epoch_<K %04d>.pth --gram_refresh_steps <list>, into the run dir
@@ -36,7 +42,11 @@
 set -euo pipefail
 NOGRAM=${CONSTLR_NOGRAM:-}  # first, before anything is read or launched
 [[ -z $NOGRAM || $NOGRAM == 1 ]] || { echo "ERROR: CONSTLR_NOGRAM holds '$NOGRAM', which is not empty or 1" >&2; exit 1; }
+PLAIN=${CONSTLR_PLAIN:-}
+[[ -z $PLAIN || $PLAIN == 1 ]] || { echo "ERROR: CONSTLR_PLAIN holds '$PLAIN', which is not empty or 1" >&2; exit 1; }
 BRANCH=${CONSTLR_BRANCH_EPOCH:-}${CONSTLR_BRANCH_STOP:-}${CONSTLR_BRANCH_EVERY:-}${CONSTLR_BRANCH_COUNT:-}  # non-empty: a branch (all four are then checked below)
+[[ -z $PLAIN || -z $BRANCH ]] || { echo "ERROR: CONSTLR_PLAIN and CONSTLR_BRANCH_* are both set: a branch continues the no-Gram trunk with the DINOv3 recipe, and branches of the plain trunk are a later feature, so unset CONSTLR_PLAIN" >&2; exit 1; }
+[[ -z $PLAIN || -n $NOGRAM ]] || { echo "ERROR: CONSTLR_PLAIN=1 is set without CONSTLR_NOGRAM=1: the plain trunk is the no-Gram trunk without the DINOv3 recipe, so set both" >&2; exit 1; }
 [[ -z $BRANCH || -z $NOGRAM ]] || { echo "ERROR: CONSTLR_NOGRAM and CONSTLR_BRANCH_* are both set: a branch launches the no-Gram trunk's line with --branch_from in place of --no_gram, so set only the CONSTLR_BRANCH_* variables" >&2; exit 1; }
 source "$(dirname "${BASH_SOURCE[0]}")/ssl_common.sh"
 
@@ -46,10 +56,17 @@ RUN=ssl_dinov3_cxr_constlr_seed_100
 STOP_FILE=chain/constlr_stop_after.txt
 GRAM_ARGS=(--gram_refresh_steps 10000,20000,30000)
 RECIPE=(--drop_path_rate 0.3 --rope_rescale_coords 2 --untie_local_cls_norm)  # the trunk's and its branches' (DINOv3's training recipe), never the phase's
+RECIPE_NOTE="DINOv3 recipe: ${RECIPE[*]}"  # what the trunk's run: line says about it
 if [[ -n $NOGRAM ]]; then
   RUN=$TRUNK
   STOP_FILE=chain/constlr_nogram_stop_after.txt
   GRAM_ARGS=("${RECIPE[@]}" --no_gram)
+  if [[ -n $PLAIN ]]; then  # no recipe flags at all (not an empty RECIPE: "${RECIPE[@]}" of an empty array is an unbound variable under set -u before bash 4.4); TRUNK is left alone
+    RUN=ssl_dinov3_cxr_constlr_nogram_plain_seed_100
+    STOP_FILE=chain/constlr_nogram_plain_stop_after.txt
+    GRAM_ARGS=(--no_gram)
+    RECIPE_NOTE="plain: no DINOv3 recipe flags, the one-variable Gram-off control of ssl_dinov3_cxr_constlr_seed_100"
+  fi
 fi
 LR=$(read_setting chain/main_lr.txt '^([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$' 'a positive number such as 2e-3 or 0.0003')
 awk -v v="$LR" 'BEGIN { exit !(v + 0 > 0) }' || { echo "ERROR: chain/main_lr.txt holds '$LR', which is not positive" >&2; exit 1; }
@@ -92,6 +109,6 @@ if [[ -n $BRANCH ]]; then
   echo "run: $RUN (Gram-anchored branch of $TRUNK from its epoch $K: --branch_from /workspace/$SOURCE --gram_refresh_steps in place of --no_gram; stop after epoch $STOP_AFTER)"
   echo "gram refresh steps: $REFRESH (branch step $BRANCH_STEP = epoch $K x epoch_length $EPOCH_LENGTH from $TRUNK_ARGS, then every $EVERY steps, $COUNT times)"
 fi
-[[ -z $NOGRAM ]] || echo "run: $RUN (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; DINOv3 recipe: ${RECIPE[*]}; stop after epoch $STOP_AFTER from $STOP_FILE)"
+[[ -z $NOGRAM ]] || echo "run: $RUN (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; $RECIPE_NOTE; stop after epoch $STOP_AFTER from $STOP_FILE)"
 
 ssl_launch "$RUN" --lr "$LR" --min_lr "$LR" --no_lr_scaling --epochs "$EPOCHS" --stop_after_epochs "$STOP_AFTER" "${GRAM_ARGS[@]}"
