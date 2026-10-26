@@ -69,7 +69,10 @@ class Accelerator:
             world_size=self.world_size,
         )
 
-    def wrap_model(self, model):
+    def wrap_model(self, model, find_unused_parameters=True):
+        """DDP-wrap the model (a no-op in one process). find_unused_parameters=True is for Ark+
+        fine-tuning, where one dataset head is active per step; False is for a model whose every
+        parameter gets a gradient every step (the SSL student), saving the per-iteration search."""
         if not self.distributed:
             return model
 
@@ -78,13 +81,13 @@ class Accelerator:
                 model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
-                find_unused_parameters=True,
+                find_unused_parameters=find_unused_parameters,
             )
 
         return DistributedDataParallel(
             model,
             device_ids=None,
-            find_unused_parameters=True,
+            find_unused_parameters=find_unused_parameters,
         )
 
     @staticmethod

@@ -18,6 +18,11 @@ export/teacher_backbone_epoch_NNNN.pth (flat stock-key backbone, loads into Ark'
 The loss columns of ssl_losses.csv are global means over the ranks, built the way Ark's trainer.py builds its losses: each
 rank reads its own on the host with .item(), a tensor made from those floats is all-reduced, then divided by world_size.
 
+Each student submodule (backbone, dino_head, ibot_head) is its own DDP module with find_unused_parameters=False, because every student parameter gets a
+gradient on every step (both heads, the mask token, the storage tokens and, with --untie_local_cls_norm, local_cls_norm; the --freeze_backbone_epochs freeze
+and the last-layer freeze are LR-0 freezes, so their gradients still flow), which saves DDP its per-iteration search for unused parameters, and if that ever
+stops being true DDP raises at the next forward instead of hanging (Ark+ fine-tuning keeps the default, True: one dataset head is active per step).
+
 --no_gram trains with no Gram teacher at all: none is built (build_models gram=False), moved to the device, loaded (--init_from_checkpoint
 included) or run; no Gram loss is computed, nothing is refreshed, and the batches carry no Gram crops (the global crops are still cut at
 2 x --global_crops_size and resized, so the student / teacher crops are the Gram runs'). An explicit --gram_weight, --gram_refresh_steps or
@@ -393,8 +398,8 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     student, teacher = student.to(device), teacher.to(device)
     if gram_teacher is not None:
         gram_teacher = gram_teacher.to(device)
-    # Meta calls student.backbone / dino_head / ibot_head separately, so each is its own DDP module
-    student = nn.ModuleDict({k: accelerator.wrap_model(m) for k, m in student.items()})
+    # Meta calls student.backbone / dino_head / ibot_head separately, so each is its own DDP module; every parameter gets a gradient every step (docstring)
+    student = nn.ModuleDict({k: accelerator.wrap_model(m, find_unused_parameters=False) for k, m in student.items()})
     student_unwrapped = nn.ModuleDict({k: accelerator.unwrap_model(m) for k, m in student.items()})
     meta = SSLMetaArch(student, teacher, gram_teacher, n_local_crops=args.local_crops_number,
                        gram_loss_weight=args.gram_weight,
