@@ -1603,6 +1603,7 @@ scripts.append(os.path.join(REPO, "run_d1_8s_timing_gaudi.sh"))
 scripts.append(os.path.join(REPO, "run_d1_8hires_gram512_gaudi.sh"))  # the Gram-512 twin's sbatch wrapper; its contents are checked after the hires checks
 scripts.append(os.path.join(REPO, "run_d1_8_constlr_nogram_gaudi.sh"))  # the no-Gram trunk's sbatch wrapper; its contents are checked after the constlr checks
 scripts.append(os.path.join(REPO, "run_d1_8_branch_gram_gaudi.sh"))  # the Gram-anchored branches' sbatch wrapper; its contents are checked after the no-Gram wrapper's
+scripts.append(os.path.join(REPO, "run_d1_8_constlr_nogram_plain_gaudi.sh"))  # the plain no-Gram trunk's sbatch wrapper; its contents are checked after the branch wrapper's
 for script in scripts:
     assert os.access(script, os.X_OK), script
     subprocess.run(["bash", "-n", script], check=True)
@@ -2044,6 +2045,122 @@ print("OK (k) branch launcher: run_d1_8_branch_gram_gaudi.sh (mode 755, 4 cards,
       "card check), K / STOP / EVERY / COUNT that are not positive integers (no leading zero; EVERY at most 9 digits, COUNT 4, both accepted at the limit), STOP above the 1000 ceiling "
       "(accepted at 1000) or not after K, a trunk args.json without a positive epoch_length, CONSTLR_NOGRAM set as well, one of the four variables alone or emptied, and a missing source "
       "on a first start (a branch with an epoch checkpoint of its own resumes without it); the phase and the trunk launch and print exactly as before with all four variables empty")
+
+# the plain no-Gram trunk ("DINO-X ConstLR 224, no Gram, plain"): CONSTLR_NOGRAM=1 CONSTLR_PLAIN=1 (what run_d1_8_constlr_nogram_plain_gaudi.sh sets) launches the phase's line with --no_gram in place of
+# --gram_refresh_steps 10000,20000,30000 and NOTHING else changed, i.e. the no-Gram trunk's line without the DINOv3 recipe (RECIPE): the one-variable Gram-off control of ssl_dinov3_cxr_constlr_seed_100. Its own run dir
+# and its own cluster-only stop file (neither of the other two is read); the phase, the no-Gram trunk and its branches (all above) launch and print exactly as before
+PLAIN_ENV, PLAIN_RUN, PLAIN_STOP_FILE = dict(NOGRAM_ENV, CONSTLR_PLAIN="1"), "/workspace/ssl_dinov3_cxr_constlr_nogram_plain_seed_100", "constlr_nogram_plain_stop_after.txt"
+RECIPE_FLAGS = [flag for flag in RECIPE if flag.startswith("--")]  # RECIPE also holds the values 0.3 and 2
+
+
+def plain_run(root, env=PLAIN_ENV, **override):  # constlr_run with the plain stop file written too, " 60 " (None: absent): the argv shows which stop file was read (the phase's 30, the no-Gram trunk's 100, the plain one's 60)
+    return constlr_run(root, env=env, **dict({PLAIN_STOP_FILE: " 60 \n"}, **override))
+
+
+def plain_argv_for(stop):  # constlr_argv(stop) with the run dir swapped and the Gram refresh list replaced by --no_gram, nothing else
+    argv = constlr_argv(stop)
+    assert argv[-2:] == ["--gram_refresh_steps", "10000,20000,30000"]
+    return [PLAIN_RUN if arg == "/workspace/ssl_dinov3_cxr_constlr_seed_100" else arg for arg in argv[:-2]] + ["--no_gram"]
+
+
+plain_root = sandbox()
+result, plain_argv = plain_run(plain_root)  # constlr_nogram_plain_stop_after.txt " 60 "; the phase's 30 and the no-Gram trunk's 100 are not read
+assert result.returncode == 0 and result.stderr == "", result.stderr
+assert plain_argv == plain_argv_for("60"), plain_argv
+assert result.stdout.splitlines() == ["run: ssl_dinov3_cxr_constlr_nogram_plain_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; plain: no DINOv3 recipe flags, "
+                                      "the one-variable Gram-off control of ssl_dinov3_cxr_constlr_seed_100; stop after epoch 60 from chain/constlr_nogram_plain_stop_after.txt)"], result.stdout
+expanded["constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_PLAIN=1"] = "./gaudi.sh " + " ".join(plain_argv)
+assert plain_argv[-1:] == ["--no_gram"] and "--gram_refresh_steps" not in plain_argv and not any(flag in plain_argv for flag in RECIPE_FLAGS)  # --no_gram, and none of the three recipe flags
+# the no-Gram trunk's line at the same stop epoch is this one with RECIPE in front of --no_gram (and its own run dir): the three recipe flags are all that separates the two no-Gram runs
+result, plain_trunk_60 = constlr_run(plain_root, env=NOGRAM_ENV, **{"constlr_nogram_stop_after.txt": "60\n"})
+assert result.returncode == 0 and plain_trunk_60 == nogram_argv_for("60"), (result.stderr, plain_trunk_60)
+assert plain_trunk_60 == [NOGRAM_RUN if arg == PLAIN_RUN else arg for arg in plain_argv[:-1]] + RECIPE + ["--no_gram"], (plain_trunk_60, plain_argv)
+# the trainer reads the plain argv as the run means it: stop after epoch 60 of the 1000-epoch ceiling, no Gram teacher (weight 0, no refreshes, the size left at the 448 default), the recipe at the trainer's
+# defaults (no drop path, no RoPE rescale, tied local CLS norm), and every other parsed setting the phase's at the same stop epoch: only --no_gram (with the Gram weight and refresh list it fixes) and the run dir differ
+result, plain_phase_60 = constlr_run(plain_root, **{"constlr_stop_after.txt": "60\n"})
+assert result.returncode == 0 and plain_phase_60 == constlr_argv("60"), (result.stderr, plain_phase_60)
+plain_parsed = ssl_pretrain.parse_args(plain_argv[plain_argv.index("ssl_pretrain.py") + 1:])
+phase_parsed = ssl_pretrain.parse_args(plain_phase_60[plain_phase_60.index("ssl_pretrain.py") + 1:])
+assert ssl_pretrain.check_args(plain_parsed) == 60 == ssl_pretrain.check_args(phase_parsed) and plain_parsed.epochs == 1000
+assert (plain_parsed.no_gram, plain_parsed.gram_weight, plain_parsed.gram_refresh_steps, plain_parsed.gram_teacher_size) == (True, 0.0, [], 448)
+assert tuple(getattr(plain_parsed, k) for k in RECIPE_KEYS) == (0.0, None, False) == tuple(getattr(phase_parsed, k) for k in RECIPE_KEYS)
+plain_differs = {k for k in vars(plain_parsed) if getattr(plain_parsed, k) != getattr(phase_parsed, k)}
+assert plain_differs == {"output_dir", "no_gram", "gram_weight", "gram_refresh_steps"}, plain_differs
+assert plain_parsed.output_dir == PLAIN_RUN and plain_parsed.resume  # a resubmit resumes
+# a missing or invalid plain stop file is refused naming itself (neither of the other two, which stay valid) before gaudi.sh is reached, and before any run: line
+for stop in (None, "", "0", "2.5", "thirty", "-3", "1001", "18446744073709551617"):  # None: absent; 1001: one past the ceiling; 2**64 + 1: bash arithmetic would read it as 1
+    result, refused_argv = plain_run(plain_root, **{PLAIN_STOP_FILE: stop})
+    assert result.returncode == 1 and "ERROR" in result.stderr and PLAIN_STOP_FILE in result.stderr and refused_argv is None, (stop, result.stderr)
+    assert "constlr_stop_after.txt" not in result.stderr and "constlr_nogram_stop_after.txt" not in result.stderr and result.stdout == "", (stop, result.stderr, result.stdout)
+assert "ceiling of 1000" in result.stderr, result.stderr  # the last one is refused for being above the ceiling, and the message names it
+# the three stop files are independent: the plain run needs neither of the other two ...
+result, solo_argv = plain_run(plain_root, **{"constlr_stop_after.txt": None, "constlr_nogram_stop_after.txt": None})
+assert result.returncode == 0 and solo_argv == plain_argv, (result.stderr, solo_argv)
+# ... and the phase and the no-Gram trunk launch and print exactly as before, the plain stop file present (not read: the argv has their 30 and 100) or absent, CONSTLR_PLAIN unset or empty
+for plain_file in (" 60 \n", None):
+    for env in (NOGRAM_ENV, dict(NOGRAM_ENV, CONSTLR_PLAIN="")):
+        result, kept_argv = plain_run(plain_root, env=env, **{PLAIN_STOP_FILE: plain_file})
+        assert result.returncode == 0 and kept_argv == nogram_argv_for("100") and result.stderr == "", (plain_file, env, result.stderr, kept_argv)
+        assert result.stdout.splitlines() == ["run: ssl_dinov3_cxr_constlr_nogram_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; DINOv3 recipe: "
+                                              "--drop_path_rate 0.3 --rope_rescale_coords 2 --untie_local_cls_norm; "
+                                              "stop after epoch 100 from chain/constlr_nogram_stop_after.txt)"], (plain_file, env, result.stdout)
+    for env in (ALLOC4, dict(ALLOC4, CONSTLR_PLAIN="")):
+        result, kept_argv = plain_run(plain_root, env=env, **{PLAIN_STOP_FILE: plain_file})
+        assert result.returncode == 0 and kept_argv == constlr_argv("30") and (result.stdout, result.stderr) == ("", ""), (plain_file, env, result.stderr, kept_argv)
+bres, kept_bargv = branch_run(branch_dir, "10", "40")  # the branches (the wrapper and sandbox above): an empty CONSTLR_PLAIN changes neither the launch line nor the output
+bres_empty, kept_bargv_empty = branch_run(branch_dir, "10", "40", env=dict(ALLOC4, CONSTLR_PLAIN=""))
+assert bres.returncode == bres_empty.returncode == 0 and kept_bargv == kept_bargv_empty == bargv, (bres.stderr, bres_empty.stderr)
+assert (bres.stdout, bres.stderr) == (bres_empty.stdout, bres_empty.stderr) and bres.stderr == "" and len(bres.stdout.splitlines()) == 2, (bres.stdout, bres_empty.stdout)
+# CONSTLR_PLAIN is refused before anything is read (plain_bare has no setting file to miss) and so before anything is launched (plain_root has them all): a value other than empty or 1; 1 without
+# CONSTLR_NOGRAM=1; 1 with any CONSTLR_BRANCH_* (with CONSTLR_NOGRAM=1 or without it)
+plain_bare = sandbox()
+PLAIN_NEEDS_NOGRAM = "ERROR: CONSTLR_PLAIN=1 is set without CONSTLR_NOGRAM=1: the plain trunk is the no-Gram trunk without the DINOv3 recipe, so set both\n"
+PLAIN_NO_BRANCH = ("ERROR: CONSTLR_PLAIN and CONSTLR_BRANCH_* are both set: a branch continues the no-Gram trunk with the DINOv3 recipe, and branches of the plain trunk are a later feature, "
+                   "so unset CONSTLR_PLAIN\n")
+plain_refusals = [(dict(NOGRAM_ENV, CONSTLR_PLAIN=value), "ERROR: CONSTLR_PLAIN holds '%s', which is not empty or 1\n" % value) for value in ("0", "yes", "2", " 1")]
+plain_refusals += [(dict(ALLOC4, CONSTLR_PLAIN="2"), "ERROR: CONSTLR_PLAIN holds '2', which is not empty or 1\n"),  # the value is checked first, with or without CONSTLR_NOGRAM
+                   (dict(ALLOC4, CONSTLR_PLAIN="1"), PLAIN_NEEDS_NOGRAM), (dict(ALLOC4, CONSTLR_PLAIN="1", CONSTLR_NOGRAM=""), PLAIN_NEEDS_NOGRAM)]
+plain_refusals += [(dict(base_env, CONSTLR_PLAIN="1", **branch_vars), PLAIN_NO_BRANCH) for base_env in (ALLOC4, NOGRAM_ENV)
+                   for branch_vars in (dict(CONSTLR_BRANCH_EPOCH="10"), dict(CONSTLR_BRANCH_STOP="40"), branch_all)]
+for env, expected_error in plain_refusals:
+    result = run_script(plain_bare, "chain/constlr.sh", env=env)
+    assert result.returncode == 1 and result.stderr == expected_error and result.stdout == "" and launched(plain_bare) is None, (env, result.stderr)
+    result, refused_argv = plain_run(plain_root, env=env)
+    assert result.returncode == 1 and result.stderr == expected_error and result.stdout == "" and refused_argv is None, (env, result.stderr)
+branch_refused(branch_root(), ("10", "40"), "CONSTLR_PLAIN", "CONSTLR_BRANCH_*", "later feature", env=dict(ALLOC4, CONSTLR_PLAIN="1"))  # the branch wrapper sets all four: refused naming both
+# the wrapper: bash -n and the executable bit are checked with the other scripts above; here its mode, sbatch header, guards and last line, that it is the no-Gram trunk's wrapper (nogram_code, above) but for
+# the job name, the comments and CONSTLR_PLAIN=1, and that a copy with its cd pointed at a sandbox launches the plain line from outside the repo (as sbatch starts it)
+PLAIN_SCRIPT = os.path.join(REPO, "run_d1_8_constlr_nogram_plain_gaudi.sh")
+assert stat.S_IMODE(os.stat(PLAIN_SCRIPT).st_mode) == 0o755
+plain_text = open(PLAIN_SCRIPT).read()
+plain_lines = plain_text.splitlines()
+assert [line[len("#SBATCH "):] for line in plain_lines if line.startswith("#SBATCH ")] == [
+    "--job-name=d1-8-nogram-plain", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"], plain_lines
+plain_code = [line for line in plain_lines if line and not line.startswith("#")]
+assert plain_code[-1] == "CONSTLR_NOGRAM=1 CONSTLR_PLAIN=1 exec ./chain/constlr.sh" and plain_code[:-1] == nogram_code[:-1], plain_code
+for needle in ("export PT_HPU_LAZY_MODE=1", "CONSTLR_NOGRAM=1", "CONSTLR_PLAIN=1", "exec ./chain/constlr.sh", "./gaudi_check_cards.sh || exit 1", "[[ -x ./gaudi_verify_busy.sh ]]", "./gaudi_verify_busy.sh 900 &"):
+    assert any(needle in line for line in plain_code), needle  # in a command, not only in a comment
+assert all(line.startswith("#") for line in plain_lines if "phases.txt" in line), plain_lines  # not a chain phase: phases.txt is named in comments only
+assert "chain/constlr_nogram_plain_stop_after.txt" in plain_text and "81.18 / 81.53 / 81.61 / 81.58" in plain_text  # the comments name the stop file and the Gram run's probes it is compared with
+wrap_root = sandbox(timing=True)  # also the gaudi_check_cards.sh / gaudi_verify_busy.sh recorders
+open(os.path.join(wrap_root, "chain", "main_lr.txt"), "w").write("0.002\n")
+open(os.path.join(wrap_root, "chain", PLAIN_STOP_FILE), "w").write("60\n")  # the only stop file
+assert plain_text.count(BRANCH_CD) == 1, BRANCH_CD
+open(os.path.join(wrap_root, "plain_wrapper.sh"), "w").write(plain_text.replace(BRANCH_CD, "cd %s || exit 1" % shlex.quote(wrap_root)))
+result = subprocess.run(["bash", os.path.join(wrap_root, "plain_wrapper.sh")], cwd=branch_elsewhere, env=ALLOC4, capture_output=True, text=True)
+assert result.returncode == 0 and result.stderr == "" and launched(wrap_root) == plain_argv_for("60"), (result.stderr, launched(wrap_root))
+assert result.stdout.startswith("run: ssl_dinov3_cxr_constlr_nogram_plain_seed_100 (no Gram teacher: ") and os.path.exists(os.path.join(wrap_root, "cards_checked")), result.stdout
+for _ in range(50):  # the busy check runs in the background
+    if os.path.exists(os.path.join(wrap_root, "busy_arg.txt")):
+        break
+    subprocess.run(["sleep", "0.1"])
+assert open(os.path.join(wrap_root, "busy_arg.txt")).read() == "900\n"
+print("OK (k) plain no-Gram trunk: constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_PLAIN=1 (run_d1_8_constlr_nogram_plain_gaudi.sh: mode 755, 4 cards, the no-Gram trunk's wrapper but for the job name, the comments and "
+      "CONSTLR_PLAIN=1, names phases.txt only in comments, launches the line below from outside the repo) launches the phase's line with --no_gram in place of the Gram refresh list, none of the three DINOv3 recipe flags "
+      "(the no-Gram trunk's line is this one plus RECIPE) and nothing else changed, into ssl_dinov3_cxr_constlr_nogram_plain_seed_100 with the stop epoch from constlr_nogram_plain_stop_after.txt only (a missing or "
+      "invalid file is refused naming itself, the other two stop files neither read nor needed); the argv parses to the phase's settings but for no_gram (and the Gram weight / refresh list it fixes) and the run dir, "
+      "the recipe at the trainer's defaults; CONSTLR_PLAIN other than empty or 1, 1 without CONSTLR_NOGRAM=1 or 1 with any CONSTLR_BRANCH_* is refused before anything is read; the phase, the no-Gram trunk "
+      "and its branches launch and print exactly as before, the plain stop file present or absent and CONSTLR_PLAIN empty")
 
 # hires.sh ("DINO-X ConstLR 512 px"): a separate run from the stock weights, constlr.sh with only the crops and the batch changed. Four setting files,
 # each missing or invalid one refused naming it before gaudi.sh is reached (the LR file is constlr's own main_lr.txt)
