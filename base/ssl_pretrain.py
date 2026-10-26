@@ -17,6 +17,13 @@ export/teacher_backbone_epoch_NNNN.pth (flat stock-key backbone, loads into Ark'
 
 The loss columns of ssl_losses.csv are global means over the ranks, built the way Ark's trainer.py builds its losses: each
 rank reads its own on the host with .item(), a tensor made from those floats is all-reduced, then divided by world_size.
+
+--no_gram trains with no Gram teacher at all: none is built (build_models gram=False), moved to the device, loaded (--init_from_checkpoint
+included) or run; no Gram loss is computed, nothing is refreshed, and the batches carry no Gram crops (the global crops are still cut at
+2 x --global_crops_size and resized, so the student / teacher crops are the Gram runs'). An explicit --gram_weight, --gram_refresh_steps or
+--gram_teacher_size is refused. The flag is locked on --resume, args.json records it, and the checkpoint's gram_teacher is None. ssl_losses.csv
+keeps all 15 columns and writes gram and gram_weight as 0.0 in every row, never blank: the DINO-X report builder parses them as numbers and
+counts a blank as unreadable.
 """
 import argparse
 import csv
@@ -51,13 +58,17 @@ CSV_HEADER = ["step", "epoch", "dino_global", "dino_local", "koleo", "ibot", "gr
 LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "ibot_loss", "gram_loss")
 # what shapes the run: a --resume must match its checkpoint on these (the other flags may change between invocations).
 # init_from_checkpoint: a run started from one resumes only with the same one (not re-applied then); any other run's checkpoint is refused
+# no_gram: a no-Gram run resumes only as one (its checkpoint has no Gram teacher), and a Gram run never as one
 RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_lr_scaling", "warmup_epochs",
                 "weight_decay", "momentum_teacher", "teacher_temp_warmup_epochs", "gram_weight", "global_crops_size",
                 "local_crops_size", "gram_teacher_size", "gram_refresh_steps", "freeze_backbone_epochs", "local_crops_number",
-                "seed", "bf16", "world_size", "init_from_checkpoint")
+                "seed", "bf16", "world_size", "init_from_checkpoint", "no_gram")
 # checkpoints written before the crop-size flags existed (pilots, main, constlr) were all trained at these
 CROP_DEFAULTS = dict(global_crops_size=224, local_crops_size=96, gram_teacher_size=448)
+# keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, and --no_gram off
+ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False)
 PATCH_SIZE = 16  # DINOV3_VITB16_KWARGS patch_size: every crop side must be a multiple of it
+DEFAULT_GRAM_REFRESH_STEPS = "10000,20000,30000"  # --gram_refresh_steps when not given (Meta's three refreshes); --no_gram: none
 
 
 def parse_steps(text):
@@ -93,13 +104,19 @@ def parse_args(argv=None):
     p.add_argument("--weight_decay", type=float, default=0.04)
     p.add_argument("--momentum_teacher", type=float, default=0.999)
     p.add_argument("--teacher_temp_warmup_epochs", type=int, default=12)
-    p.add_argument("--gram_weight", type=float, default=2.0)
+    p.add_argument("--no_gram", action="store_true",
+                   help="train with no Gram teacher at all (none built or loaded, no Gram loss, no refreshes); the 2026-10-23 trunk run")
+    p.add_argument("--gram_weight", type=float, default=None,
+                   help="Gram loss weight (default 2.0; refused with --no_gram, where it is 0.0)")
     p.add_argument("--global_crops_size", type=int, default=224)
     p.add_argument("--local_crops_size", type=int, default=96)
     p.add_argument("--gram_teacher_size", type=int, default=None,
-                   help="default 2 x --global_crops_size (448 at the default 224): DINOv3's 2x Gram teacher, Sec. 4.3")
-    p.add_argument("--gram_refresh_steps", type=parse_steps, default="10000,20000,30000",
-                   help="comma-separated global steps after which the Gram teacher is reloaded from the EMA teacher")
+                   help="default 2 x --global_crops_size (448 at the default 224): DINOv3's 2x Gram teacher, Sec. 4.3. Refused with --no_gram, "
+                        "where it still resolves to 2 x global: it only sets the size the global crops are cut at before the resize to the "
+                        "global size, so the crops match the Gram runs'")
+    p.add_argument("--gram_refresh_steps", type=parse_steps, default=None,
+                   help=f"comma-separated global steps after which the Gram teacher is reloaded from the EMA teacher (default "
+                        f"{DEFAULT_GRAM_REFRESH_STEPS}; none: no refresh). Refused with --no_gram, where there are none")
     p.add_argument("--freeze_backbone_epochs", type=int, default=1, help="backbone LR 0 (heads train) for this many epochs")
     p.add_argument("--local_crops_number", type=int, default=8)
     p.add_argument("--resume", action="store_true")
@@ -112,6 +129,17 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if args.pretrained_weights is None and args.init_from_checkpoint is None:
         p.error("--pretrained_weights is required unless --init_from_checkpoint is given")
+    if args.no_gram:  # no Gram teacher: the Gram knobs have nothing to act on, so an explicit one is a mistake, not a no-op
+        for name, why in (("gram_weight", "there is no Gram loss to weight"), ("gram_refresh_steps", "there is no Gram teacher to refresh"),
+                          ("gram_teacher_size", "there is no Gram teacher to size; the global crops are cut at 2 x --global_crops_size")):
+            if getattr(args, name) is not None:
+                p.error(f"--{name} cannot be combined with --no_gram ({why})")
+        args.gram_weight, args.gram_refresh_steps = 0.0, []
+    else:
+        if args.gram_weight is None:
+            args.gram_weight = 2.0
+        if args.gram_refresh_steps is None:
+            args.gram_refresh_steps = parse_steps(DEFAULT_GRAM_REFRESH_STEPS)
     if args.gram_teacher_size is None:
         args.gram_teacher_size = 2 * args.global_crops_size
     return args
@@ -183,7 +211,7 @@ def save_atomic(obj, path):
 
 
 def check_resume(ckpt, args, world_size, epoch_length, data_fingerprint):
-    saved = dict(CROP_DEFAULTS, **ckpt["args"], world_size=ckpt["world_size"])  # no crop keys: an old checkpoint, 224 / 96 / 448
+    saved = dict(ARG_DEFAULTS, **ckpt["args"], world_size=ckpt["world_size"])  # no crop / no_gram keys: an old checkpoint, 224 / 96 / 448, Gram on
     now = dict(vars(args), world_size=world_size)
     diffs = [f"{k}: checkpoint {saved.get(k)!r}, now {now[k]!r}" for k in RESUME_MATCH if saved.get(k) != now[k]]
     if ckpt.get("data_fingerprint") != data_fingerprint:  # same names and length, different (or reordered) image list
@@ -232,7 +260,10 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
         say(f"WARNING: --pretrained_weights {args.pretrained_weights} ignored: --init_from_checkpoint supplies every weight")
     student, teacher, gram_teacher = build_models(vit_kwargs or DINOV3_VITB16_KWARGS,
                                                   None if args.init_from_checkpoint else args.pretrained_weights,
-                                                  head_kwargs or HEAD_KWARGS)
+                                                  head_kwargs or HEAD_KWARGS, gram=not args.no_gram)
+    if args.no_gram:
+        say("Gram: OFF (--no_gram): no Gram teacher built or loaded, no Gram loss, no Gram refreshes; "
+            "ssl_losses.csv gram and gram_weight columns are 0.0")
     # a resume of this run restores its own checkpoint below instead (check_resume: same init_from_checkpoint or refused)
     if args.init_from_checkpoint and not resuming_own:
         init = torch.load(args.init_from_checkpoint, map_location="cpu", weights_only=False)
@@ -242,13 +273,17 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
         student.load_state_dict(init["student"], strict=True)
         teacher.load_state_dict(init["teacher"], strict=True)
         # DINOv3 re-anchors the Gram teacher to the previous stage's EMA teacher (not to that stage's own, older Gram teacher)
-        gram_teacher.load_state_dict({k: v for k, v in init["teacher"].items() if k.startswith("backbone.")}, strict=True)
+        if gram_teacher is not None:  # --no_gram: nothing to anchor
+            gram_teacher.load_state_dict({k: v for k, v in init["teacher"].items() if k.startswith("backbone.")}, strict=True)
+        gram_init_note = "no Gram teacher (--no_gram)" if args.no_gram else "Gram teacher <- its EMA teacher backbone"
         was = dict(CROP_DEFAULTS, **init["args"])
         say(f"initialized from {args.init_from_checkpoint}: its step {init.get('step')}, epoch {init.get('epoch')}, crops global "
             f"{was['global_crops_size']} / local {was['local_crops_size']} / Gram teacher {was['gram_teacher_size']}; student and "
-            "teacher (heads included) loaded strictly, Gram teacher <- its EMA teacher backbone; fresh optimizer, step 0")
+            f"teacher (heads included) loaded strictly, {gram_init_note}; fresh optimizer, step 0")
         del init
-    student, teacher, gram_teacher = student.to(device), teacher.to(device), gram_teacher.to(device)
+    student, teacher = student.to(device), teacher.to(device)
+    if gram_teacher is not None:
+        gram_teacher = gram_teacher.to(device)
     # Meta calls student.backbone / dino_head / ibot_head separately, so each is its own DDP module
     student = nn.ModuleDict({k: accelerator.wrap_model(m) for k, m in student.items()})
     student_unwrapped = nn.ModuleDict({k: accelerator.unwrap_model(m) for k, m in student.items()})
@@ -259,10 +294,13 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     optimizer = build_optimizer(get_params_groups(student))
 
     transform = DataAugmentationCXR(local_crops_number=args.local_crops_number, global_crops_size=args.global_crops_size,
-                                    local_crops_size=args.local_crops_size, gram_teacher_crops_size=args.gram_teacher_size)
+                                    local_crops_size=args.local_crops_size, gram_teacher_crops_size=args.gram_teacher_size,
+                                    emit_gram_teacher_crops=not args.no_gram)
     decode_side = transform.decode_min_side  # follows the crop sizes: 1024 for 224 / 96 / 448 (as before), 2368 for 512 / 224 / 1024
+    gram_crops_note = (f"no Gram teacher (global crops cut at {args.gram_teacher_size} and resized to {args.global_crops_size}, as in the "
+                       "Gram runs)" if args.no_gram else f"Gram teacher {args.gram_teacher_size}")
     say(f"crops: global {args.global_crops_size}, local {args.local_crops_size} (x{args.local_crops_number}), "
-        f"Gram teacher {args.gram_teacher_size}; JPEG decode min side {decode_side}")
+        f"{gram_crops_note}; JPEG decode min side {decode_side}")
     if datasets_config is None:
         datasets_config = get_config(args.datasets_config)
     dataset = build_dataset(args.data_set, datasets_config, transform, check_exists=check_exists and main, decode_side=decode_side)
@@ -306,14 +344,15 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     if ckpt is not None:
         student_unwrapped.load_state_dict(ckpt["student"])
         teacher.load_state_dict(ckpt["teacher"])
-        gram_teacher.load_state_dict(ckpt["gram_teacher"])
+        if gram_teacher is not None:  # --no_gram: the checkpoint's gram_teacher is None
+            gram_teacher.load_state_dict(ckpt["gram_teacher"])
         optimizer.load_state_dict(ckpt["optimizer"])
         step, epochs_done, gram_refreshes = ckpt["step"], ckpt["epoch"], list(ckpt["gram_refreshes"])
         random.setstate(ckpt["rng"]["python"])
         np.random.set_state(ckpt["rng"]["numpy"])
         torch.set_rng_state(ckpt["rng"]["torch"])
-        say(f"resumed from {found[-1][1]}: {epochs_done} epochs / {step} steps done, Gram refreshes {gram_refreshes}, "
-            "student/teacher/Gram teacher/optimizer/RNG restored")
+        restored = "student/teacher/optimizer/RNG restored" if args.no_gram else "student/teacher/Gram teacher/optimizer/RNG restored"
+        say(f"resumed from {found[-1][1]}: {epochs_done} epochs / {step} steps done, Gram refreshes {gram_refreshes}, {restored}")
         del ckpt
     summary = lambda: dict(step=step, epoch=epochs_done, gram_refreshes=list(gram_refreshes),
                            peak_lr=sch["peak_lr"], epoch_length=epoch_length)
@@ -338,7 +377,8 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
             save_atomic(export_backbone(teacher.backbone), export_path)
             save_atomic(to_cpu(dict(
                 student=student_unwrapped.state_dict(), teacher=teacher.state_dict(),
-                gram_teacher=gram_teacher.state_dict(), optimizer=optimizer.state_dict(), step=step, epoch=epochs_done,
+                gram_teacher=None if gram_teacher is None else gram_teacher.state_dict(),  # --no_gram: the key stays, holding None
+                optimizer=optimizer.state_dict(), step=step, epoch=epochs_done,
                 gram_refreshes=list(gram_refreshes), args=vars(args), world_size=world_size, data_fingerprint=data_fingerprint,
                 rng=dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state()))), ckpt_path)
         accelerator.barrier()
@@ -387,7 +427,8 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                 # materialized, then a tensor built from those Python floats is all-reduced and divided by world_size on the
                 # host. Never a torch.stack of the lazy loss tensors: all_reduce(stack(...)) died on Gaudi in HPU lazy mode
                 # (synNodeCreateWithId failed for node: concat).
-                local = [loss_dict[k].item() for k in LOSS_KEYS] + [loss.item()]
+                # --no_gram: no gram_loss key; its column is 0.0, never blank (the report builder parses the CSV as numbers)
+                local = [0.0 if args.no_gram and k == "gram_loss" else loss_dict[k].item() for k in LOSS_KEYS] + [loss.item()]
                 stats = torch.tensor(local, dtype=torch.float32, device=device)
                 if accelerator.distributed:
                     accelerator.all_reduce(stats)
