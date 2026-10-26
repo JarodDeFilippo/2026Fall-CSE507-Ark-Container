@@ -75,7 +75,7 @@ if [[ -n $BRANCH ]]; then
   # the branch's own epoch checkpoints: once there is one, the trainer resumes from it and never reads the source again. The name test is the trainer's epoch_checkpoints():
   # epoch_<digits>.pth (epoch_backup.pth, epoch_0011.pth.tmp and maxsteps_*.pth do not count), and it must be a regular file, not a directory of that name
   OWN=
-  for f in "$RUN"/ckpt/epoch_*.pth; do [[ -f $f && ${f##*/} =~ ^epoch_[0-9]+\.pth$ ]] && OWN=$f; done
+  for f in "$RUN"/ckpt/epoch_*.pth; do if [[ -f $f && ${f##*/} =~ ^epoch_[0-9]+\.pth$ ]]; then OWN=$f; fi; done  # if, not &&: a false test leaves status 0 under set -e
   [[ -n $OWN || -f $SOURCE ]] || { echo "ERROR: $SOURCE not found and $RUN has no epoch checkpoint of its own yet: nothing to branch from (the trunk keeps every 10th epoch and its last 3)" >&2; exit 1; }
   BRANCH_STEP=$(( K * EPOCH_LENGTH ))
   STEPS=()
