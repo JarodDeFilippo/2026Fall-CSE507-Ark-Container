@@ -108,7 +108,10 @@ class DataAugmentationCXR:
     """DataAugmentationDINO with gram_teacher_no_distortions=True, share_color_jitter=False,
     local_crops_subset_of_global_crops=False, teacher_no_color_jitter=False and the CXR values below.
     Takes a grayscale PIL image; returns the crop dict collate_data_and_cast expects (crops 3-channel, normalized).
-    gram_teacher_crops_size=None drops the gram crops; 224 makes them the same size as the global crops."""
+    gram_teacher_crops_size=None drops the gram crops; 224 makes them the same size as the global crops.
+    emit_gram_teacher_crops=False (--no_gram) leaves "gram_teacher_crops" out of the output and changes nothing else: the global crop is
+    still cut at max(global, Gram size) and resized to the global size, same decode side, same RNG draws, so the student / teacher crops are
+    bitwise those of the Gram run with the same sizes."""
 
     def __init__(
         self,
@@ -121,8 +124,10 @@ class DataAugmentationCXR:
         horizontal_flips=True,
         mean=IMAGENET_MEAN,
         std=IMAGENET_STD,
+        emit_gram_teacher_crops=True,
     ):
         self.local_crops_number = local_crops_number
+        self.emit_gram_teacher_crops = emit_gram_teacher_crops
         bicubic = v2.InterpolationMode.BICUBIC
         flip = 0.5 if horizontal_flips else 0.0
 
@@ -186,7 +191,7 @@ class DataAugmentationCXR:
         output["global_crops_teacher"] = [global_crop_1, global_crop_2]
 
         # gram teacher crops: same crop as the global ones, no distortions
-        if self.resize_gram_teacher is not None:
+        if self.resize_gram_teacher is not None and self.emit_gram_teacher_crops:
             output["gram_teacher_crops"] = [
                 self.normalize(self.resize_gram_teacher(im1_base)),
                 self.normalize(self.resize_gram_teacher(im2_base)),

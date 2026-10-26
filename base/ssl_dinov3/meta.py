@@ -2,7 +2,8 @@
 get_student_output, get_gram_teacher_output, compute_losses, update_ema, update_gram) with the options this run uses fixed:
 sinkhorn_knopp centering, separate iBOT head, global_ignore_diagonal, non-distributed KoLeo (weight 0.1), no local-loss
 reweighting, Gram from a separate teacher (ema_teacher false) on all tokens, normalized, img_level, remove_neg false,
-bicubic resize without antialias, constant Gram weight. Method bodies follow Meta's line for line; differences are marked."""
+bicubic resize without antialias, constant Gram weight. Method bodies follow Meta's line for line; differences are marked.
+gram_teacher=None is the no-Gram mode (--no_gram): no Gram teacher forward, no Gram loss term, no gram_loss key."""
 import contextlib
 
 import torch
@@ -22,9 +23,10 @@ class SSLMetaArch(nn.Module):
         self.student = student  # ModuleDict(backbone, dino_head, ibot_head); entries may be DDP-wrapped
         self.teacher = teacher
         self.model_ema = self.teacher
-        self.gram_teacher = gram_teacher  # ModuleDict(backbone)
+        self.gram_teacher = gram_teacher  # ModuleDict(backbone); None: no-Gram mode
         self.teacher.requires_grad_(False)
-        self.gram_teacher.requires_grad_(False)
+        if self.gram_teacher is not None:
+            self.gram_teacher.requires_grad_(False)
         self.ema_params_lists = None
         self.gram_params_lists = None
 
@@ -32,7 +34,8 @@ class SSLMetaArch(nn.Module):
         self.dino_loss = DINOLoss(n_prototypes)
         self.ibot_patch_loss = iBOTPatchLoss(teacher.ibot_head.last_layer.out_features)
         self.koleo_loss = KoLeoLoss()
-        self.gram_loss = GramLoss(apply_norm=True, remove_only_teacher_neg=False, remove_neg=False)
+        self.gram_loss = (GramLoss(apply_norm=True, remove_only_teacher_neg=False, remove_neg=False)
+                          if self.gram_teacher is not None else None)
         self.dino_loss.init_weights()  # centers start at nan upstream; sinkhorn_knopp never reads them
         self.ibot_patch_loss.init_weights()
 
@@ -69,7 +72,8 @@ class SSLMetaArch(nn.Module):
         masks_weight = data["masks_weight"].to(device, non_blocking=True)
         # ours: float, not int64, for the all_reduce inside iBOT's Sinkhorn-Knopp (exact below 2**24; HCCL-safe dtype)
         n_masked_patches_tensor = data["n_masked_patches"].to(device=device, dtype=torch.float32, non_blocking=True)
-        gram_teacher_crops = data["collated_gram_teacher_crops"].to(device, non_blocking=True)
+        if self.gram_teacher is not None:  # no-Gram mode: the batch has no Gram crops
+            gram_teacher_crops = data["collated_gram_teacher_crops"].to(device, non_blocking=True)
 
         with self._autocast(device):
             teacher_global = self.get_teacher_output(
@@ -86,13 +90,16 @@ class SSLMetaArch(nn.Module):
                 masks=masks,
                 mask_indices_list=mask_indices_list,
             )
-            gram_global = self.get_gram_teacher_output(
-                gram_teacher_crops.unflatten(0, (n_global_crops, B)),
-                masks=masks,
-                teacher_global=teacher_global,
-                student_global=student_global,
-                student_global_crops_size=global_crops.shape[-1],
-            )
+            if self.gram_teacher is None:  # no-Gram mode: no Gram forward, compute_losses skips the Gram loss
+                gram_global = None
+            else:
+                gram_global = self.get_gram_teacher_output(
+                    gram_teacher_crops.unflatten(0, (n_global_crops, B)),
+                    masks=masks,
+                    teacher_global=teacher_global,
+                    student_global=student_global,
+                    student_global_crops_size=global_crops.shape[-1],
+                )
             loss_accumulator, loss_dict = self.compute_losses(
                 teacher_global=teacher_global,
                 student_global=student_global,
@@ -264,17 +271,19 @@ class SSLMetaArch(nn.Module):
         loss_dict["ibot_loss"] = ibot_patch_loss
         loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
 
-        # Gram loss (constant weight: no loss_weight_schedule)
-        gram_loss = self.gram_loss(gram_global["student_patches"], gram_global["teacher_patches"], img_level=self.gram_img_level)
-        loss_accumulator += gram_loss * self.gram_loss_weight
-        loss_dict["gram_loss"] = gram_loss
+        # Gram loss (constant weight: no loss_weight_schedule); none in no-Gram mode (gram_global is None)
+        if gram_global is not None:
+            gram_loss = self.gram_loss(gram_global["student_patches"], gram_global["teacher_patches"], img_level=self.gram_img_level)
+            loss_accumulator += gram_loss * self.gram_loss_weight
+            loss_dict["gram_loss"] = gram_loss
 
         return loss_accumulator, loss_dict
 
     def train(self, mode=True):
         super().train(mode)
         self.teacher.eval()
-        self.gram_teacher.eval()
+        if self.gram_teacher is not None:
+            self.gram_teacher.eval()
         return self
 
     def backprop_loss(self, loss):
