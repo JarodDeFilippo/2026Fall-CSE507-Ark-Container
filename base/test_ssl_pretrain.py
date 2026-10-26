@@ -10,6 +10,7 @@ import math
 import os
 import random
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1380,6 +1381,221 @@ assert len(common_ubr) >= 3 and all(r[2:6] + r[7:12] == by_step_ub[r[0]][:4] + b
 print("OK (u) resume bitwise, recipe on, set_epoch as with --workers > 0: 1 epoch + --resume to 2 == 2 epochs straight (export, student, EMA teacher, optimizer, RNG states, "
       "the CSV rows both logged), and a --gram_weight 0 branch of epoch 1 == both (its Gram teacher carries local_cls_norm); the same resume from a checkpoint whose torch RNG state "
       "was replaced differs (student, export)")
+
+# (v) per-rank model-side RNG: seed + rank once the models exist; every rank's states in a multi-rank checkpoint -----------------------------------------------------------------------
+# Once the models exist each rank re-seeds python / numpy / torch with seed + rank (so drop path and the RoPE rescale differ across ranks; rank 0 keeps seed). A multi-rank checkpoint also
+# carries every rank's states (rng_per_rank; rng stays rank 0's, the whole story at one rank), and a --resume / --branch_from restores each rank its own.
+
+
+def seeded_rng(seed):  # the (python, numpy, torch) RNG states right after seeding with `seed`
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    return random.getstate(), np.random.get_state(), torch.get_rng_state()
+
+
+@contextlib.contextmanager
+def as_rank(rank, world_size):  # the world faked as (q) does: the one-rank gloo group stays up, Accelerator reads RANK / WORLD_SIZE from the env
+    saved = {key: os.environ.get(key) for key in ("RANK", "WORLD_SIZE")}
+    os.environ.update(RANK=str(rank), WORLD_SIZE=str(world_size))
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+v_flat = lambda models: {f"{k}.{n}": t.detach().clone() for k, m in models.items() for n, t in Accelerator.unwrap_model(m).state_dict().items()}
+v_handed = []
+
+
+def v_meta_init(self, student, teacher, gram_teacher, **kwargs):  # the RNG states and the models as run() hands them over, before any step
+    v_handed.append(dict(rng=(random.getstate(), np.random.get_state(), torch.get_rng_state()),
+                         models={name: v_flat(m) for name, m in (("student", student), ("teacher", teacher), ("gram_teacher", gram_teacher)) if m is not None}))
+    return real_meta_init(self, student, teacher, gram_teacher, **kwargs)
+
+
+def v_start(out, *extra):  # run() up to its first step (models built, the checkpoint restored if there is one); returns what it printed
+    buf = io.StringIO()
+    SSLMetaArch.__init__, SSLMetaArch.forward_backward = v_meta_init, stop_at_forward
+    try:
+        with contextlib.redirect_stdout(buf):
+            raises(StopAtForward, ssl_pretrain.run, make_args(out, *extra), TINY_VIT, TINY_HEADS, CFG)
+    finally:
+        SSLMetaArch.__init__, SSLMetaArch.forward_backward = real_meta_init, real_forward_backward
+    return buf.getvalue()
+
+
+# one process: the RNGs are re-seeded after the models are built, with seed + 0, and the models are those of a build without the re-seed
+V_SEED = P().seed
+v_start(os.path.join(TMP, "V_ONE"))
+v_one = v_handed[-1]
+fresh_state = seeded_rng(V_SEED)
+assert same_state(v_one["rng"], fresh_state)  # python, numpy and torch: the fresh seed + 0 state
+no_reseed = build_models(TINY_VIT, None, TINY_HEADS)  # seeded as above, built, carried on: what 28eacd8 handed over
+assert not torch.equal(torch.get_rng_state(), fresh_state[2])  # the build drew torch's init, so the re-seed after it is not a no-op
+assert same_state(v_one["models"], dict(zip(("student", "teacher", "gram_teacher"), map(v_flat, no_reseed))))  # student, EMA teacher, Gram teacher, heads included
+print("OK (v) one process: when run() hands the models over, python / numpy / torch are in the fresh seed + 0 state (the build had moved torch's, so the re-seed came after it), and "
+      "the student, EMA teacher and Gram teacher (heads included) are bitwise those of a build seeded once and not re-seeded")
+
+# ranks 0 and 1 of 2 (the world faked as (q) does it): rank 1 is in the seed + 1 state, every stream differs from rank 0's, the models are bitwise rank 0's (and the one process')
+with as_rank(0, 2):
+    v_start(os.path.join(TMP, "V_RANK0"))
+with as_rank(1, 2):
+    v_start(os.path.join(TMP, "V_RANK1"))
+v_rank0, v_rank1 = v_handed[-2:]
+assert same_state(v_rank0["rng"], seeded_rng(V_SEED)) and same_state(v_rank1["rng"], seeded_rng(V_SEED + 1))
+assert all(not same_state(a, b) for a, b in zip(v_rank0["rng"], v_rank1["rng"]))  # python, numpy and torch each
+assert same_state(v_rank1["models"], v_rank0["models"]) and same_state(v_rank0["models"], v_one["models"]) and set(v_rank1["models"]) == {"student", "teacher", "gram_teacher"}
+print("OK (v) two ranks, faked: rank 0 of 2 is in the seed + 0 state, rank 1 in the seed + 1 state (python, numpy and torch each differ from rank 0's), and the student, EMA teacher "
+      "and Gram teacher are bitwise equal on both ranks and to the one-process run's")
+
+# two real processes (gloo on this CPU, loopback rendezvous): the gather is a collective every rank must reach, which the faked world cannot show. set_epoch acts as with --workers > 0
+# (the main process' RNGs are not re-seeded per epoch), the recipe is on, so epoch 2's draws (drop path, RoPE rescale, the in-process transforms) start from each rank's saved states
+V_DRIVER, V_DRIVER_SOURCE = os.path.join(TMP, "v_driver.py"), '''# one rank of a real two-process (gloo, CPU) run() with the tiny ViT, written by test_ssl_pretrain.py (v); argv: base dir, spec json
+import argparse, json, os, random, sys
+import numpy as np
+import torch
+import torch.distributed as dist
+
+base, spec = sys.argv[1], json.load(open(sys.argv[2]))
+sys.path.insert(0, base)
+os.chdir(base)
+import ssl_pretrain
+from ssl_dinov3.meta import SSLMetaArch
+
+rank = int(os.environ["RANK"])
+states = lambda: dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state())
+real_init = SSLMetaArch.__init__
+
+
+def init(self, *args, **kwargs):  # this rank's RNG states as run() hands the models over
+    torch.save(states(), os.path.join(spec["dump"], "built_rank%d.pt" % rank))
+    return real_init(self, *args, **kwargs)
+
+
+def set_epoch(loader, sampler, epoch, seed, rank):  # as with --workers > 0: the sampler and the worker base seed, never this process' RNGs
+    sampler.set_epoch(epoch)
+    loader.generator.manual_seed(seed + 1000 * epoch + rank)
+
+
+SSLMetaArch.__init__, ssl_pretrain.set_epoch = init, set_epoch
+ssl_pretrain.run(argparse.Namespace(**spec["args"]), spec["vit"], spec["heads"], spec["cfg"])
+torch.save(states(), os.path.join(spec["dump"], "end_rank%d.pt" % rank))
+dist.destroy_process_group()
+'''
+with open(V_DRIVER, "w") as f:
+    f.write(V_DRIVER_SOURCE)
+
+
+def v_two_ranks(tag, out, *extra):  # run() on two real ranks; returns the dir holding each rank's RNG states (at the models, at the end) and both ranks' output
+    dump = os.path.join(TMP, "v_dump_" + tag)
+    os.makedirs(dump)
+    spec = os.path.join(TMP, "v_spec_%s.json" % tag)
+    with open(spec, "w") as f:
+        json.dump(dict(args=vars(make_args(out, *extra)), vit=TINY_VIT, heads=TINY_HEADS, cfg=CFG, dump=dump), f)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        env = dict(os.environ, WORLD_SIZE="2", MASTER_ADDR="127.0.0.1", MASTER_PORT=str(s.getsockname()[1]))
+    procs = [subprocess.Popen([sys.executable, V_DRIVER, BASE, spec], env=dict(env, RANK=str(r), LOCAL_RANK=str(r)), stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True) for r in range(2)]
+    try:
+        outputs = [p.communicate(timeout=120)[0] for p in procs]
+    finally:
+        for p in procs:
+            p.kill()  # a rank stuck in a collective must not outlive the test
+            p.wait()
+    assert [p.returncode for p in procs] == [0, 0], outputs
+    return dump, outputs
+
+
+v_dumped = lambda dump, kind, rank: torch.load(os.path.join(dump, "%s_rank%d.pt" % (kind, rank)), weights_only=False)
+V_A, V_B, V_C = (os.path.join(TMP, n) for n in ("V_A", "V_B", "V_C"))
+V_TRUNK = ["--no_gram", *RECIPE]
+v_two_ranks("a", V_A, *V_TRUNK, "--stop_after_epochs", "2")  # 2 epochs straight
+dump_b1, _ = v_two_ranks("b1", V_B, *V_TRUNK, "--stop_after_epochs", "1")  # epoch 1, then the resume below
+shutil.copytree(V_B, V_C)
+ck_b1 = load_ckpt(V_B, "epoch_0001.pth")
+ck_c1 = load_ckpt(V_C, "epoch_0001.pth")
+ck_c1["rng_per_rank"][1] = ck_c1["rng_per_rank"][0]  # the control: rank 1 gets rank 0's states back, as every rank did before the per-rank states
+torch.save(ck_c1, os.path.join(V_C, "ckpt", "epoch_0001.pth"))
+v_two_ranks("b2", V_B, *V_TRUNK, "--resume", "--stop_after_epochs", "2")
+v_two_ranks("c", V_C, *V_TRUNK, "--resume", "--stop_after_epochs", "2")
+for rank in (0, 1):  # each real rank re-seeded with seed + rank once its models were built, and its saved entry is its own state at the save
+    assert same_state(v_dumped(dump_b1, "built", rank), dict(zip(("python", "numpy", "torch"), seeded_rng(V_SEED + rank))))
+    assert same_state(ck_b1["rng_per_rank"][rank], v_dumped(dump_b1, "end", rank))
+assert ck_b1["world_size"] == 2 and len(ck_b1["rng_per_rank"]) == 2 and not same_state(*ck_b1["rng_per_rank"]) and same_state(ck_b1["rng"], ck_b1["rng_per_rank"][0])
+ck_va, ck_vb, ck_vc = (load_ckpt(d, "epoch_0002.pth") for d in (V_A, V_B, V_C))
+for part in ("student", "teacher", "optimizer", "rng", "rng_per_rank"):  # 1 epoch + --resume == 2 epochs straight, every rank's stream included
+    assert same_state(ck_vb[part], ck_va[part]), part
+assert same_state(torch.load(os.path.join(V_B, "export", "teacher_backbone_epoch_0002.pth"), weights_only=True),
+                  torch.load(os.path.join(V_A, "export", "teacher_backbone_epoch_0002.pth"), weights_only=True))
+assert not same_state(ck_va["student"], ck_b1["student"]) and not same_state(ck_vc["student"], ck_va["student"])  # epoch 2 trained; and the control, with rank 1 on rank 0's stream, differs
+print("OK (v) two real ranks: each rank is in its seed + rank state when the models are handed over; the epoch-1 checkpoint has world_size 2, rng_per_rank of 2 distinct entries (each its "
+      "own rank's state at the save) and rng = entry 0; a recipe run of 1 epoch + --resume equals 2 epochs straight (export, student, EMA teacher, optimizer, rng, both ranks' states), "
+      "and the same resume with rank 1 handed rank 0's states differs (student)")
+
+# which entry a rank restores (the epoch-1 checkpoint of the real run, the world faked): its own on --resume and on --branch_from; a checkpoint without rng_per_rank gives the one state to every
+# rank and rank 0 says so; a list that does not match the world is refused
+v_setters = random.setstate, np.random.set_state, torch.set_rng_state
+
+
+@contextlib.contextmanager
+def recording_rng_restores():  # yields the list of (name, state) the three setters are handed, in order
+    restored = []
+    spy = lambda name, real: lambda state: (restored.append((name, state)), real(state))[1]
+    random.setstate, np.random.set_state, torch.set_rng_state = (spy(name, real) for name, real in zip(("python", "numpy", "torch"), v_setters))
+    try:
+        yield restored
+    finally:
+        random.setstate, np.random.set_state, torch.set_rng_state = v_setters
+
+
+def v_restores(rank, out, *extra):  # run() as this rank of 2, up to its first step: (the (name, state) pairs the setters got, what it printed)
+    with as_rank(rank, 2), recording_rng_restores() as restored:
+        text = v_start(out, *extra)
+    return restored, text
+
+
+def v_one_checkpoint(name, ckpt):  # a run dir holding just this epoch-1 checkpoint (--resume reads the newest one)
+    out = os.path.join(TMP, name)
+    os.makedirs(os.path.join(out, "ckpt"))
+    torch.save(ckpt, os.path.join(out, "ckpt", "epoch_0001.pth"))
+    return out
+
+
+V_NEW = v_one_checkpoint("V_NEW", ck_b1)
+V_OLD = v_one_checkpoint("V_OLD", {k: v for k, v in ck_b1.items() if k != "rng_per_rank"})  # as written before the per-rank states
+V_BAD = v_one_checkpoint("V_BAD", dict(ck_b1, rng_per_rank=ck_b1["rng_per_rank"] + ck_b1["rng_per_rank"][:1]))  # 3 entries, 2 ranks
+OLD_LINE = "RNG: the checkpoint predates the per-rank RNG states and holds one: it is restored on every rank (2)"
+for rank in (0, 1):
+    for out, extra, said in ((V_NEW, (*V_TRUNK, "--resume", "--stop_after_epochs", "2"), "resumed from"),
+                             (os.path.join(TMP, "V_BRANCH%d" % rank), (*RECIPE, "--branch_from", os.path.join(V_NEW, "ckpt", "epoch_0001.pth"),
+                                                                      "--gram_refresh_steps", "100", "--stop_after_epochs", "2"), "branched from")):
+        restored, text = v_restores(rank, out, *extra)
+        assert [name for name, _ in restored] == ["python", "numpy", "torch"] and same_state(dict(restored), ck_b1["rng_per_rank"][rank]), (rank, said)
+        assert "predates" not in text and (said in text) == (rank == 0), (rank, said)  # only rank 0 prints; nothing about old checkpoints
+    restored, text = v_restores(rank, V_OLD, *V_TRUNK, "--resume", "--stop_after_epochs", "2")
+    assert [name for name, _ in restored] == ["python", "numpy", "torch"] and same_state(dict(restored), ck_b1["rng"])  # the one state, on this rank too
+    assert (OLD_LINE in text.splitlines()) == (rank == 0) and ("predates" in text) == (rank == 0)  # rank 0 says so, once
+with as_rank(0, 2):
+    message = raises(AssertionError, v_start, V_BAD, *V_TRUNK, "--resume", "--stop_after_epochs", "2")
+assert "the checkpoint holds 3 per-rank RNG states, this run has 2 ranks" in message, message
+print("OK (v) restore: a faked rank 0 / rank 1 of 2 takes entry 0 / entry 1 of rng_per_rank back on --resume and on --branch_from (python, numpy, torch, each bitwise the saved one) and says "
+      "nothing; a checkpoint without rng_per_rank restores its one state on both ranks and rank 0 prints '%s' once; 3 entries for 2 ranks raise AssertionError naming both counts" % OLD_LINE)
+
+# one process: no per-rank list in its checkpoint (the key set (g) asserts is unchanged), no extra collective; the bitwise resume tests (g), (t), (u) above run on exactly these checkpoints
+gathers, real_all_gather_object = [], dist.all_gather_object
+dist.all_gather_object = lambda *args, **kwargs: (gathers.append(args), real_all_gather_object(*args, **kwargs))[1]
+try:
+    go(os.path.join(TMP, "V_SINGLE"), "--no_gram", "--stop_after_epochs", "1")
+finally:
+    dist.all_gather_object = real_all_gather_object
+assert gathers == [] and "rng_per_rank" not in load_ckpt(os.path.join(TMP, "V_SINGLE"), "epoch_0001.pth") and "rng_per_rank" not in ck2
+print("OK (v) one process: its checkpoints carry no rng_per_rank and its run gathers nothing, so a one-process run saves, resumes and branches exactly as before (rng is the one state)")
 
 # (k) launch scripts ------------------------------------------------------------------------------------------------------------
 scripts = [os.path.join(REPO, "chain", f) for f in ("ssl_common.sh", "pilot_a.sh", "pilot_b.sh", "main.sh", "constlr.sh", "hires.sh")]
