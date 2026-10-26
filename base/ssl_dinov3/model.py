@@ -23,10 +23,12 @@ def build_backbone(vit_kwargs, weights_path=None):
     return backbone
 
 
-def build_models(vit_kwargs, weights_path=None, head_kwargs=HEAD_KWARGS):
+def build_models(vit_kwargs, weights_path=None, head_kwargs=HEAD_KWARGS, gram=True):
     """Returns (student, teacher, gram_teacher) as nn.ModuleDicts keyed like SSLMetaArch: student/teacher have
     backbone, dino_head, ibot_head; gram_teacher has backbone only. Teacher = copy of the student (init_weights:
-    model_ema.load_state_dict(student.state_dict())); Gram teacher = the same stock backbone, frozen, eval."""
+    model_ema.load_state_dict(student.state_dict())); Gram teacher = the same stock backbone, frozen, eval.
+    gram=False (--no_gram): no Gram teacher is built (the backbone is not copied for it) and gram_teacher is None;
+    student and teacher are built exactly as with gram=True (deepcopy draws no RNG)."""
     backbone = build_backbone(vit_kwargs, weights_path)
     student = nn.ModuleDict(dict(
         backbone=backbone,
@@ -37,6 +39,8 @@ def build_models(vit_kwargs, weights_path=None, head_kwargs=HEAD_KWARGS):
     student.ibot_head.init_weights()
     teacher = copy.deepcopy(student)
     teacher.requires_grad_(False)
+    if not gram:
+        return student, teacher, None
     gram_teacher = nn.ModuleDict(dict(backbone=copy.deepcopy(backbone)))
     gram_teacher.requires_grad_(False)
     gram_teacher.eval()
