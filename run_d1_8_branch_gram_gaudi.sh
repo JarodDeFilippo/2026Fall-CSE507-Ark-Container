@@ -11,6 +11,8 @@
 # DINO-X ConstLR 224, Gram-anchored branch: the no-Gram trunk (run_d1_8_constlr_nogram_gaudi.sh, run dir ssl_dinov3_cxr_constlr_nogram_seed_100) continued EXACTLY from its epoch-K checkpoint (student, EMA
 # teacher, optimizer, step, epoch, schedule position, data order, RNG) with ONE change: the Gram teacher on, anchored to that checkpoint's EMA teacher backbone (ssl_pretrain.py --branch_from). Gram weight 2.0
 # and Gram teacher 448: the trainer's defaults, as in constlr. The trunk keeps running; the branch is a new run dir, so it never writes to the trunk's.
+# The trunk's line carries DINOv3's --drop_path_rate 0.3 --rope_rescale_coords 2 --untie_local_cls_norm (2026-10-26), so a branch passes them too (--branch_from requires them to match the source), and
+# neither is an exact ConstLR-224 control.
 # Usage: sbatch run_d1_8_branch_gram_gaudi.sh <K> <STOP> [EVERY] [COUNT]   (EVERY default 10000, COUNT default 3: Meta's 10k x 3, DINOv3 Appendix C)
 #   K = the trunk epoch to branch from (its ckpt/epoch_<K %04d>.pth must exist when the branch first starts: the trunk keeps every 10th epoch and its last 3); STOP = the epoch the branch stops after (above K, at most the 1000 ceiling);
 #   EVERY / COUNT = the Gram refreshes: COUNT of them, EVERY steps apart, the first one EVERY steps after the branch step.

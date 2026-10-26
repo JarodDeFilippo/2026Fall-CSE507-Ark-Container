@@ -15,12 +15,14 @@
 # missing, empty or invalid one stops the phase before anything is launched; so does a stop epoch above the ceiling, which the trainer would
 # only refuse after the allocation had started.
 # Env overrides, all unset in the chain's phase (so the phase's run dir, launch line and messages are unchanged): CONSTLR_NOGRAM=1 makes this the no-Gram trunk,
-# "DINO-X ConstLR 224, no Gram": the same launch line with --no_gram (no Gram teacher built, loaded or run) in place of --gram_refresh_steps 10000,20000,30000, into its own
+# "DINO-X ConstLR 224, no Gram": the same launch line with --no_gram (no Gram teacher built, loaded or run) in place of --gram_refresh_steps 10000,20000,30000 and, ahead of it,
+# three settings of DINOv3's training recipe the phase does not pass (RECIPE below: --drop_path_rate 0.3 --rope_rescale_coords 2 --untie_local_cls_norm; Jarod, 2026-10-26, so
+# the trunk is no longer an exact ConstLR-224 control: the Gram teacher is not the only difference), into its own
 # run dir ssl_dinov3_cxr_constlr_nogram_seed_100, with the stop epoch read from chain/constlr_nogram_stop_after.txt instead (the same rules, cluster-only too; chain/constlr_stop_after.txt
 # is not read then), and one `run:` line printed before the launch. Any other non-empty value is refused before anything is read. run_d1_8_constlr_nogram_gaudi.sh sets it: its own
 # 4-card job outside the chain, never a phase.
 # CONSTLR_BRANCH_EPOCH=K, CONSTLR_BRANCH_STOP=STOP, CONSTLR_BRANCH_EVERY=EVERY and CONSTLR_BRANCH_COUNT=COUNT (all four; run_d1_8_branch_gram_gaudi.sh sets them, never the
-# chain) make this a Gram-anchored branch of the no-Gram trunk: the trunk's launch line with --no_gram replaced by --branch_from
+# chain) make this a Gram-anchored branch of the no-Gram trunk: the trunk's launch line (RECIPE included, which --branch_from requires to match the source) with --no_gram replaced by --branch_from
 # /workspace/ssl_dinov3_cxr_constlr_nogram_seed_100/ckpt/epoch_<K %04d>.pth --gram_refresh_steps <list>, into the run dir
 # ssl_dinov3_cxr_constlr_nogram_e<K %04d>_gram_every<EVERY>x<COUNT>_seed_100 (the cadence is in the name, so two cadences from the same K never share a dir), stopping
 # after epoch STOP (no stop file is read). The list is the branch step + i x EVERY for i = 1..COUNT, the branch step being K x the trunk's real epoch_length, read from
@@ -43,10 +45,11 @@ TRUNK=ssl_dinov3_cxr_constlr_nogram_seed_100  # the no-Gram trunk's run dir (CON
 RUN=ssl_dinov3_cxr_constlr_seed_100
 STOP_FILE=chain/constlr_stop_after.txt
 GRAM_ARGS=(--gram_refresh_steps 10000,20000,30000)
+RECIPE=(--drop_path_rate 0.3 --rope_rescale_coords 2 --untie_local_cls_norm)  # the trunk's and its branches' (DINOv3's training recipe), never the phase's
 if [[ -n $NOGRAM ]]; then
   RUN=$TRUNK
   STOP_FILE=chain/constlr_nogram_stop_after.txt
-  GRAM_ARGS=(--no_gram)
+  GRAM_ARGS=("${RECIPE[@]}" --no_gram)
 fi
 LR=$(read_setting chain/main_lr.txt '^([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$' 'a positive number such as 2e-3 or 0.0003')
 awk -v v="$LR" 'BEGIN { exit !(v + 0 > 0) }' || { echo "ERROR: chain/main_lr.txt holds '$LR', which is not positive" >&2; exit 1; }
@@ -85,10 +88,10 @@ if [[ -n $BRANCH ]]; then
   LAST=${STEPS[COUNT - 1]}
   END=$(( EPOCHS * EPOCH_LENGTH ))
   (( LAST <= END )) || { echo "ERROR: the last Gram refresh, after step $LAST, is past the end of the $EPOCHS-epoch schedule (step $END): it could never run; lower EVERY (CONSTLR_BRANCH_EVERY) or COUNT (CONSTLR_BRANCH_COUNT)" >&2; exit 1; }
-  GRAM_ARGS=(--branch_from "/workspace/$SOURCE" --gram_refresh_steps "$REFRESH")
+  GRAM_ARGS=("${RECIPE[@]}" --branch_from "/workspace/$SOURCE" --gram_refresh_steps "$REFRESH")
   echo "run: $RUN (Gram-anchored branch of $TRUNK from its epoch $K: --branch_from /workspace/$SOURCE --gram_refresh_steps in place of --no_gram; stop after epoch $STOP_AFTER)"
   echo "gram refresh steps: $REFRESH (branch step $BRANCH_STEP = epoch $K x epoch_length $EPOCH_LENGTH from $TRUNK_ARGS, then every $EVERY steps, $COUNT times)"
 fi
-[[ -z $NOGRAM ]] || echo "run: $RUN (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; stop after epoch $STOP_AFTER from $STOP_FILE)"
+[[ -z $NOGRAM ]] || echo "run: $RUN (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; DINOv3 recipe: ${RECIPE[*]}; stop after epoch $STOP_AFTER from $STOP_FILE)"
 
 ssl_launch "$RUN" --lr "$LR" --min_lr "$LR" --no_lr_scaling --epochs "$EPOCHS" --stop_after_epochs "$STOP_AFTER" "${GRAM_ARGS[@]}"

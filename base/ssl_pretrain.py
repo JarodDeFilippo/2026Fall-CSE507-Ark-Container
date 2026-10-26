@@ -37,6 +37,20 @@ source cannot break it, and branch_from is locked on --resume. Refused before an
 epoch checkpoint or not a --no_gram run's; --no_gram or --init_from_checkpoint with it; a source that differs on any --resume-locked setting but the
 Gram ones and its own --init_from_checkpoint, or in its image list, world size or epoch length; a refresh step at or before the branch step; a stop
 epoch at or before the source's.
+
+--drop_path_rate R, --rope_rescale_coords S and --untie_local_cls_norm are three settings of Meta's DINOv3 training recipe (ssl_default_config's
+drop_path_rate 0.3; pos_embed_rope_rescale_coords 2 and untie_global_and_local_cls_norm true as in the released ViT-7B configs), passed to the student
+backbone: stochastic depth (each of a block's two residual branches runs on a random 1 - R of the batch, rescaled), RoPE coordinates scaled by a
+log-uniform factor in [1/S, S] (drawn anew per block, crop group and forward), and a second LayerNorm local_cls_norm for the CLS and register tokens
+of the local crops (entry 1 of the student's list forward). All three act in train mode only: the EMA and Gram teachers are copies of the student but
+run in eval, so none of the three reaches the teacher forwards, the probe or the export. The draws come from torch's generator on the training device:
+on CPU the checkpoint's torch RNG state covers them, so a resumed run is bitwise the uninterrupted one; a device generator (HPU) is not in the
+checkpoint, so there a resumed run draws other (equally distributed) factors and subsets. Every rank starts from the same seed, so the ranks draw
+alike (Meta seeds seed + rank). The defaults (0.0, none, off) are the behaviour before the flags existed, so every earlier checkpoint resumes and
+branches unchanged: the three are locked on --resume (a checkpoint without the keys reads as the defaults), recorded in args.json, and a --branch_from
+source must match them. With --untie_local_cls_norm the stock --pretrained_weights file loads strictly and local_cls_norm starts as a copy of its
+norm (one line says so); the epoch checkpoints carry local_cls_norm (student, EMA teacher, Gram teacher) and the exports leave it out (the stock 188
+keys, as before). An --init_from_checkpoint source must match the flag: its student and teacher load strictly.
 """
 import argparse
 import csv
@@ -73,14 +87,17 @@ LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "i
 # init_from_checkpoint: a run started from one resumes only with the same one (not re-applied then); any other run's checkpoint is refused
 # no_gram: a no-Gram run resumes only as one (its checkpoint has no Gram teacher), and a Gram run never as one
 # branch_from: a branch resumes only as the same branch (its source is read only at its start); a trunk or any other run never as one
+# drop_path_rate / rope_rescale_coords / untie_local_cls_norm: the student's training recipe (its forward; untied, its parameters too)
 RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_lr_scaling", "warmup_epochs",
                 "weight_decay", "momentum_teacher", "teacher_temp_warmup_epochs", "gram_weight", "global_crops_size",
                 "local_crops_size", "gram_teacher_size", "gram_refresh_steps", "freeze_backbone_epochs", "local_crops_number",
-                "seed", "bf16", "world_size", "init_from_checkpoint", "no_gram", "branch_from")
+                "seed", "bf16", "world_size", "init_from_checkpoint", "no_gram", "branch_from", "drop_path_rate",
+                "rope_rescale_coords", "untie_local_cls_norm")
 # checkpoints written before the crop-size flags existed (pilots, main, constlr) were all trained at these
 CROP_DEFAULTS = dict(global_crops_size=224, local_crops_size=96, gram_teacher_size=448)
-# keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off and no --branch_from
-ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None)
+# keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off, no --branch_from, and no
+# recipe setting (drop path 0, no RoPE rescale, tied CLS norm)
+ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None, drop_path_rate=0.0, rope_rescale_coords=None, untie_local_cls_norm=False)
 # what a --branch_from start may differ from its source in (check_resume skips these): the Gram switch and knobs the branch turns on, the path itself,
 # and the source's own init provenance (its full state is restored; a branch cannot pass --init_from_checkpoint, so it would always differ)
 BRANCH_FREE = ("no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from", "init_from_checkpoint")
@@ -99,6 +116,18 @@ def parse_steps(text):
     if any(s <= 0 for s in steps):
         raise argparse.ArgumentTypeError(f"refresh steps must be positive, got {text!r}")
     return steps
+
+
+def parse_rescale(text):
+    if text.strip().lower() == "none":  # no rescale: the RoPE coordinates as in eval
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number above 1 or none, got {text!r}")
+    if not (math.isfinite(value) and value > 1):  # 1 would draw a factor of exactly 1; below 1 the range [1/S, S] is upside down
+        raise argparse.ArgumentTypeError(f"the rescale must be above 1 (a log-uniform factor in [1/S, S]) or none, got {text!r}")
+    return value
 
 
 def parse_args(argv=None):
@@ -140,6 +169,14 @@ def parse_args(argv=None):
                         f"{DEFAULT_GRAM_REFRESH_STEPS}; none: no refresh). Refused with --no_gram, where there are none")
     p.add_argument("--freeze_backbone_epochs", type=int, default=1, help="backbone LR 0 (heads train) for this many epochs")
     p.add_argument("--local_crops_number", type=int, default=8)
+    p.add_argument("--drop_path_rate", type=float, default=0.0,
+                   help="student stochastic depth, in [0, 1) (Meta's DINOv3 recipe: 0.3); train mode only")
+    p.add_argument("--rope_rescale_coords", type=parse_rescale, default=None,
+                   help="student RoPE coordinates scaled by a log-uniform factor in [1/S, S], S above 1, or none (default; Meta's DINOv3 recipe: 2); "
+                        "train mode only")
+    p.add_argument("--untie_local_cls_norm", action="store_true",
+                   help="a second student LayerNorm for the local crops' CLS and register tokens (Meta's untie_global_and_local_cls_norm); "
+                        "train mode only, initialized from the stock norm, not exported")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--workers", type=int, default=16)
     p.add_argument("--seed", type=int, default=100)
@@ -151,6 +188,8 @@ def parse_args(argv=None):
     for name in ("init_from_checkpoint", "branch_from"):  # an empty path (an unset variable in a launch line) would pass the presence checks below but not run()'s
         if getattr(args, name) == "":
             p.error(f"--{name} is empty: pass a checkpoint path, or leave the flag out")
+    if not 0.0 <= args.drop_path_rate < 1.0:  # 1 would drop every sample of every residual branch (and NaN fails both)
+        p.error(f"--drop_path_rate must be in [0, 1), got {args.drop_path_rate}")
     if args.pretrained_weights is None and args.init_from_checkpoint is None and args.branch_from is None:
         p.error("--pretrained_weights is required unless --init_from_checkpoint is given (or --branch_from)")
     if args.branch_from is not None:  # a branch continues a no-Gram run exactly with the Gram teacher on; these would contradict that
@@ -310,9 +349,18 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     weights_from = "--init_from_checkpoint" if args.init_from_checkpoint else "--branch_from" if args.branch_from else None
     if weights_from and args.pretrained_weights:
         say(f"WARNING: --pretrained_weights {args.pretrained_weights} ignored: {weights_from} supplies every weight")
-    student, teacher, gram_teacher = build_models(vit_kwargs or DINOV3_VITB16_KWARGS,
+    # the student's training recipe; the EMA and Gram teachers are its copies (same parameters), and run in eval, where none of it acts
+    recipe = dict(drop_path_rate=args.drop_path_rate, pos_embed_rope_rescale_coords=args.rope_rescale_coords,
+                  untie_global_and_local_cls_norm=args.untie_local_cls_norm)
+    student, teacher, gram_teacher = build_models(dict(vit_kwargs or DINOV3_VITB16_KWARGS, **recipe),
                                                   None if weights_from else args.pretrained_weights,
                                                   head_kwargs or HEAD_KWARGS, gram=not args.no_gram)
+    if (args.drop_path_rate, args.rope_rescale_coords, args.untie_local_cls_norm) != (0.0, None, False):  # the defaults print nothing new
+        say(f"recipe (student, train mode only; the EMA / Gram teachers run in eval): drop path {args.drop_path_rate:g}, RoPE coordinate rescale "
+            f"{'none' if args.rope_rescale_coords is None else format(args.rope_rescale_coords, 'g')}, local-crop CLS norm "
+            f"{'untied' if args.untie_local_cls_norm else 'tied'}")
+    if args.untie_local_cls_norm and args.pretrained_weights and not weights_from and not resuming_own:  # a resume / init / branch restores it instead
+        say(f"local_cls_norm: initialized as a copy of norm.weight / norm.bias from {args.pretrained_weights} (the stock file has no local_cls_norm)")
     if args.no_gram:
         say("Gram: OFF (--no_gram): no Gram teacher built or loaded, no Gram loss, no Gram refreshes; "
             "ssl_losses.csv gram and gram_weight columns are 0.0")
