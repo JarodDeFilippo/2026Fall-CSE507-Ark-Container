@@ -917,6 +917,193 @@ print("OK (s) --no_gram --init_from_checkpoint: a Gram run's full checkpoint loa
       "('no Gram teacher (--no_gram)' in the initialized line), the new checkpoint's gram_teacher is None; a Gram run initialized from that no-Gram "
       "checkpoint anchors its Gram teacher to the trunk's EMA teacher and trains with the Gram loss")
 
+# (t) --branch_from: a no-Gram trunk continued exactly, with the Gram teacher switched on -------------------------------------------------------
+
+# parse: --branch_from stands in for --pretrained_weights, needs --gram_refresh_steps (none allowed: an anchor that never refreshes) and refuses --no_gram / --init_from_checkpoint
+PB = lambda *extra: ssl_pretrain.parse_args(["--data_set", "MIMIC", "--output_dir", "o", "--branch_from", "x.pth"] + list(extra))
+assert P().branch_from is None and ssl_pretrain.ARG_DEFAULTS["branch_from"] is None and "branch_from" in ssl_pretrain.RESUME_MATCH
+assert set(ssl_pretrain.BRANCH_FREE) == {"no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from"}
+branch_parsed = PB("--gram_refresh_steps", "5")  # no --pretrained_weights
+assert (branch_parsed.branch_from, branch_parsed.pretrained_weights, branch_parsed.no_gram, branch_parsed.gram_weight, branch_parsed.gram_teacher_size,
+        branch_parsed.gram_refresh_steps) == ("x.pth", None, False, 2.0, 448, [5])
+assert PB("--gram_refresh_steps", "none").gram_refresh_steps == [] and PB("--gram_refresh_steps", "5", "--pretrained_weights", "w").pretrained_weights == "w"
+with contextlib.redirect_stderr(io.StringIO()) as err:
+    raises(SystemExit, ssl_pretrain.parse_args, ["--data_set", "MIMIC", "--output_dir", "o"])
+assert "--pretrained_weights is required unless --init_from_checkpoint is given (or --branch_from)" in err.getvalue(), err.getvalue()
+for extra, flags in ((["--no_gram"], ("--branch_from", "--no_gram")),
+                     (["--gram_refresh_steps", "5", "--init_from_checkpoint", "c.pth"], ("--branch_from", "--init_from_checkpoint")),
+                     ([], ("--branch_from", "--gram_refresh_steps"))):
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        raises(SystemExit, PB, *extra)
+    complaint = err.getvalue().split("error: ", 1)[1]
+    assert all(flag in complaint for flag in flags), (extra, err.getvalue())
+print("OK (t) parse: no --branch_from -> None (read as None in an old checkpoint, locked on --resume); --branch_from alone (with --gram_refresh_steps 5 or none) needs no "
+      "--pretrained_weights and keeps gram_weight 2.0, Gram size 448; --no_gram, --init_from_checkpoint, or no --gram_refresh_steps with it exits 2 naming both flags")
+
+
+def same_state(a, b):  # bitwise: tensors torch.equal (and the same dtype), arrays array_equal, containers recursively, the rest ==
+    if torch.is_tensor(a) or torch.is_tensor(b):
+        return torch.is_tensor(a) and torch.is_tensor(b) and a.dtype == b.dtype and torch.equal(a, b)
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        return isinstance(a, np.ndarray) and isinstance(b, np.ndarray) and a.dtype == b.dtype and np.array_equal(a, b)
+    if isinstance(a, dict) or isinstance(b, dict):
+        return isinstance(a, dict) and isinstance(b, dict) and set(a) == set(b) and all(same_state(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        return type(a) is type(b) and len(a) == len(b) and all(same_state(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+# the key claim: a branch is the trunk continued exactly. The no-Gram trunk (1 epoch, then --resume to 2) against a --branch_from of its epoch 1 with --gram_weight 0
+# (the Gram teacher is built, fed Gram crops and run, its loss computed and weighted 0; no refresh before step 100). Gram crops draw no RNG, the Gram teacher runs in eval
+# mode under no_grad and the 0-weighted term adds exact zeros to the loss and the gradients, so epoch 2 must come out bitwise the same, not merely close
+BR_T, BR_II = os.path.join(TMP, "BR_T"), os.path.join(TMP, "BR_II")
+go(BR_T, "--no_gram", "--stop_after_epochs", "1")
+SRC1 = os.path.join(BR_T, "ckpt", "epoch_0001.pth")
+src1 = torch.load(SRC1, map_location="cpu", weights_only=False)
+assert src1["args"]["no_gram"] is True and (src1["step"], src1["epoch"]) == (6, 1) and src1["gram_teacher"] is None
+summary_ii, text_ii = go(BR_II, "--branch_from", SRC1, "--gram_weight", "0", "--gram_refresh_steps", "100", "--resume", "--stop_after_epochs", "2")
+summary_t, text_t = go(BR_T, "--no_gram", "--resume", "--stop_after_epochs", "2")
+assert "branched from %s: its step 6, epoch 1;" % SRC1 in text_ii and "starting from scratch" not in text_ii and "resumed from" in text_t, (text_ii, text_t)
+assert summary_ii == summary_t and (summary_t["step"], summary_t["epoch"], summary_t["gram_refreshes"]) == (12, 2, [])
+exp_t = torch.load(os.path.join(BR_T, "export", "teacher_backbone_epoch_0002.pth"), weights_only=True)
+exp_ii = torch.load(os.path.join(BR_II, "export", "teacher_backbone_epoch_0002.pth"), weights_only=True)
+ck_t, ck_ii = load_ckpt(BR_T, "epoch_0002.pth"), load_ckpt(BR_II, "epoch_0002.pth")
+assert (ck_t["step"], ck_t["epoch"], ck_ii["step"], ck_ii["epoch"]) == (12, 2, 12, 2)
+assert not same_state(ck_t["student"], src1["student"]) and not same_state(ck_t["rng"], src1["rng"])  # the comparisons below are not vacuous: epoch 2 did train
+assert same_state(exp_ii, exp_t), "export"
+for part in ("student", "teacher", "optimizer", "rng"):  # optimizer: the whole state dict, i.e. the state tensors (exp_avg, exp_avg_sq, step) and param_groups
+    assert same_state(ck_ii[part], ck_t[part]), part
+assert ck_ii["gram_teacher"] is not None and ck_t["gram_teacher"] is None and ck_ii["args"]["branch_from"] == SRC1 and ck_t["args"]["branch_from"] is None
+rows_t, rows_ii = read_csv(BR_T), read_csv(BR_II)
+by_step_t = {r[0]: r for r in rows_t[1:]}
+common = [r for r in rows_ii[1:] if r[0] in by_step_t]
+assert rows_ii[1][0] == "6" and all(int(r[0]) >= 6 for r in rows_ii[1:]) and len(common) >= 3, rows_ii  # the branch's rows start at its step; the trunk's earlier ones are not copied
+for r in common:
+    for column in ("dino_global", "dino_local", "koleo", "ibot", "total", "lr", "wd", "momentum", "teacher_temp"):
+        assert r[ng_cols.index(column)] == by_step_t[r[0]][ng_cols.index(column)], (column, r, by_step_t[r[0]])
+assert all(r[ng_gram_weight] == "0.0" and float(r[ng_gram]) > 0 for r in rows_ii[1:])  # the Gram loss is computed (positive), its weight 0
+print("OK (t) bitwise: a --no_gram trunk (1 epoch, then --resume to 2) and a --branch_from of its epoch 1 (Gram teacher built and run, --gram_weight 0, no refresh) have the "
+      "same epoch-2 export, student, optimizer (state and param_groups), teacher and RNG states, bitwise equal; step 12 / epoch 2 both; the %d common CSV rows (steps >= 6) agree "
+      "as strings on dino_global, dino_local, koleo, ibot, total, lr, wd, momentum, teacher_temp; the branch's rows start at step 6 with gram > 0 and gram_weight 0.0" % len(common))
+
+# default weight: the Gram teacher is the source's EMA teacher backbone before the first step, the models are the source's, and the run is a normal Gram run from there
+BR_G = os.path.join(TMP, "BR_G")
+args_g = make_args(BR_G, "--branch_from", SRC1, "--gram_refresh_steps", "8,10", "--resume", "--stop_after_epochs", "2")
+args_g.pretrained_weights = "unused"  # both given: the checkpoint wins, with a warning (as args_h above)
+br_first = []
+
+
+def br_forward_backward(self, data, *, teacher_temp):  # the models as the first step sees them (cloned: the step then updates them); later calls only pass through
+    if not br_first:
+        br_first.append({name: {k: v.detach().clone() for k, v in module.state_dict().items()}
+                         for name, module in (("gram_teacher", self.gram_teacher), ("teacher", self.teacher), ("student", self.student))})
+    return real_forward_backward(self, data, teacher_temp=teacher_temp)
+
+
+SSLMetaArch.forward_backward = br_forward_backward
+try:
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        summary_g = ssl_pretrain.run(args_g, TINY_VIT, TINY_HEADS, CFG)
+    text_g = buf.getvalue()
+finally:
+    SSLMetaArch.forward_backward = real_forward_backward
+assert same_state(br_first[0]["gram_teacher"], {k: v for k, v in src1["teacher"].items() if k.startswith("backbone.")})  # anchored to the source's EMA teacher backbone
+assert same_state(br_first[0]["teacher"], src1["teacher"]) and same_state(br_first[0]["student"], src1["student"])  # restored before the first step
+lines_g = text_g.splitlines()
+assert "WARNING: --pretrained_weights unused ignored: --branch_from supplies every weight" in lines_g, text_g
+assert (f"branched from {SRC1}: its step 6, epoch 1; student/teacher/optimizer/RNG restored; Gram teacher <- its EMA teacher backbone; Gram ON, weight 2, "
+        "refreshes after steps [8, 10]") in lines_g, text_g
+assert "Gram refresh scheduled after step 8 (epoch 1.33 of 3)" in lines_g and "Gram refresh scheduled after step 10 (epoch 1.67 of 3)" in lines_g, text_g
+assert "Gram refresh 1/2 after step 8:" in text_g and "Gram refresh 2/2 after step 10:" in text_g
+assert not any(words in text_g for words in ("starting from scratch", "resumed from", "Gram: OFF")), text_g
+assert summary_g["step"] == 12 and summary_g["epoch"] == 2 and summary_g["gram_refreshes"] == [8, 10]
+assert [e for e, _ in ssl_pretrain.epoch_checkpoints(os.path.join(BR_G, "ckpt"))] == [2]  # the trunk's numbering continues: no epoch_0001 here
+assert os.listdir(os.path.join(BR_G, "export")) == ["teacher_backbone_epoch_0002.pth"]
+ck_g = load_ckpt(BR_G, "epoch_0002.pth")
+assert ck_g["args"]["branch_from"] == SRC1 and ck_g["args"]["no_gram"] is False and ck_g["gram_refreshes"] == [8, 10] and ck_g["gram_teacher"] is not None
+assert (ck_g["step"], ck_g["epoch"]) == (12, 2)
+info_g = json.load(open(os.path.join(BR_G, "args.json")))
+assert (info_g["branch_from"], info_g["no_gram"], info_g["gram_weight"], info_g["gram_refresh_steps"]) == (SRC1, False, 2.0, [8, 10])
+rows_g = read_csv(BR_G)
+assert ",".join(rows_g[0]) == CSV_HEADER and rows_g[1][0] == "6" and all(int(r[0]) >= 6 for r in rows_g[1:])
+assert all(float(r[ng_gram]) > 0 and r[ng_gram_weight] == "2.0" for r in rows_g[1:])
+print("OK (t) default-weight branch: before its first step the models are the source's, bitwise (student, teacher), and the Gram teacher is the source's EMA teacher backbone; "
+      "WARNING for --pretrained_weights, the 'branched from' line, no 'starting from scratch' / 'resumed from' / 'Gram: OFF'; refreshes [8, 10] run and are reported; "
+      "step 12 / epoch 2, only epoch_0002 + its export written (numbering continues the trunk's); the checkpoint and args.json record branch_from, no_gram False, "
+      "weight 2.0, refreshes [8, 10]; CSV from step 6 with gram > 0 and gram_weight 2.0")
+
+# the source is read only at the start: a re-submit resumes the branch's own checkpoint with the source gone, a different source path is a different run, and a trunk is never a branch
+BR_R, COPY = os.path.join(TMP, "BR_R"), os.path.join(TMP, "branch_src_copy.pth")
+shutil.copy(SRC1, COPY)
+BR_R_ARGS = ["--branch_from", COPY, "--gram_refresh_steps", "8,10", "--resume"]
+assert go(BR_R, *BR_R_ARGS, "--stop_after_epochs", "2")[0]["epoch"] == 2
+os.remove(COPY)
+summary_r, text_r = go(BR_R, *BR_R_ARGS, "--stop_after_epochs", "3")
+assert "resumed from" in text_r and "2 epochs / 12 steps done, Gram refreshes [8, 10]" in text_r and "branched from" not in text_r, text_r
+assert (summary_r["step"], summary_r["epoch"], summary_r["gram_refreshes"]) == (18, 3, [8, 10])
+assert os.path.isfile(os.path.join(BR_R, "export", "teacher_backbone_epoch_0003.pth"))
+assert json.load(open(os.path.join(BR_R, "args.json")))["branch_from"] == COPY  # still recorded
+other = os.path.join(TMP, "elsewhere_branch_src.pth")  # a resume naming another source is refused by the comparison even when that path does not exist either
+before_r = open(os.path.join(BR_R, "args.json")).read()
+message = raises(ValueError, go, BR_R, "--branch_from", other, "--gram_refresh_steps", "8,10", "--resume", "--stop_after_epochs", "3")
+assert "cannot --resume" in message and ("branch_from: checkpoint %r, now %r" % (COPY, other)) in message, message
+assert open(os.path.join(BR_R, "args.json")).read() == before_r
+before_t = open(os.path.join(BR_T, "args.json")).read()  # the no-Gram trunk resumed as a branch: it was not one
+message = raises(ValueError, go, BR_T, "--branch_from", SRC1, "--gram_refresh_steps", "100", "--resume", "--stop_after_epochs", "3")
+assert "cannot --resume" in message and ("branch_from: checkpoint None, now %r" % SRC1) in message, message
+assert open(os.path.join(BR_T, "args.json")).read() == before_t
+# a trunk checkpoint written before the key existed (0e8d453) reads as no branch and resumes unchanged
+assert "branch_from" in ck_t["args"] and ck_t["args"]["branch_from"] is None
+ck_old = dict(ck_t, args={k: v for k, v in ck_t["args"].items() if k != "branch_from"})
+ssl_pretrain.check_resume(ck_old, make_args(BR_T, "--no_gram"), 1, 6, ck_t["data_fingerprint"])
+print("OK (t) branch resume: branch -> epoch 2 -> source deleted -> --resume continues to epoch 3 ('resumed from', Gram refreshes [8, 10] restored, no 'branched from'; "
+      "path still recorded); a resume naming another (missing) source is refused by the comparison, and so is --branch_from on a trunk's resume (checkpoint None), args.json "
+      "untouched both times; a trunk checkpoint without the branch_from key still resumes as no branch")
+
+# refusals: each in a fresh dir, naming the cause, with nothing created on disk
+BRX = ["--branch_from", SRC1, "--gram_refresh_steps", "100", "--stop_after_epochs", "2"]  # the base args of every run below: valid, each adds one fault (a later flag wins)
+
+
+def br_refused(name, exc, *extra):  # a --branch_from start in a fresh dir TMP/brx_<name> that must raise exc: its message, after checking that nothing was created
+    out = os.path.join(TMP, "brx_" + name)
+    message = raises(exc, go, out, *BRX, *extra)
+    assert not os.path.exists(out), name
+    return message
+
+
+no_such = os.path.join(TMP, "no_such_branch_src.pth")
+assert "--branch_from %s is not a file" % no_such in br_refused("missing", FileNotFoundError, "--branch_from", no_such)
+assert "not a full epoch checkpoint" in br_refused("export", ValueError, "--branch_from", os.path.join(BR_T, "export", "teacher_backbone_epoch_0001.pth"))
+message = br_refused("gram_run", ValueError, "--branch_from", os.path.join(DIR_B, "ckpt", "epoch_0001.pth"))  # a Gram run's full checkpoint
+assert "not a --no_gram run's checkpoint" in message and "its no_gram is False" in message, message
+for flag, value, diff in (("--lr", "2e-3", "lr: checkpoint 0.001, now 0.002"), ("--seed", "7", "seed: checkpoint 100, now 7")):  # any other locked setting
+    message = br_refused(flag[2:], ValueError, flag, value)
+    listed = message.split("differs from the checkpoint in ", 1)[1]  # the differences themselves ("cannot --branch_from:" ahead of them is only the lead-in)
+    assert "cannot --branch_from" in message and diff in message, message
+    assert not any(free in listed for free in ("no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from:")), message  # the free keys are skipped
+rev_list = os.path.join(TMP, "ChestXray14_reversed.list")  # the same 3 lines in reverse order: same names and length, a different image list
+with open(CFG["ChestXray14"]["train_list"]) as f:
+    rev_lines = f.read().splitlines()
+with open(rev_list, "w") as f:
+    f.write("\n".join(reversed(rev_lines)) + "\n")
+cfg_rev, out_rev = dict(CFG, ChestXray14=dict(CFG["ChestXray14"], train_list=rev_list)), os.path.join(TMP, "brx_list")
+with contextlib.redirect_stdout(io.StringIO()):
+    message = raises(ValueError, ssl_pretrain.run, make_args(out_rev, *BRX), TINY_VIT, TINY_HEADS, cfg_rev)
+assert "cannot --branch_from" in message and "training image list" in message and not os.path.exists(out_rev), message
+helper_args = make_args(os.path.join(TMP, "brx_helper"), *BRX)  # world size and epoch length, through the helper (the run is one rank)
+assert ssl_pretrain.load_branch_source(helper_args, 2, 1, 6, src1["data_fingerprint"])["step"] == 6  # the real values pass
+assert "world_size: checkpoint 1, now 4" in raises(ValueError, ssl_pretrain.load_branch_source, helper_args, 2, 4, 6, src1["data_fingerprint"])
+assert "epoch_length 5" in raises(ValueError, ssl_pretrain.load_branch_source, helper_args, 2, 1, 5, src1["data_fingerprint"])
+assert not os.path.exists(os.path.join(TMP, "brx_helper"))
+assert "[6] not after the branch step 6" in br_refused("refresh_at", ValueError, "--gram_refresh_steps", "6,20")  # the refresh at the branch step itself
+assert "[3] not after" in br_refused("refresh_before", ValueError, "--gram_refresh_steps", "3")
+assert "--stop_after_epochs 1 is not after the source's epoch 1" in br_refused("stop", ValueError, "--stop_after_epochs", "1")
+print("OK (t) refusals: a missing source (FileNotFoundError), an export/teacher_backbone_*.pth ('not a full epoch checkpoint'), a Gram run's checkpoint (its no_gram is False), "
+      "another --lr / --seed (naming the difference, the Gram keys and branch_from skipped), a different image list, world size 4 and epoch length 5 (through load_branch_source), "
+      "a refresh step at (6) or before (3) the branch step, and a stop epoch not after the source's: each ValueError (or FileNotFoundError) names its cause and leaves the "
+      "output dir uncreated")
+
 # (k) launch scripts ------------------------------------------------------------------------------------------------------------
 scripts = [os.path.join(REPO, "chain", f) for f in ("ssl_common.sh", "pilot_a.sh", "pilot_b.sh", "main.sh", "constlr.sh", "hires.sh")]
 scripts.append(os.path.join(REPO, "run_d1_8s_timing_gaudi.sh"))
