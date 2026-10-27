@@ -69,7 +69,10 @@ keys, as before). An --init_from_checkpoint source must match the flag: its stud
 everything trainable, and with --lock_half_pass (Foundation X's lock-release, FX Sec. 3.3 / Supp. C, X+ Sec. 4.4.5-6; off by default, a per-run ablation)
 a lock pass before it: one pass over a random half of the dataset (n // 2 images, drawn per cycle by lock_subset from (seed, cycle, the dataset's place)
 alone, so every rank draws the same half; its own DistributedSampler shuffles and shards it per rank as the release pass's does the whole dataset) with the
-backbone at LR 0 (the --freeze_backbone_epochs mechanism) and the heads training. Every pass has its own DistributedSampler (shuffle, drop_last, per rank),
+backbone frozen and the heads training: its LR is 0 and its gradients are dropped after the backward (and its DDP all-reduce), before the clip and the
+optimizer step, so AdamW leaves the backbone's weights, moments and step counts exactly as they were and the half reaches the backbone through nothing, not
+even the optimizer state at the release (Codex r2 P2). The LR-0 freezes outside lock passes (the frozen first epoch, cycle, and the heads' last layers in it)
+are as before: their moments keep advancing, as on every earlier run and in Meta's recipe. Every pass has its own DistributedSampler (shuffle, drop_last, per rank),
 and set_epoch is called as each pass starts with that pass's own index (cycle x the passes per cycle + its place), so no two share a sampler permutation seed
 or a worker base seed. epoch_length is the sum of the passes' loader lengths (at global batch 256: 2665 without the lock, 1332 + 2665 = 3997 with it, against
 the mixed loader's 2666; VinDrCXR's lock pass is 29 steps, its release 58), and everything per epoch (LR warmup, teacher-temperature warmup,
@@ -246,7 +249,7 @@ def parse_args(argv=None):
     p.add_argument("--heads", choices=("shared", "per_dataset"), default="shared",
                    help="per_dataset (--cyclic_ark_teacher only): one DINO and one iBOT head per dataset, student and teacher, the batch's pair used")
     p.add_argument("--lock_half_pass", dest="lock_half_pass", action="store_const", const=True, default=None,
-                   help="--cyclic_ark_teacher only: Foundation X's lock-release, per dataset per cycle a lock pass over a random half (backbone LR 0, "
+                   help="--cyclic_ark_teacher only: Foundation X's lock-release, per dataset per cycle a lock pass over a random half (backbone frozen, "
                         "heads train) before the release pass over all of it (default: off, the release passes alone)")
     p.add_argument("--no_lock_half_pass", dest="lock_half_pass", action="store_const", const=False,
                    help="--cyclic_ark_teacher only: no lock passes, each dataset's release pass alone (the default, given explicitly)")
@@ -563,7 +566,7 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
             + ", ".join(f"{name} {len(parts[name])} images: " + (f"lock {lengths[(name, 'lock')]} + " if args.lock_half_pass else "")
                         + f"release {lengths[(name, 'release')]} steps" for name in order) + f"; {epoch_length} steps a cycle (= one epoch)")
         say(f"teacher (--cyclic_ark_teacher): no per-step EMA, frozen through every pass; after each dataset's release pass teacher <- {args.ark_teacher_momentum:g} "
-            f"x teacher + {1 - args.ark_teacher_momentum:g} x student (backbone and all heads)" + ("; FX lock-release: half-pass lock (backbone LR 0, heads train) + "
+            f"x teacher + {1 - args.ark_teacher_momentum:g} x student (backbone and all heads)" + ("; FX lock-release: half-pass lock (backbone frozen, heads train) + "
                                                                                                  "full-pass release per dataset" if args.lock_half_pass else ""))
 
     global_batch = args.batch_size_per_gpu * world_size
@@ -706,12 +709,15 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                 n_images = len(parts[name])
                 say(f"dataset pass after step {it}: {name} {phase} (cycle {epoch}, dataset {order.index(name) + 1}/{len(order)}, "
                     + (f"a random half, {n_images // 2} of {n_images} images" if lock else f"all {n_images} images") + f", {lengths[(name, phase)]} steps): "
-                    + ("backbone LR 0, heads train" if lock else "backbone and heads train" + ("; the backbone at LR 0 in this frozen cycle" if freeze else "")))
+                    + ("backbone frozen (LR 0, no optimizer step), heads train" if lock else "backbone and heads train" + ("; the backbone at LR 0 in this frozen cycle" if freeze else "")))
             lr, temp = float(sch["lr"][it]), float(sch["teacher_temp"][it])
             apply_optim_scheduler(optimizer, lr, args.weight_decay, float(sch["last_layer_lr"][it]), freeze_backbone=freeze or lock)
             optimizer.zero_grad(set_to_none=True)
             loss, loss_dict = meta.forward_backward(data, teacher_temp=temp)
             accelerator.mark_step()
+            if lock:  # a lock pass trains the heads only: with the backbone's grads dropped AdamW skips it, its moments and step counts too (Codex r2 P2); the LR-0 freezes keep theirs
+                for p in student["backbone"].parameters():
+                    p.grad = None
             for module in student.values():
                 torch.nn.utils.clip_grad_norm_(module.parameters(), max_norm=CLIP_GRAD)
             optimizer.step()

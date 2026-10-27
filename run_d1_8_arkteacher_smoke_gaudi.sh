@@ -30,7 +30,7 @@ TOKEN=  LOCK_FLAG=--no_lock_half_pass
 # LR-0 backbone all run on HCCL, and the --max_steps save (ckpt/maxsteps_0002300.pth: 8 heads, the per-rank RNG gather) follows. Expected log, in this order:
 #   cycle (--cyclic_ark_teacher): ... MIMIC 368960 images: [lock 720 + ]release 1441 steps, CheXpert 223414 images: [lock 436 + ]release 872 steps, ...; 2665 [3997] steps a cycle (= one epoch)
 #   (with the `heads: per_dataset` and `teacher views: clean` lines around it)
-#   1 only: dataset pass after step 0: MIMIC lock (cycle 0, dataset 1/4, a random half, 184480 of 368960 images, 720 steps): backbone LR 0, heads train
+#   1 only: dataset pass after step 0: MIMIC lock (cycle 0, dataset 1/4, a random half, 184480 of 368960 images, 720 steps): backbone frozen (LR 0, no optimizer step), heads train
 #   dataset pass after step 0 [720]: MIMIC release (cycle 0, dataset 1/4, all 368960 images, 1441 steps): backbone and heads train; the backbone at LR 0 in this frozen cycle
 #   step rows tagged | MIMIC:lock (1 only), then | MIMIC:release
 #   teacher blend after step 1441 [2161] (end of MIMIC's release pass, cycle 0, dataset 1/4): teacher <- 0.8 x teacher + 0.2 x student, backbone and all heads

@@ -19,7 +19,7 @@
 #   sbatch run_d1_8_constlr_arkteacher_gaudi.sh                               -> 0: no lock passes, each dataset's release pass alone (MIMIC 1441, CheXpert 872, ChestXray14 294, VinDrCXR 58
 #                                                                                steps at 64 x 4: 2665 a cycle, about 33 min); run dir ssl_dinov3_cxr_constlr_arkteacher_seed_100,
 #                                                                                stop file chain/constlr_arkteacher_stop_after.txt
-#   sbatch --export=ALL,CONSTLR_ARK_LOCK=1 run_d1_8_constlr_arkteacher_gaudi.sh -> 1: FX lock-release, per dataset a lock pass over a random half (backbone LR 0, heads train: MIMIC 720, CheXpert 436,
+#   sbatch --export=ALL,CONSTLR_ARK_LOCK=1 run_d1_8_constlr_arkteacher_gaudi.sh -> 1: FX lock-release, per dataset a lock pass over a random half (backbone frozen, heads train: MIMIC 720, CheXpert 436,
 #                                                                                ChestXray14 147, VinDrCXR 29 steps) before its release pass: 3997 a cycle, about 50 min; run dir
 #                                                                                ssl_dinov3_cxr_constlr_arkteacher_lock_seed_100, stop file chain/constlr_arkteacher_lock_stop_after.txt
 # The two arms never share a run dir or a stop file, so they can run side by side and a resume never flips the lock (the trainer also locks lock_half_pass on --resume). Pass CONSTLR_ARK_LOCK=1 on every
