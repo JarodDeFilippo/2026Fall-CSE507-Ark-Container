@@ -56,6 +56,13 @@
 # with --no_gram replaced by the branch pair, ARK_FLAGS kept after it, so a branch launches its trunk's line plus --branch_from as before (--branch_from requires every mode flag to match the source).
 # Its epoch_length is the cycle's, read from that args.json (2665, or 3997 with the lock, at global batch 256), so `1 40 <epoch_length> 30` refreshes the Gram teacher at the next 30 cycle
 # boundaries. Refused before anything is read: any other non-empty value, and CONSTLR_BRANCH_ARK=1 without the CONSTLR_BRANCH_* variables.
+# CONSTLR_ABLATE (drop_path, rope or local_norm; empty or unset = off), only together with CONSTLR_NOGRAM=1, makes the no-Gram trunk a one-flag-off recipe ablation, "DINO-X ConstLR 224, no Gram, one recipe flag off" (Jarod,
+# 2026-10-26; for group members, one arm each): the no-Gram trunk's launch line (RECIPE and --no_gram) with exactly one RECIPE flag and its value removed, drop_path --drop_path_rate 0.3, rope --rope_rescale_coords 2, local_norm
+# --untie_local_cls_norm, the other two kept in RECIPE's order, so each flag's effect on the frozen probe and the cosine maps reads on its own: the plain trunk (CONSTLR_PLAIN) is the all-off control and the no-Gram trunk the all-on one.
+# Each arm has its own run dir ssl_dinov3_cxr_constlr_nogram_no_<value>_seed_100 and its own stop file chain/constlr_nogram_no_<value>_stop_after.txt (the same rules, cluster-only too; no other stop file is read then), so no two
+# arms, and no arm and a trunk, share either, and its own `run:` line says which flag is off. TRUNK below stays the no-Gram trunk's run dir, and branches of an ablation arm are not supported. Refused before anything is read: any other
+# non-empty value (the message names the three), CONSTLR_NOGRAM unset or empty, CONSTLR_PLAIN or CONSTLR_ARK set, and any CONSTLR_BRANCH_* set. run_d1_8_constlr_nogram_ablate_gaudi.sh sets CONSTLR_NOGRAM and refuses to start without
+# CONSTLR_ABLATE (sbatch --export=ALL,CONSTLR_ABLATE=<value>): its own 4-card job outside the chain, never a phase.
 set -euo pipefail
 NOGRAM=${CONSTLR_NOGRAM:-}  # first, before anything is read or launched
 [[ -z $NOGRAM || $NOGRAM == 1 ]] || { echo "ERROR: CONSTLR_NOGRAM holds '$NOGRAM', which is not empty or 1" >&2; exit 1; }
@@ -76,6 +83,12 @@ BRANCH_ARK=${CONSTLR_BRANCH_ARK:-}
 ARK_LOCK=${CONSTLR_ARK_LOCK:-}
 [[ -z $ARK_LOCK || $ARK_LOCK == 0 || $ARK_LOCK == 1 ]] || { echo "ERROR: CONSTLR_ARK_LOCK holds '$ARK_LOCK', which is not empty, 0 or 1" >&2; exit 1; }
 [[ -z $ARK_LOCK || -n $ARK || -n $BRANCH_ARK ]] || { echo "ERROR: CONSTLR_ARK_LOCK is set without CONSTLR_ARK=1 or CONSTLR_BRANCH_ARK=1: it picks the Ark-teacher trunk's lock arm, so set one of them" >&2; exit 1; }
+ABLATE=${CONSTLR_ABLATE:-}
+[[ -z $ABLATE || $ABLATE == drop_path || $ABLATE == rope || $ABLATE == local_norm ]] || { echo "ERROR: CONSTLR_ABLATE holds '$ABLATE', which is not empty, drop_path, rope or local_norm" >&2; exit 1; }
+[[ -z $ABLATE || -z $PLAIN ]] || { echo "ERROR: CONSTLR_ABLATE and CONSTLR_PLAIN are both set: an ablation arm is the no-Gram trunk with one DINOv3 recipe flag removed, and the plain trunk has no recipe flag left to remove, so unset CONSTLR_PLAIN" >&2; exit 1; }
+[[ -z $ABLATE || -z $ARK ]] || { echo "ERROR: CONSTLR_ABLATE and CONSTLR_ARK are both set: an ablation arm is the no-Gram trunk's line with one recipe flag removed and nothing added, so unset CONSTLR_ARK" >&2; exit 1; }
+[[ -z $ABLATE || -z $BRANCH ]] || { echo "ERROR: CONSTLR_ABLATE and CONSTLR_BRANCH_* are both set: branches of an ablation arm are not supported, so unset CONSTLR_ABLATE" >&2; exit 1; }
+[[ -z $ABLATE || -n $NOGRAM ]] || { echo "ERROR: CONSTLR_ABLATE=$ABLATE is set without CONSTLR_NOGRAM=1: an ablation arm is the no-Gram trunk with one recipe flag removed, so set both" >&2; exit 1; }
 source "$(dirname "${BASH_SOURCE[0]}")/ssl_common.sh"
 
 EPOCHS=1000  # the --epochs ceiling (never reached): the stop epoch's upper limit and the launch line both use it, so they cannot drift
@@ -107,6 +120,19 @@ if [[ -n $NOGRAM ]]; then
     STOP_FILE=chain/constlr_arkteacher${ARK_TOKEN}_stop_after.txt
     GRAM_ARGS=("${RECIPE[@]}" --no_gram "${ARK_FLAGS[@]}")
     RECIPE_NOTE="DINOv3 recipe: ${RECIPE[*]}; Ark teacher: ${ARK_FLAGS[*]} after --no_gram ($ARK_LOCK_NOTE; clean teacher views implied, --ark_teacher_momentum 0.8 by default; an epoch is a cycle over the four datasets)"
+  fi
+  if [[ -n $ABLATE ]]; then  # RECIPE minus one flag and its value (the rest in its order), the line otherwise the no-Gram trunk's; TRUNK is left alone (no branch of an arm: refused above)
+    case $ABLATE in drop_path) OFF_FLAG=--drop_path_rate ;; rope) OFF_FLAG=--rope_rescale_coords ;; local_norm) OFF_FLAG=--untie_local_cls_norm ;; esac
+    KEPT=() OFF= DROP=
+    for word in "${RECIPE[@]}"; do
+      [[ $word != --* ]] || DROP=  # a flag starts a new group, kept unless it is the removed one ...
+      [[ $word != "$OFF_FLAG" ]] || DROP=1  # ... whose value (the words without --) then goes with it
+      if [[ -n $DROP ]]; then OFF+=${OFF:+ }$word; else KEPT+=("$word"); fi
+    done
+    RUN=ssl_dinov3_cxr_constlr_nogram_no_${ABLATE}_seed_100
+    STOP_FILE=chain/constlr_nogram_no_${ABLATE}_stop_after.txt
+    GRAM_ARGS=("${KEPT[@]}" --no_gram)
+    RECIPE_NOTE="recipe ablation: $ABLATE off ($OFF removed); DINOv3 recipe otherwise: ${KEPT[*]}"
   fi
 fi
 LR=$(read_setting chain/main_lr.txt '^([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$' 'a positive number such as 2e-3 or 0.0003')

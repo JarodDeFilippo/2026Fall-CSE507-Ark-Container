@@ -2325,6 +2325,7 @@ scripts.append(os.path.join(REPO, "run_d1_8hires_gram512_gaudi.sh"))  # the Gram
 scripts.append(os.path.join(REPO, "run_d1_8_constlr_nogram_gaudi.sh"))  # the no-Gram trunk's sbatch wrapper; its contents are checked after the constlr checks
 scripts.append(os.path.join(REPO, "run_d1_8_branch_gram_gaudi.sh"))  # the Gram-anchored branches' sbatch wrapper; its contents are checked after the no-Gram wrapper's
 scripts.append(os.path.join(REPO, "run_d1_8_constlr_nogram_plain_gaudi.sh"))  # the plain no-Gram trunk's sbatch wrapper; its contents are checked after the branch wrapper's
+scripts.append(os.path.join(REPO, "run_d1_8_constlr_nogram_ablate_gaudi.sh"))  # the one-flag-off ablation arms' sbatch wrapper; its contents are checked after the Ark-teacher checks
 for script in scripts:
     assert os.access(script, os.X_OK), script
     subprocess.run(["bash", "-n", script], check=True)
@@ -3098,6 +3099,185 @@ print("OK (k) Ark-teacher trunk: constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_ARK=1 
       "branch dir, every --branch_from-checked setting = the trunk's, and a trunk args.json with the other lock_half_pass or none is refused; the phase, the no-Gram trunk, the plain trunk and the no-Gram "
       "branches launch and print exactly as before with the three variables empty and the Ark stop files present or absent; run_d1_8_arkteacher_smoke_gaudi.sh (75 min) launches the arm's flags for 2300 "
       "steps (past MIMIC's release, 1441, or lock + release, 2161) into ssl_dinov3_cxr_arkteacher[_lock]_smoke_seed_100 and refuses another CONSTLR_ARK_LOCK")
+
+# the one-flag-off recipe ablations ("DINO-X ConstLR 224, no Gram, one recipe flag off"): CONSTLR_NOGRAM=1 CONSTLR_ABLATE=drop_path | rope | local_norm (what run_d1_8_constlr_nogram_ablate_gaudi.sh sets, the arm
+# coming from its sbatch line) launches the no-Gram trunk's line (RECIPE, --no_gram) with exactly that one RECIPE flag and its value removed, into the arm's own run dir with the arm's own cluster-only stop file (no
+# other stop file is read). Refused before anything is read: another value, CONSTLR_NOGRAM unset, CONSTLR_PLAIN, CONSTLR_ARK, any CONSTLR_BRANCH_*; the wrapper also refuses to start without an arm. The phase,
+# the no-Gram trunk, the plain trunk, both Ark-teacher arms and the no-Gram trunk's branches launch and print exactly as before
+ABLATE_ARMS = {  # arm: (the RECIPE words it removes, the words that stay as the run: line prints them, the trainer's (drop_path_rate, rope_rescale_coords, untie_local_cls_norm), the one key that reads as its default)
+    "drop_path": (["--drop_path_rate", "0.3"], "--rope_rescale_coords 2 --untie_local_cls_norm", (0.0, 2.0, True), "drop_path_rate"),
+    "rope": (["--rope_rescale_coords", "2"], "--drop_path_rate 0.3 --untie_local_cls_norm", (0.3, None, True), "rope_rescale_coords"),
+    "local_norm": (["--untie_local_cls_norm"], "--drop_path_rate 0.3 --rope_rescale_coords 2", (0.3, 2.0, False), "untie_local_cls_norm")}
+ABLATE_STOPS = {"drop_path": "91", "rope": "92", "local_norm": "93"}  # each arm's stop epoch, in its file as " 91 \n": the argv shows which file was read (the phase's 30, the no-Gram trunk's 100, the plain 60, the Ark arms' 70 / 80)
+ABLATE_FILES = {arm: "constlr_nogram_no_%s_stop_after.txt" % arm for arm in ABLATE_ARMS}
+ABLATE_RUNS = {arm: "/workspace/ssl_dinov3_cxr_constlr_nogram_no_%s_seed_100" % arm for arm in ABLATE_ARMS}
+ABLATE_ENVS = {arm: dict(NOGRAM_ENV, CONSTLR_ABLATE=arm) for arm in ABLATE_ARMS}
+ABLATE_TRAINER_LINES = {"drop_path": "drop path 0, RoPE coordinate rescale 2, local-crop CLS norm untied", "rope": "drop path 0.3, RoPE coordinate rescale none, local-crop CLS norm untied",
+                        "local_norm": "drop path 0.3, RoPE coordinate rescale 2, local-crop CLS norm tied"}  # the recipe (...) line the trainer prints for each arm (the f-string in run())
+ALL_STOP_FILES = {"constlr_stop_after.txt", "constlr_nogram_stop_after.txt", PLAIN_STOP_FILE, ARK_STOP_FILE, ARK_LOCK_STOP_FILE, *ABLATE_FILES.values()}
+ALL_RUNS = ["/workspace/ssl_dinov3_cxr_constlr_seed_100", NOGRAM_RUN, PLAIN_RUN, *ARK_RUNS.values(), *ABLATE_RUNS.values()]
+assert len(ALL_STOP_FILES) == len(ALL_RUNS) == len(set(ALL_RUNS)) == 8  # the phase, the no-Gram trunk, the plain trunk, the two Ark arms and the three ablation arms: no run dir or stop file shared by any two
+PLAIN_RUN_LINE = ("run: ssl_dinov3_cxr_constlr_nogram_plain_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; plain: no DINOv3 recipe flags, "
+                  "the one-variable Gram-off control of ssl_dinov3_cxr_constlr_seed_100; stop after epoch 60 from chain/constlr_nogram_plain_stop_after.txt)")
+
+
+def constlr_vars(env):  # for assertion messages: the CONSTLR_ settings, not the whole environment (it holds the caller's tokens)
+    return {k: v for k, v in env.items() if k.startswith("CONSTLR_")}
+
+
+def ablate_run(root, env, **override):  # ark_run with the three arms' stop files written too, " 91 \n" ... (None: absent); the argv shows which stop file was read
+    return ark_run(root, env=env, **dict({ABLATE_FILES[arm]: " %s \n" % ABLATE_STOPS[arm] for arm in ABLATE_ARMS}, **override))
+
+
+def without(argv, words):  # argv minus a run of consecutive words, which must be in it exactly once
+    at = [i for i in range(len(argv) - len(words) + 1) if argv[i:i + len(words)] == words]
+    assert len(at) == 1 and argv.count(words[0]) == 1, (words, at)
+    return argv[:at[0]] + argv[at[0] + len(words):]
+
+
+def ablate_argv_for(arm, stop):  # nogram_argv_for(stop) in the arm's run dir without the arm's flag (and its value), nothing else changed
+    return [ABLATE_RUNS[arm] if arg == NOGRAM_RUN else arg for arg in without(nogram_argv_for(stop), ABLATE_ARMS[arm][0])]
+
+
+ablate_root = sandbox()
+ablate_argvs = {}
+for arm, (off, kept, recipe_set, reset_key) in ABLATE_ARMS.items():
+    stop = ABLATE_STOPS[arm]
+    result, argv = ablate_run(ablate_root, ABLATE_ENVS[arm])  # the arm's stop file " 9x ": the other seven are not read
+    assert result.returncode == 0 and result.stderr == "" and argv == ablate_argv_for(arm, stop), (arm, result.stderr, argv)
+    assert result.stdout.splitlines() == ["run: ssl_dinov3_cxr_constlr_nogram_no_%s_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; recipe ablation: %s off (%s removed); "
+                                          "DINOv3 recipe otherwise: %s; stop after epoch %s from chain/constlr_nogram_no_%s_stop_after.txt)" % (arm, arm, " ".join(off), kept, stop, arm)], result.stdout
+    # the line spelled out, not derived: the arm's run dir and stop epoch, the two flags that stay and then --no_gram at the end, and neither the removed flag nor a Gram refresh list anywhere
+    assert after(argv, "--output_dir") == ABLATE_RUNS[arm] and after(argv, "--stop_after_epochs") == stop and argv[-1 - len(kept.split()):] == kept.split() + ["--no_gram"], (arm, argv)
+    assert off[0] not in argv and "--gram_refresh_steps" not in argv and all(argv.count(flag) == 1 for flag in kept.split() if flag.startswith("--")), (arm, argv)
+    ablate_argvs[arm] = argv
+    expanded["constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_ABLATE=" + arm] = "./gaudi.sh " + " ".join(argv)
+    # the no-Gram trunk's real line at this stop epoch (constlr.sh with CONSTLR_NOGRAM=1), minus the arm's flag and in the arm's run dir, is the arm's line byte for byte
+    result, folded = ablate_run(ablate_root, NOGRAM_ENV, **{"constlr_nogram_stop_after.txt": stop + "\n"})
+    assert result.returncode == 0 and folded == nogram_argv_for(stop), (arm, result.stderr, folded)
+    assert argv == [ABLATE_RUNS[arm] if arg == NOGRAM_RUN else arg for arg in without(folded, off)] and len(folded) == len(argv) + len(off), (arm, argv, folded)
+    # the trainer reads the arm's argv as meant: stop after epoch 9x of the 1000-epoch ceiling, no Gram teacher, the recipe with just that setting at its default, and every other parsed setting the
+    # no-Gram trunk's at the same stop epoch (only the run dir and that one setting differ)
+    parsed = ssl_pretrain.parse_args(argv[argv.index("ssl_pretrain.py") + 1:])
+    folded_parsed = ssl_pretrain.parse_args(folded[folded.index("ssl_pretrain.py") + 1:])
+    assert ssl_pretrain.check_args(parsed) == int(stop) and parsed.epochs == 1000 and parsed.no_gram and parsed.resume and parsed.output_dir == ABLATE_RUNS[arm]
+    assert tuple(getattr(parsed, k) for k in RECIPE_KEYS) == recipe_set and tuple(getattr(folded_parsed, k) for k in RECIPE_KEYS) == (0.3, 2.0, True)
+    assert {k for k in vars(parsed) if getattr(parsed, k) != getattr(folded_parsed, k)} == {"output_dir", reset_key}, arm
+assert len({tuple(argv) for argv in ablate_argvs.values()}) == 3  # three different lines
+# a missing or invalid stop file of an arm is refused naming itself (none of the other seven, which stay valid) before gaudi.sh is reached, and before any run: line; each arm reads only its own
+for arm in ABLATE_ARMS:
+    own = ABLATE_FILES[arm]
+    for stop in (None, "", "0", "2.5", "thirty", "-3", "1001", "18446744073709551617"):  # None: absent; 1001: one past the ceiling; 2**64 + 1: bash arithmetic would read it as 1
+        result, refused_argv = ablate_run(ablate_root, ABLATE_ENVS[arm], **{own: stop})
+        assert result.returncode == 1 and "ERROR" in result.stderr and own in result.stderr and refused_argv is None and result.stdout == "", (arm, stop, result.stderr)
+        assert not any("chain/" + other in result.stderr for other in ALL_STOP_FILES - {own}), (arm, stop, result.stderr)
+    assert "ceiling of 1000" in result.stderr, result.stderr  # the last one is refused for being above the ceiling, and the message names it
+    result, solo_argv = ablate_run(ablate_root, ABLATE_ENVS[arm], **{name: None for name in ALL_STOP_FILES - {own}})  # the arm needs none of the others
+    assert result.returncode == 0 and solo_argv == ablate_argvs[arm], (arm, result.stderr, solo_argv)
+# the others are byte-unchanged: the phase, the no-Gram trunk, the plain trunk and both Ark-teacher arms with the arms' stop files present (not read: the argv has the others' epochs) or absent and CONSTLR_ABLATE
+# unset or empty, and the no-Gram trunk's branch
+for ablate_file in (" 94 \n", None):
+    files = {name: ablate_file for name in ABLATE_FILES.values()}
+    for empty in ({}, dict(CONSTLR_ABLATE="")):
+        result, kept_argv = ablate_run(ablate_root, dict(ALLOC4, **empty), **files)
+        assert result.returncode == 0 and kept_argv == constlr_argv("30") and (result.stdout, result.stderr) == ("", ""), (ablate_file, empty, result.stderr, kept_argv)
+        result, kept_argv = ablate_run(ablate_root, dict(NOGRAM_ENV, **empty), **files)
+        assert result.returncode == 0 and kept_argv == nogram_argv_for("100") and result.stderr == "" and result.stdout.splitlines() == [NOGRAM_RUN_LINE % "100"], (ablate_file, empty, result.stdout)
+        result, kept_argv = ablate_run(ablate_root, dict(PLAIN_ENV, **empty), **files)
+        assert result.returncode == 0 and kept_argv == plain_argv_for("60") and result.stderr == "" and result.stdout.splitlines() == [PLAIN_RUN_LINE], (ablate_file, empty, result.stdout)
+        for lock, env, stop in (("0", ARK_ENV, "70"), ("1", ARK_LOCK_ENV, "80")):
+            result, kept_argv = ablate_run(ablate_root, dict(env, **empty), **files)
+            assert result.returncode == 0 and kept_argv == ark_argv_for(stop, lock) and result.stderr == "" and result.stdout.splitlines() == [ark_run_line(lock, stop)], (ablate_file, empty, lock, result.stdout)
+assert len(bres.stdout.splitlines()) == 2 and bres.stdout.startswith("run: %s (Gram-anchored branch of " % BRANCH_E10), bres.stdout  # bres: the `10 40` branch above
+for empty in ({}, dict(CONSTLR_ABLATE="")):
+    bres_ablate, kept_bargv = branch_run(branch_dir, "10", "40", env=dict(ALLOC4, **empty))
+    assert bres_ablate.returncode == 0 and kept_bargv == bargv == branch_argv_for("40", BRANCH_E10, BRANCH_SRC10, "36660,46660,56660"), (empty, bres_ablate.stderr)
+    assert (bres_ablate.stdout, bres_ablate.stderr) == (bres.stdout, bres.stderr) and bres_ablate.stderr == "", (empty, bres_ablate.stdout)
+# the refusals, each before anything is read (ablate_bare has no setting file to miss) and so before anything is launched (ablate_root has them all), with its exact text
+ablate_bare = sandbox()
+ABLATE_BAD_VALUE = "ERROR: CONSTLR_ABLATE holds '%s', which is not empty, drop_path, rope or local_norm\n"
+ABLATE_NO_PLAIN = ("ERROR: CONSTLR_ABLATE and CONSTLR_PLAIN are both set: an ablation arm is the no-Gram trunk with one DINOv3 recipe flag removed, and the plain trunk has no recipe flag left to remove, "
+                   "so unset CONSTLR_PLAIN\n")
+ABLATE_NO_ARK = "ERROR: CONSTLR_ABLATE and CONSTLR_ARK are both set: an ablation arm is the no-Gram trunk's line with one recipe flag removed and nothing added, so unset CONSTLR_ARK\n"
+ABLATE_NO_BRANCH = "ERROR: CONSTLR_ABLATE and CONSTLR_BRANCH_* are both set: branches of an ablation arm are not supported, so unset CONSTLR_ABLATE\n"
+ABLATE_NEEDS_NOGRAM = "ERROR: CONSTLR_ABLATE=%s is set without CONSTLR_NOGRAM=1: an ablation arm is the no-Gram trunk with one recipe flag removed, so set both\n"
+bad_values = ("0", "1", "yes", "Rope", "drop-path", "local", "all", " rope", "rope ", "drop_path,rope")
+ablate_refusals = [(dict(NOGRAM_ENV, CONSTLR_ABLATE=value), ABLATE_BAD_VALUE % value) for value in bad_values]
+ablate_refusals += [(dict(ALLOC4, CONSTLR_ABLATE="yes"), ABLATE_BAD_VALUE % "yes")]  # the value is checked first, with or without CONSTLR_NOGRAM
+ablate_refusals += [(dict(PLAIN_ENV, CONSTLR_ABLATE=arm), ABLATE_NO_PLAIN) for arm in ABLATE_ARMS]
+ablate_refusals += [(dict(env, CONSTLR_ABLATE=arm), ABLATE_NO_ARK) for env in (ARK_ENV, ARK_LOCK_ENV) for arm in ABLATE_ARMS]
+ablate_refusals += [(dict(ALLOC4, CONSTLR_ABLATE=arm, **branch_vars), ABLATE_NO_BRANCH) for arm in ABLATE_ARMS
+                    for branch_vars in (dict(CONSTLR_BRANCH_EPOCH="10"), dict(CONSTLR_BRANCH_STOP="40"), branch_all, dict(branch_all, CONSTLR_BRANCH_ARK="1"))]
+ablate_refusals += [(dict(ALLOC4, CONSTLR_ABLATE=arm), ABLATE_NEEDS_NOGRAM % arm) for arm in ABLATE_ARMS] + [(dict(ALLOC4, CONSTLR_ABLATE="rope", CONSTLR_NOGRAM=""), ABLATE_NEEDS_NOGRAM % "rope")]
+for env, expected_error in ablate_refusals:
+    result = run_script(ablate_bare, "chain/constlr.sh", env=env)
+    assert result.returncode == 1 and result.stderr == expected_error and result.stdout == "" and launched(ablate_bare) is None, (constlr_vars(env), result.stderr)
+    result, refused_argv = ablate_run(ablate_root, env)
+    assert result.returncode == 1 and result.stderr == expected_error and result.stdout == "" and refused_argv is None, (constlr_vars(env), result.stderr)
+branch_refused(branch_root(), ("10", "40"), "CONSTLR_ABLATE", "CONSTLR_BRANCH_*", env=dict(ALLOC4, CONSTLR_ABLATE="rope"))  # the branch wrapper sets all four: refused naming both
+# the wrapper: bash -n and the executable bit are checked with the other scripts above; here its mode, sbatch header, guard, last line and comments, that it is the no-Gram trunk's wrapper but for the job
+# name, the comments and one guard right after the export, and that a copy with its cd pointed at a sandbox launches each arm's line from outside the repo (as sbatch starts it) and refuses to start without an arm
+ABLATE_SCRIPT = os.path.join(REPO, "run_d1_8_constlr_nogram_ablate_gaudi.sh")
+assert stat.S_IMODE(os.stat(ABLATE_SCRIPT).st_mode) == 0o755
+ablate_text = open(ABLATE_SCRIPT).read()
+ablate_lines = ablate_text.splitlines()
+assert [line[len("#SBATCH "):] for line in ablate_lines if line.startswith("#SBATCH ")] == [
+    "--job-name=d1-8-nogram-no", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"], ablate_lines  # the job name is completed on the sbatch line
+ablate_code = [line for line in ablate_lines if line and not line.startswith("#")]
+assert ablate_code[-1] == "CONSTLR_NOGRAM=1 exec ./chain/constlr.sh" and ablate_code == nogram_code[:1] + ablate_code[1:2] + nogram_code[1:], ablate_code
+assert ablate_code[1].startswith("[[ -n ${CONSTLR_ABLATE:-} ]] || {") and ablate_code[1].endswith("exit 1; }") and all(arm in ablate_code[1] for arm in ABLATE_ARMS), ablate_code[1]  # names the three
+assert all(line.startswith("#") for line in ablate_lines if "phases.txt" in line), ablate_lines  # not a chain phase: phases.txt is named in comments only
+for arm, (off, kept, _, _) in ABLATE_ARMS.items():  # the comments: each arm's submit line (its stop file first, its own job name) and the note and trainer line its log must show
+    assert ablate_lines.count("#   echo 100 > chain/%s && sbatch --job-name=d1-8-nogram-no-%s --export=ALL,CONSTLR_ABLATE=%s run_d1_8_constlr_nogram_ablate_gaudi.sh" % (ABLATE_FILES[arm], arm, arm)) == 1, arm
+    assert "recipe ablation: %s off (%s removed); DINOv3 recipe otherwise: %s" % (arm, " ".join(off), kept) in ablate_text and "recipe (...): " + ABLATE_TRAINER_LINES[arm] in ablate_text, arm
+for needle in ("the plain trunk is the all-off control and the no-Gram trunk the all-on one", "No smoke launcher", "run_d1_8_nogram_smoke_gaudi.sh", "HCCL", "pass the SAME CONSTLR_ABLATE",
+               "ssl_dinov3_cxr_constlr_nogram_no_<value>_seed_100", "chain/constlr_nogram_no_<value>_stop_after.txt", "sbatch does not expand variables", "never export it in the shell"):
+    assert needle in ablate_text, needle
+
+
+def ablate_wrapper_root():  # a sandbox with all the arms' stop files and the no-Gram trunk's (so a launch that took no arm for "off" would show), and the wrapper with its cd pointed at it
+    root = sandbox(timing=True)  # also the gaudi_check_cards.sh / gaudi_verify_busy.sh recorders
+    open(os.path.join(root, "chain", "main_lr.txt"), "w").write("0.002\n")
+    open(os.path.join(root, "chain", "constlr_nogram_stop_after.txt"), "w").write("100\n")
+    for arm in ABLATE_ARMS:
+        open(os.path.join(root, "chain", ABLATE_FILES[arm]), "w").write(ABLATE_STOPS[arm] + "\n")
+    assert ablate_text.count(BRANCH_CD) == 1, BRANCH_CD
+    open(os.path.join(root, "ablate_wrapper.sh"), "w").write(ablate_text.replace(BRANCH_CD, "cd %s || exit 1" % shlex.quote(root)))
+    return root
+
+
+def ablate_wrapper(root, env):  # the wrapper copy, started from elsewhere: (result, argv or None), a stale argv.txt removed first
+    if os.path.exists(os.path.join(root, "argv.txt")):
+        os.remove(os.path.join(root, "argv.txt"))
+    return subprocess.run(["bash", os.path.join(root, "ablate_wrapper.sh")], cwd=branch_elsewhere, env=env, capture_output=True, text=True), launched(root)
+
+
+for arm, (off, kept, _, _) in ABLATE_ARMS.items():
+    wrap_root = ablate_wrapper_root()
+    result, wrapped_argv = ablate_wrapper(wrap_root, dict(ALLOC4, CONSTLR_ABLATE=arm))
+    assert result.returncode == 0 and result.stderr == "" and wrapped_argv == ablate_argv_for(arm, ABLATE_STOPS[arm]) == ablate_argvs[arm], (arm, result.stderr, wrapped_argv)
+    assert result.stdout.startswith("run: ssl_dinov3_cxr_constlr_nogram_no_%s_seed_100 (no Gram teacher: " % arm) and ("recipe ablation: %s off (%s removed)" % (arm, " ".join(off))) in result.stdout, result.stdout
+    assert os.path.exists(os.path.join(wrap_root, "cards_checked"))
+    for _ in range(50):  # the busy check runs in the background
+        if os.path.exists(os.path.join(wrap_root, "busy_arg.txt")):
+            break
+        subprocess.run(["sleep", "0.1"])
+    assert open(os.path.join(wrap_root, "busy_arg.txt")).read() == "900\n"
+for env in (ALLOC4, dict(ALLOC4, CONSTLR_ABLATE="")):  # no arm (unset or empty): refused before the cd and the card check, and the no-Gram trunk (its stop file is there) is not launched in its place
+    wrap_root = ablate_wrapper_root()
+    result, wrapped_argv = ablate_wrapper(wrap_root, env)
+    assert result.returncode == 1 and result.stdout == "" and result.stderr.startswith("ERROR: CONSTLR_ABLATE is unset or empty") and result.stderr.count("\n") == 1, (constlr_vars(env), result.stderr)
+    assert all(arm in result.stderr for arm in ABLATE_ARMS) and wrapped_argv is None and not os.path.exists(os.path.join(wrap_root, "cards_checked")), (constlr_vars(env), result.stderr)
+wrap_root = ablate_wrapper_root()  # another value gets through the wrapper's guard and is refused by constlr.sh, naming the three; nothing is launched
+result, wrapped_argv = ablate_wrapper(wrap_root, dict(ALLOC4, CONSTLR_ABLATE="rop"))
+assert result.returncode == 1 and result.stdout == "" and result.stderr == ABLATE_BAD_VALUE % "rop" and wrapped_argv is None, result.stderr
+print("OK (k) ablation arms: constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_ABLATE=drop_path | rope | local_norm (run_d1_8_constlr_nogram_ablate_gaudi.sh: mode 755, 4 cards, the no-Gram trunk's wrapper but for the job name, "
+      "the comments and one guard after the export that refuses to start without CONSTLR_ABLATE, names phases.txt only in comments, launches each arm's line from outside the repo) launches the no-Gram trunk's line "
+      "with exactly that one flag and its value removed (byte for byte: the real no-Gram trunk line at the same stop epoch minus the flag, in the arm's run dir) into ssl_dinov3_cxr_constlr_nogram_no_<arm>_seed_100 "
+      "with the stop epoch from constlr_nogram_no_<arm>_stop_after.txt only (a missing or invalid file is refused naming itself, the other seven stop files neither read nor needed; eight run dirs and eight stop "
+      "files in all, none shared), printing the arm and the flag removed in its run: line; the argv parses to the no-Gram trunk's settings but for the run dir and that one recipe setting at its default; CONSTLR_ABLATE "
+      "other than empty or the three values, without CONSTLR_NOGRAM=1, or with CONSTLR_PLAIN, CONSTLR_ARK or any CONSTLR_BRANCH_* is refused with its exact text before anything is read; the phase, the no-Gram trunk, "
+      "the plain trunk, both Ark-teacher arms and the no-Gram trunk's branches launch and print exactly as before with CONSTLR_ABLATE unset or empty and the arms' stop files present or absent")
 
 # hires.sh ("DINO-X ConstLR 512 px"): a separate run from the stock weights, constlr.sh with only the crops and the batch changed. Four setting files,
 # each missing or invalid one refused naming it before gaudi.sh is reached (the LR file is constlr's own main_lr.txt)
