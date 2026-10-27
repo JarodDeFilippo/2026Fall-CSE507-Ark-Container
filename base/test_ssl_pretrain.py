@@ -1727,28 +1727,39 @@ for w_rank in w_wrapped:
 print("OK (w) two real ranks, Accelerator.wrap_model: called without the keyword it reports find_unused_parameters True (as with True) and trains a module with a parameter in no forward for 3 steps; with False it "
       "reports False and that module raises '%s' at its second forward, on both ranks" % w_wrapped[0]["false"][1])
 
-# (x) --cyclic_ark_teacher: the Ark+ / FX teacher (cycles of one-dataset batches, largest first; no per-step EMA, a blend at every dataset-epoch end on clean views;
-# per-dataset heads; a backbone lock after every dataset switch; every checkpoint kept) ------------------------------------------------------------------------------
-# The data: 8 / 6 / 4 / 2 images (the real ranking: MIMIC 368960, CheXpert 223414, ChestXray14 75312, VinDrCXR 15000), listed in make_args's --data_set order VinDrCXR, ChestXray14,
-# MIMIC, CheXpert, which the cycle order must not follow; batch 2 on one rank: 4 / 3 / 2 / 1 steps, 10 a cycle
+# (x) --cyclic_ark_teacher: the Ark+ / FX teacher (cycles of one-dataset batches, largest first; no per-step EMA, a blend after every dataset's release pass on clean views;
+# per-dataset heads; with --lock_half_pass Foundation X's lock pass over a random half before each release pass; every checkpoint kept) -----------------------------------------
+# The data: 12 / 8 / 6 / 4 images (the real ranking: MIMIC 368960, CheXpert 223414, ChestXray14 75312, VinDrCXR 15000), listed in make_args's --data_set order VinDrCXR, ChestXray14,
+# MIMIC, CheXpert, which the cycle order must not follow. Batch 2 on one rank: release passes of 6 / 4 / 3 / 2 steps, lock passes (halves of 6 / 4 / 3 / 2 images) of 3 / 2 / 1 / 1, so a
+# cycle is 22 steps with the lock and 15 without
+import hashlib
+
 from torchvision.transforms import v2
 
-X_COUNTS = dict(MIMIC=8, CheXpert=6, ChestXray14=4, VinDrCXR=2)
+X_COUNTS = dict(MIMIC=12, CheXpert=8, ChestXray14=6, VinDrCXR=4)
 X_CFG = make_synthetic_data(os.path.join(TMP, "data_cyclic"), X_COUNTS)
-X_ORDER, X_LENGTHS = ["MIMIC", "CheXpert", "ChestXray14", "VinDrCXR"], [4, 3, 2, 1]
-X_PATTERN = [name for name, n in zip(X_ORDER, X_LENGTHS) for _ in range(n)]  # the dataset of each step of a cycle
-X_ENDS = [4, 7, 9, 10]  # steps done at each dataset epoch's end, within a cycle
-X_MODE = ["--cyclic_ark_teacher", "--heads", "per_dataset", "--switch_lock_steps", "2"]  # the trunk's mode flags, at a lock the tiny dataset epochs leave room for
+X_ORDER = ["MIMIC", "CheXpert", "ChestXray14", "VinDrCXR"]
+X_PASSES = [("MIMIC", "lock", 3), ("MIMIC", "release", 6), ("CheXpert", "lock", 2), ("CheXpert", "release", 4), ("ChestXray14", "lock", 1), ("ChestXray14", "release", 3),
+            ("VinDrCXR", "lock", 1), ("VinDrCXR", "release", 2)]
+X_L = sum(n for _, _, n in X_PASSES)  # 22
+X_PATTERN = [(name, phase) for name, phase, n in X_PASSES for _ in range(n)]  # (dataset, phase) of each step of a cycle
+X_ENDS = [9, 15, 19, 22]  # steps done at each release pass's end within a cycle: the blends
+X_MODE = ["--cyclic_ark_teacher", "--heads", "per_dataset", "--lock_half_pass"]  # the lock arm's mode flags (the trunk's line with CONSTLR_ARK_LOCK=1)
 ARK = ["--no_gram", *X_MODE]
-X_ARK_KEYS = ("cyclic_ark_teacher", "ark_teacher_momentum", "teacher_clean_view", "heads", "switch_lock_steps", "keep_all_checkpoints")
-X_DEFAULTS = (False, None, False, "shared", 0, False)
+ARK_OFF = ["--no_gram", "--cyclic_ark_teacher", "--heads", "per_dataset"]  # the arm without lock passes (the mode's default)
+X_ARK_KEYS = ("cyclic_ark_teacher", "ark_teacher_momentum", "teacher_clean_view", "heads", "lock_half_pass", "keep_all_checkpoints")
+X_DEFAULTS = (False, None, False, "shared", False, False)
 
 
-def xgo(out, *extra):  # go() on the cyclic data
+def xgo(out, *extra, cfg=X_CFG):  # go() on the cyclic data
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        summary = ssl_pretrain.run(make_args(out, *extra), TINY_VIT, TINY_HEADS, X_CFG)
+        summary = ssl_pretrain.run(make_args(out, *extra), TINY_VIT, TINY_HEADS, cfg)
     return summary, buf.getvalue()
+
+
+def x_images(name):  # the dataset's image paths, in list order (lock_subset indexes into this)
+    return ssl_data.image_paths(name, X_CFG[name]["data_dir"], X_CFG[name]["train_list"])
 
 
 def x_dataset_of(path):  # the dataset whose data_dir holds this image
@@ -1759,7 +1770,7 @@ def x_dataset_of(path):  # the dataset whose data_dir holds this image
 
 @contextlib.contextmanager
 def x_spying():
-    """Per step (rec.steps): the batch's dataset tag, the image paths fetched for it, the optimizer groups' (is_backbone, lr, is_last_layer) as the step set them, the teacher's /
+    """Per step (rec.steps): the batch's dataset and phase tags, the image paths fetched for it, the optimizer groups' (is_backbone, lr, is_last_layer) as the step set them, the teacher's /
     student's / Gram teacher's state before the step, which student parameters have a grad after its backward, and the global crops / the teacher's input;
     per update_ema call (rec.emas): the steps done, m, the teacher before and after, the student it blends in; prune_checkpoints calls (rec.prunes); per set_epoch call
     (rec.set_epochs): its epoch index and the loader's image count (the set_epoch in place on entry runs, so (g)'s --workers > 0 stand-in still acts)."""
@@ -1777,7 +1788,7 @@ def x_spying():
         rec.lrs = [(g["is_backbone"], g["lr"], g["is_last_layer"]) for g in optimizer.param_groups]
 
     def forward_backward(self, data, *, teacher_temp):
-        step = dict(dataset=data.get("dataset"), paths=list(rec.fetched), lrs=rec.lrs, teacher=state(self.teacher), student=v_flat(self.student),
+        step = dict(dataset=data.get("dataset"), phase=data.get("phase"), paths=list(rec.fetched), lrs=rec.lrs, teacher=state(self.teacher), student=v_flat(self.student),
                     gram=None if self.gram_teacher is None else state(self.gram_teacher), data=data)
         rec.fetched.clear()
         result = real_forward_backward(self, data, teacher_temp=teacher_temp)
@@ -1817,78 +1828,111 @@ def x_spying():
 assert tuple(getattr(P(), k) for k in X_ARK_KEYS) == X_DEFAULTS == tuple(ssl_pretrain.ARG_DEFAULTS[k] for k in X_ARK_KEYS) and P().momentum_teacher == 0.999
 assert set(X_ARK_KEYS) <= set(ssl_pretrain.RESUME_MATCH) and not set(X_ARK_KEYS) & set(ssl_pretrain.BRANCH_FREE)
 x_parsed = P("--cyclic_ark_teacher")
-assert tuple(getattr(x_parsed, k) for k in X_ARK_KEYS) == (True, 0.8, True, "shared", 100, False) and x_parsed.momentum_teacher is None  # no per-step EMA
-assert vars(P("--cyclic_ark_teacher", "--teacher_clean_view")) == vars(x_parsed)  # implied: given as well, it is the same run (accepted, not refused)
+assert tuple(getattr(x_parsed, k) for k in X_ARK_KEYS) == (True, 0.8, True, "shared", False, False) and x_parsed.momentum_teacher is None  # no per-step EMA, no lock passes
+assert vars(P("--cyclic_ark_teacher", "--teacher_clean_view")) == vars(x_parsed) == vars(P("--cyclic_ark_teacher", "--no_lock_half_pass"))  # implied / the default, given as well: the same run
+assert P("--cyclic_ark_teacher", "--lock_half_pass").lock_half_pass is True and P("--cyclic_ark_teacher", "--lock_half_pass", "--no_lock_half_pass").lock_half_pass is False  # the last one wins
 assert (P("--teacher_clean_view").teacher_clean_view, P("--teacher_clean_view").cyclic_ark_teacher, P("--teacher_clean_view").momentum_teacher) == (True, False, 0.999)  # alone: the ablation arm
-assert (P("--cyclic_ark_teacher", "--ark_teacher_momentum", "0", "--switch_lock_steps", "0", "--heads", "per_dataset", "--keep_all_checkpoints").ark_teacher_momentum,
-        P("--cyclic_ark_teacher", "--switch_lock_steps", "0").switch_lock_steps, P("--keep_all_checkpoints").keep_all_checkpoints) == (0.0, 0, True)
+assert (P("--cyclic_ark_teacher", "--ark_teacher_momentum", "0", "--heads", "per_dataset", "--keep_all_checkpoints").ark_teacher_momentum, P("--keep_all_checkpoints").keep_all_checkpoints) == (0.0, True)
 for extra, flags in ((["--heads", "per_dataset"], ("--heads per_dataset", "--cyclic_ark_teacher")), (["--ark_teacher_momentum", "0.8"], ("--ark_teacher_momentum", "--cyclic_ark_teacher")),
-                     (["--switch_lock_steps", "0"], ("--switch_lock_steps", "--cyclic_ark_teacher")), (["--cyclic_ark_teacher", "--momentum_teacher", "0.999"], ("--momentum_teacher", "--cyclic_ark_teacher")),
+                     (["--lock_half_pass"], ("--lock_half_pass", "--cyclic_ark_teacher")), (["--no_lock_half_pass"], ("--no_lock_half_pass", "--cyclic_ark_teacher")),
+                     (["--cyclic_ark_teacher", "--momentum_teacher", "0.999"], ("--momentum_teacher", "--cyclic_ark_teacher")),
                      (["--cyclic_ark_teacher", "--data_set", "MIMIC"], ("--cyclic_ark_teacher", "--data_set", "MIMIC")),
                      (["--cyclic_ark_teacher", "--ark_teacher_momentum", "1"], ("--ark_teacher_momentum",)), (["--cyclic_ark_teacher", "--ark_teacher_momentum", "-0.1"], ("--ark_teacher_momentum",)),
-                     (["--cyclic_ark_teacher", "--ark_teacher_momentum", "nan"], ("--ark_teacher_momentum",)), (["--cyclic_ark_teacher", "--switch_lock_steps", "-1"], ("--switch_lock_steps",)),
-                     (["--heads", "both"], ("--heads",))):
+                     (["--cyclic_ark_teacher", "--ark_teacher_momentum", "nan"], ("--ark_teacher_momentum",)), (["--heads", "both"], ("--heads",)),
+                     (["--cyclic_ark_teacher", "--switch_lock_steps", "100"], ("unrecognized arguments: --switch_lock_steps 100",))):  # the step-count lock is gone
     with contextlib.redirect_stderr(io.StringIO()) as err:
         assert raises(SystemExit, P, *extra) == "2"
     complaint = err.getvalue().split("error: ", 1)[1]
     assert all(flag in complaint for flag in flags), (extra, err.getvalue())
+assert "switch_lock_steps" not in vars(x_parsed) and "switch_lock_steps" not in ssl_pretrain.RESUME_MATCH and "switch_lock_steps" not in ssl_pretrain.ARG_DEFAULTS
 print("OK (x) parse: the six settings default to the mixed-batch run (= ARG_DEFAULTS; --momentum_teacher 0.999), are --resume-locked and not branch-free; --cyclic_ark_teacher resolves clean views on, "
-      "momentum 0.8, lock 100, no per-step momentum, and the same args with --teacher_clean_view given too; --teacher_clean_view alone keeps the per-step EMA; --heads per_dataset / --ark_teacher_momentum / "
-      "--switch_lock_steps without the mode, --momentum_teacher or a repeated --data_set with it, a momentum outside [0, 1) or NaN, a negative lock and an unknown head mode each exit 2 naming the flag")
+      "momentum 0.8, no lock passes, no per-step momentum, and the same args with --teacher_clean_view or --no_lock_half_pass given too; --lock_half_pass turns the lock passes on (the last of the pair "
+      "wins); --teacher_clean_view alone keeps the per-step EMA; --heads per_dataset / --ark_teacher_momentum / --lock_half_pass / --no_lock_half_pass without the mode, --momentum_teacher or a repeated "
+      "--data_set with it, a momentum outside [0, 1) or NaN and an unknown head mode each exit 2 naming the flag; --switch_lock_steps no longer exists")
 
-# one trunk run of 2 cycles (lock 2) under the spies: the cycle, the teacher rule, the clean views, the lock and the heads are all read off it
+# one run of the lock arm, 2 cycles, under the spies: the cycle, the passes, the teacher rule, the clean views, the lock and the heads are all read off it
 X_A = os.path.join(TMP, "X_A")
 with x_spying() as x_rec:
     x_summary, x_text = xgo(X_A, *ARK, "--stop_after_epochs", "2")
 x_lines = x_text.splitlines()
 x_steps, x_emas = x_rec.steps, x_rec.emas
 
-# (a) the cycle: by image count, largest first, logged; every batch one dataset (the tag, the CSV column and the images fetched for it agree); epoch_length = the sum
-assert ("cycle (--cyclic_ark_teacher): each dataset in turn, largest first by image count, every batch from one dataset: MIMIC 8 images / 4 steps, CheXpert 6 images / 3 steps, "
-        "ChestXray14 4 images / 2 steps, VinDrCXR 2 images / 1 steps; 10 steps a cycle (= one epoch)") in x_lines, x_text
-assert x_summary["epoch_length"] == 10 == sum(X_LENGTHS) and json.load(open(os.path.join(X_A, "args.json")))["epoch_length"] == 10 and "epoch_length 10 steps" in x_text
+# (a) the cycle: by image count, largest first, logged; per dataset a lock pass over a random half (the same draw on every rank, a fresh one per cycle), then the release pass over all of it; every
+# batch one dataset (the tags, the CSV column and the images fetched for it agree); epoch_length = the sum of the passes
+assert ("cycle (--cyclic_ark_teacher): each dataset in turn, largest first by image count, every batch from one dataset, a lock pass over a random half then a release pass over all of it: "
+        "MIMIC 12 images: lock 3 + release 6 steps, CheXpert 8 images: lock 2 + release 4 steps, ChestXray14 6 images: lock 1 + release 3 steps, VinDrCXR 4 images: lock 1 + release 2 steps; "
+        "22 steps a cycle (= one epoch)") in x_lines, x_text
+assert x_summary["epoch_length"] == X_L == 22 and json.load(open(os.path.join(X_A, "args.json")))["epoch_length"] == 22 and "epoch_length 22 steps" in x_text
 x_info = json.load(open(os.path.join(X_A, "args.json")))  # args.json records the six settings as resolved (and the per-step momentum as None); a mixed-batch run's, the defaults
-assert tuple(x_info[k] for k in X_ARK_KEYS) == (True, 0.8, True, "per_dataset", 2, False) and x_info["momentum_teacher"] is None
+assert tuple(x_info[k] for k in X_ARK_KEYS) == (True, 0.8, True, "per_dataset", True, False) and x_info["momentum_teacher"] is None
 assert tuple(json.load(open(os.path.join(DIR_A, "args.json")))[k] for k in X_ARK_KEYS) == X_DEFAULTS
-assert [s["dataset"] for s in x_steps] == X_PATTERN * 2, [s["dataset"] for s in x_steps]
+assert [(s["dataset"], s["phase"]) for s in x_steps] == X_PATTERN * 2, [(s["dataset"], s["phase"]) for s in x_steps]
 for s in x_steps:
     assert len(s["paths"]) == 2 and {x_dataset_of(path) for path in s["paths"]} == {s["dataset"]}, s["paths"]  # the 2 images of the batch are both its dataset's
-for cycle in (0, 1):  # a dataset epoch is a full pass (drop_last: every image of these lists, each once), and the sampler reshuffles per cycle
-    seen = [path for s in x_steps[10 * cycle:10 * cycle + 10] for path in s["paths"]]
-    assert sorted(seen) == sorted(path for name in X_ORDER for path in ssl_data.image_paths(name, X_CFG[name]["data_dir"], X_CFG[name]["train_list"])), cycle
-assert [s["paths"] for s in x_steps[:10]] != [s["paths"] for s in x_steps[10:]]
-assert x_rec.set_epochs == [(4 * c + j, X_COUNTS[name]) for c in (0, 1) for j, name in enumerate(X_ORDER)]  # each dataset epoch its own index: no shared sampler or worker seed
+x_lock_seen = {}
+for cycle in (0, 1):
+    in_cycle = x_steps[X_L * cycle:X_L * (cycle + 1)]
+    for place, name in enumerate(X_ORDER):
+        seen = lambda phase: [path for s in in_cycle if (s["dataset"], s["phase"]) == (name, phase) for path in s["paths"]]
+        assert sorted(seen("release")) == sorted(x_images(name)), (cycle, name)  # the release pass: every image once
+        half = {x_images(name)[i] for i in ssl_pretrain.lock_subset(X_COUNTS[name], 100, cycle, place)}
+        lock = seen("lock")
+        assert len(lock) == len(set(lock)) == X_COUNTS[name] // 2 // 2 * 2 and set(lock) <= half and len(half) == X_COUNTS[name] // 2, (cycle, name, lock)  # half of it (drop_last: 2 of ChestXray14's 3)
+        x_lock_seen[(cycle, name)] = set(lock)
+assert all(x_lock_seen[(0, name)] != x_lock_seen[(1, name)] for name in ("MIMIC", "ChestXray14"))  # a fresh half each cycle (CheXpert's and VinDrCXR's draws happen to repeat)
+assert ssl_pretrain.lock_subset(12, 100, 0, 0) == ssl_pretrain.lock_subset(12, 100, 0, 0) != ssl_pretrain.lock_subset(12, 100, 1, 0) and ssl_pretrain.lock_subset(12, 101, 0, 0) != ssl_pretrain.lock_subset(12, 100, 0, 0)
+assert [s["paths"] for s in x_steps[:X_L]] != [s["paths"] for s in x_steps[X_L:]]
+assert x_rec.set_epochs == [(8 * c + k, X_COUNTS[name] // (2 if phase == "lock" else 1)) for c in (0, 1) for k, (name, phase, _) in enumerate(X_PASSES)]  # each pass its own index
 x_rows = read_csv(X_A)
 x_col = {c: i for i, c in enumerate(x_rows[0])}
 assert ",".join(x_rows[0]) == CSV_HEADER and all(len(r) == 16 for r in x_rows)
-assert all(r[x_col["dataset"]] == x_steps[int(r[0])]["dataset"] for r in x_rows[1:])  # the CSV's dataset column is the step's
-x_boundary_rows = {10 * c + e - 1 for c in (0, 1) for e in X_ENDS}  # 0-based step of every dataset epoch's last step
+assert all(r[x_col["dataset"]] == "%s:%s" % (x_steps[int(r[0])]["dataset"], x_steps[int(r[0])]["phase"]) for r in x_rows[1:])  # MIMIC:lock, MIMIC:release, ...
+x_boundary_rows = {X_L * c + e - 1 for c in (0, 1) for e in X_ENDS}  # 0-based step of every release pass's last step
 assert x_boundary_rows <= {int(r[0]) for r in x_rows[1:]}  # each is a log row
 assert all(r[x_col["momentum"]] == ("0.8" if int(r[0]) in x_boundary_rows else "1.0") for r in x_rows[1:])  # the momentum the step applied
 assert all(r[x_col["dataset"]] == "-" and r[x_col["momentum"]] == "0.999" for r in rows_a[1:])  # the mixed-batch run (g): "-", the per-step momentum
-print("OK (x) cycle: the logged order is MIMIC, CheXpert, ChestXray14, VinDrCXR by image count (8 / 6 / 4 / 2, not the --data_set order), 4 / 3 / 2 / 1 steps, epoch_length 10 = their sum "
-      "(summary, args.json, which records the six settings as resolved); each of the 20 steps' batch is tagged with one dataset and both of its images come from that dataset (an image-fetch hook), the tags run in the cycle order, each "
-      "cycle passes over every image once and reshuffles, set_epoch runs as each dataset epoch starts with that epoch's own index (0..7 over the 8); the CSV's dataset column is the step's, every dataset epoch's last step is a row, the momentum column is 0.8 there and 1.0 elsewhere "
-      "(the mixed-batch run: '-' and 0.999)")
+# at the real list sizes and global batch 256 (64 x 4 ranks, the world faked as (q) does it; the lists are read, no image is: the run stops at its first fetch): VinDrCXR's lock pass is 29 steps and its
+# release 58, MIMIC's 720 and 1441; epoch_length 3997 with the lock, 2665 without
+from utils import get_config
+for x_extra, x_cycle_steps in ((["--lock_half_pass"], 3997), ([], 2665)):
+    x_real = os.path.join(TMP, "X_REAL%d" % len(x_extra))
+    buf = io.StringIO()
+    with as_rank(0, 4), contextlib.redirect_stdout(buf):
+        raises(FileNotFoundError, ssl_pretrain.run, make_args(x_real, *ARK_OFF, *x_extra, "--batch_size_per_gpu", "64"), TINY_VIT, TINY_HEADS, get_config("datasets_config.yaml"),
+               check_exists=False)
+    x_cycle = [line for line in buf.getvalue().splitlines() if line.startswith("cycle (")]
+    assert json.load(open(os.path.join(x_real, "args.json")))["epoch_length"] == x_cycle_steps and len(x_cycle) == 1, buf.getvalue()
+    if x_extra:
+        assert ("MIMIC 368960 images: lock 720 + release 1441 steps, CheXpert 223414 images: lock 436 + release 872 steps, ChestXray14 75312 images: lock 147 + release 294 steps, "
+                "VinDrCXR 15000 images: lock 29 + release 58 steps; 3997 steps a cycle") in x_cycle[0], x_cycle
+    else:
+        assert "MIMIC 368960 images: release 1441 steps, CheXpert 223414 images: release 872 steps, ChestXray14 75312 images: release 294 steps, VinDrCXR 15000 images: release 58 steps; 2665 steps a cycle" in x_cycle[0]
+print("OK (x) cycle: the logged order is MIMIC, CheXpert, ChestXray14, VinDrCXR by image count (12 / 8 / 6 / 4, not the --data_set order); per dataset a lock pass then a release pass (3 + 6, 2 + 4, 1 + 3, "
+      "1 + 2 steps), epoch_length 22 = their sum (summary, args.json, which records the six settings as resolved); each of the 44 steps' batch is tagged with one dataset and phase and both of its images "
+      "come from that dataset (an image-fetch hook); a release pass covers every image of its dataset once, a lock pass half of it (MIMIC 6 of 12, CheXpert 4 of 8, ChestXray14 2 of its half of 3, VinDrCXR "
+      "2 of 4), all within lock_subset's draw, and MIMIC's and ChestXray14's halves differ between the cycles; set_epoch runs as each pass starts with its own index (0..15); the CSV's dataset column is "
+      "<name>:<phase>, every release pass's last step is a row, the momentum column 0.8 there and 1.0 elsewhere (the mixed-batch run: '-' and 0.999); at the real list sizes and 64 x 4: VinDrCXR lock 29 "
+      "+ release 58 steps, MIMIC 720 + 1441, 3997 a cycle (2665 without the lock)")
 
-# (b) the teacher: bitwise constant within a dataset epoch, 0.8 x old + 0.2 x student at every boundary (the frozen first cycle's included), backbone and every head; no per-step EMA in
-# the mode, one per step without it
-assert [(e["step"], e["m"]) for e in x_emas] == [(10 * c + e, 0.8) for c in (0, 1) for e in X_ENDS], [(e["step"], e["m"]) for e in x_emas]
+# (b) the teacher: bitwise constant through every pass, 0.8 x old + 0.2 x student after each release pass (the frozen first cycle's included; never after a lock pass), backbone and every head;
+# no per-step EMA in the mode, one per step without it
+assert [(e["step"], e["m"]) for e in x_emas] == [(X_L * c + e, 0.8) for c in (0, 1) for e in X_ENDS], [(e["step"], e["m"]) for e in x_emas]
+assert all(x_steps[e["step"] - 1]["phase"] == "release" for e in x_emas)  # each blend follows a release pass's last step, none a lock pass's
 for e in x_emas:
     for k, before in e["before"].items():
         want = before.mul(0.8).add_(e["student"][k], alpha=1 - 0.8) if k in e["params"] else before  # update_ema's foreach mul + add (buffers are not blended)
         assert torch.equal(e["after"][k], want), (e["step"], k)
     assert not same_state(e["after"], e["before"]), e["step"]
 x_blend = {e["step"]: e for e in x_emas}
-for i in range(1, 20):  # the teacher each step sees: the one before it unless a blend came in between, then that blend's result
+for i in range(1, 2 * X_L):  # the teacher each step sees: the one before it unless a blend came in between, then that blend's result
     assert same_state(x_steps[i]["teacher"], x_blend[i]["after"] if i in x_blend else x_steps[i - 1]["teacher"]), i
-assert same_state(load_ckpt(X_A, "epoch_0002.pth")["teacher"], x_blend[20]["after"]) and same_state(load_ckpt(X_A, "epoch_0001.pth")["teacher"], x_blend[10]["after"])
-vin = "dino_head.VinDrCXR.mlp.0.weight"  # VinDrCXR's head trained at step 9 only; the MIMIC blend of cycle 1 (after step 14) still moves its teacher copy: every head is blended
-assert not torch.equal(x_blend[14]["after"][vin], x_blend[14]["before"][vin]) and torch.equal(x_steps[13]["student"][vin], x_steps[10]["student"][vin])
+assert same_state(load_ckpt(X_A, "epoch_0002.pth")["teacher"], x_blend[2 * X_L]["after"]) and same_state(load_ckpt(X_A, "epoch_0001.pth")["teacher"], x_blend[X_L]["after"])
+vin = "dino_head.VinDrCXR.mlp.0.weight"  # VinDrCXR's head trained in steps 19-21 only; the MIMIC blend of cycle 1 (after step 31) still moves its teacher copy: every head is blended
+assert not torch.equal(x_blend[X_L + 9]["after"][vin], x_blend[X_L + 9]["before"][vin]) and torch.equal(x_steps[X_L + 8]["student"][vin], x_steps[X_L]["student"][vin])
 with x_spying() as x_rec_mixed:
     go(os.path.join(TMP, "X_MIXED"), "--stop_after_epochs", "1")
 assert [(e["step"], e["m"]) for e in x_rec_mixed.emas] == [(i, 0.999) for i in range(1, 7)]  # without the mode: after every step, --momentum_teacher
-print("OK (x) teacher: update_ema runs only after steps 4, 7, 9, 10, 14, 17, 19, 20 (every dataset epoch's last step, the frozen cycle's included) with m 0.8, and each time every teacher "
+print("OK (x) teacher: update_ema runs only after steps 9, 15, 19, 22, 31, 37, 41, 44 (every release pass's last step, the frozen cycle's included; never a lock pass's) with m 0.8, and each time every teacher "
       "parameter is bitwise old x 0.8 + student x 0.2 (backbone and all 8 heads: VinDrCXR's head moves at the MIMIC blend too); between blends the teacher each step sees is bitwise the one before; "
       "the epoch checkpoints hold the cycle-end blend; a mixed-batch run calls it after each of its 6 steps with 0.999")
 
@@ -1930,35 +1974,37 @@ print("OK (x) clean views: the clean teacher crops are bitwise normalize(resize 
       "EMA teacher scores the collated clean crops at every step, not the distorted student crops (cyclic trunk and --teacher_clean_view alone), a default run's teacher the student's own; the clean-view "
       "run's student batches are bitwise the default run's and its losses differ")
 
-# (d) the lock: backbone LR 0 for the first 2 steps of every dataset epoch, nonzero after; the heads train throughout (outside the frozen cycle 0, where the lock is a no-op); one line per switch
+# (d) the lock passes: backbone LR 0 exactly through the lock passes, nonzero through the release passes; the heads train throughout (outside the frozen cycle 0, where both passes run with the backbone
+# at LR 0); one line per pass; and the arm without lock passes
 x_lr = lambda s, backbone: {lr for is_backbone, lr, _ in s["lrs"] if is_backbone == backbone}
 x_last_lr = lambda s: {lr for _, lr, is_last in s["lrs"] if is_last}  # every head's last layer (the optimizer's last-layer groups hold all 8)
 for i, s in enumerate(x_steps):
-    cycle, pos = divmod(i, 10)
-    in_dataset = pos - [0, 4, 7, 9][X_ORDER.index(s["dataset"])]
+    cycle = i // X_L
     assert (x_last_lr(s) == {0.0}) == (cycle == 0), i  # the last-layer freeze (FREEZE_LAST_LAYER_EPOCHS 1): cycle 0, every head
     if cycle == 0:
         assert x_lr(s, True) == {0.0}, i  # the frozen cycle
     else:
-        assert (x_lr(s, True) == {0.0}) == (in_dataset < 2) and 0.0 not in x_lr(s, False), (i, s["lrs"])  # MIMIC 0 0 + +, CheXpert 0 0 +, ChestXray14 0 0, VinDrCXR 0
-        moved = not same_state(backbone_of(x_steps[i + 1]["student"] if i < 19 else load_ckpt(X_A, "epoch_0002.pth")["student"]), backbone_of(s["student"]))
-        assert moved == (in_dataset >= 2), i  # LR 0 leaves the backbone bitwise (AdamW, decoupled decay); an open step moves it
-assert all(torch.equal(x_steps[10]["student"][k], v) for k, v in x_steps[0]["student"].items() if k.endswith("last_layer.weight"))  # 8 last layers untouched in cycle 0
-switch_lines = [line for line in x_lines if line.startswith("dataset switch after step ")]
-assert len(switch_lines) == 8 and switch_lines[0] == ("dataset switch after step 0: start -> MIMIC (cycle 0, dataset 1/4, 4 steps): backbone LR 0 for its first 2 steps "
-                                                      "(--switch_lock_steps 2; a no-op in this frozen cycle)"), switch_lines
-assert "dataset switch after step 10: VinDrCXR -> MIMIC (cycle 1, dataset 1/4, 4 steps): backbone LR 0 for its first 2 steps (--switch_lock_steps 2)" in switch_lines
-assert "dataset switch after step 19: ChestXray14 -> VinDrCXR (cycle 1, dataset 4/4, 1 steps): backbone LR 0 for its first 1 steps (--switch_lock_steps 2)" in switch_lines
-assert [line for line in x_lines if line.startswith("NOTE: ")] == [
-    "NOTE: ChestXray14's dataset epoch is 2 steps, not more than --switch_lock_steps 2: its backbone stays at LR 0 for the whole of it (its heads train)",
-    "NOTE: VinDrCXR's dataset epoch is 1 steps, not more than --switch_lock_steps 2: its backbone stays at LR 0 for the whole of it (its heads train)"], x_text
-assert ("teacher blend after step 4 (end of MIMIC's epoch, cycle 0, dataset 1/4): teacher <- 0.8 x teacher + 0.2 x student, backbone and all heads") in x_lines
+        assert (x_lr(s, True) == {0.0}) == (s["phase"] == "lock") and 0.0 not in x_lr(s, False), (i, s["phase"], s["lrs"])
+        moved = not same_state(backbone_of(x_steps[i + 1]["student"] if i < 2 * X_L - 1 else load_ckpt(X_A, "epoch_0002.pth")["student"]), backbone_of(s["student"]))
+        assert moved == (s["phase"] == "release"), i  # LR 0 leaves the backbone bitwise (AdamW, decoupled decay); a release step moves it
+assert all(torch.equal(x_steps[X_L]["student"][k], v) for k, v in x_steps[0]["student"].items() if k.endswith("last_layer.weight"))  # 8 last layers untouched in cycle 0
+pass_lines = [line for line in x_lines if line.startswith("dataset pass after step ")]
+assert len(pass_lines) == 16 and pass_lines[:2] == [
+    "dataset pass after step 0: MIMIC lock (cycle 0, dataset 1/4, a random half, 6 of 12 images, 3 steps): backbone LR 0, heads train",
+    "dataset pass after step 3: MIMIC release (cycle 0, dataset 1/4, all 12 images, 6 steps): backbone and heads train; the backbone at LR 0 in this frozen cycle"], pass_lines
+assert pass_lines[-2:] == ["dataset pass after step 41: VinDrCXR lock (cycle 1, dataset 4/4, a random half, 2 of 4 images, 1 steps): backbone LR 0, heads train",
+                           "dataset pass after step 42: VinDrCXR release (cycle 1, dataset 4/4, all 4 images, 2 steps): backbone and heads train"], pass_lines
+assert not any(line.startswith("NOTE: ") or "switch_lock" in line for line in x_lines)
+assert "teacher blend after step 9 (end of MIMIC's release pass, cycle 0, dataset 1/4): teacher <- 0.8 x teacher + 0.2 x student, backbone and all heads" in x_lines
 with x_spying() as x_rec_open:
-    xgo(os.path.join(TMP, "X_OPEN"), "--no_gram", "--cyclic_ark_teacher", "--switch_lock_steps", "0", "--stop_after_epochs", "2")
-assert all(x_lr(s, True) == {0.0} for s in x_rec_open.steps[:10]) and all(0.0 not in x_lr(s, True) for s in x_rec_open.steps[10:])  # no lock: only the frozen cycle
-print("OK (x) lock: in cycle 1 the backbone groups are at LR 0 for the first 2 steps of each dataset epoch (MIMIC 2 of 4, CheXpert 2 of 3, ChestXray14 and VinDrCXR all of theirs) and nonzero "
-      "after, the head groups nonzero at every step (and every head's last layer at LR 0 in cycle 0 only, untouched there); a locked step leaves the backbone bitwise, an open one moves it; in the frozen cycle 0 the backbone is at 0 throughout; 8 switch lines "
-      "(start -> MIMIC, ..., VinDrCXR -> MIMIC) name the step, the cycle and the lock (a no-op in cycle 0), and a NOTE names each dataset epoch the lock covers; --switch_lock_steps 0 locks nothing")
+    open_summary, open_text = xgo(os.path.join(TMP, "X_OPEN"), *ARK_OFF, "--stop_after_epochs", "2")
+assert open_summary["epoch_length"] == 15 and [(s["dataset"], s["phase"]) for s in x_rec_open.steps] == [(name, "release") for name, phase, n in X_PASSES if phase == "release" for _ in range(n)] * 2
+assert all(x_lr(s, True) == {0.0} for s in x_rec_open.steps[:15]) and all(0.0 not in x_lr(s, True) for s in x_rec_open.steps[15:])  # no lock: only the frozen cycle
+assert [e["step"] for e in x_rec_open.emas] == [15 * c + e for c in (0, 1) for e in (6, 10, 13, 15)] and len([l for l in open_text.splitlines() if l.startswith("dataset pass ")]) == 8
+assert all(r[15].endswith(":release") for r in read_csv(os.path.join(TMP, "X_OPEN"))[1:]) and "its release pass only (--no_lock_half_pass)" in open_text
+print("OK (x) lock: in cycle 1 the backbone groups are at LR 0 at every step of a lock pass and nonzero at every step of a release pass, the head groups nonzero at every step (and every head's last layer "
+      "at LR 0 in cycle 0 only, untouched there); a lock step leaves the backbone bitwise, a release step moves it; in the frozen cycle 0 both passes run with the backbone at 0; 16 pass lines name the "
+      "dataset, lock / release, the images and steps; no NOTE line; without --lock_half_pass a cycle is the 4 release passes (15 steps, blends after 6, 10, 13, 15), its backbone at LR 0 in cycle 0 only")
 
 # (e) per-dataset heads: 4 + 4 (student, teacher), only the batch's pair gets gradients, every head in the optimizer with the shared heads' multipliers; the export is the stock key set
 x_head_names = lambda sd, kind: {k.split(".")[1] for k in sd if k.startswith(kind + ".")}
@@ -1999,15 +2045,15 @@ else:
     assert len(exported_x) == 188 == len(stock_x) and set(exported_x) == set(stock_x) and list(teacher_x.dino_head) == X_ORDER
     DinoVisionTransformer(**DINOV3_VITB16_KWARGS).load_state_dict(exported_x, strict=True)
     del stock_x, teacher_x, exported_x
-print("OK (x) heads: the student and the teacher (built, and in the checkpoint) hold one DINO and one iBOT head per dataset; after each of the 20 backwards exactly the backbone and the batch's dataset's "
+print("OK (x) heads: the student and the teacher (built, and in the checkpoint) hold one DINO and one iBOT head per dataset; after each of the 44 backwards exactly the backbone and the batch's dataset's "
       "two heads have gradients; every head is its own random draw through init_weights; the optimizer puts every parameter in one group, %d groups as with shared heads, each head parameter with the shared head's multipliers (lr, wd, last layer); the "
       "export is the stock key set (tiny ViT; ViT-B/16: 188 keys, strict into DinoVisionTransformer)" % x_n_groups)
 
 # (f) --keep_all_checkpoints: nothing pruned over 5 cycles; without it the old policy (the last 3 and every 10th)
 with x_spying() as x_rec_keep:
-    xgo(os.path.join(TMP, "X_KEEP"), *ARK, "--keep_all_checkpoints", "--epochs", "5")
+    xgo(os.path.join(TMP, "X_KEEP"), *ARK_OFF, "--keep_all_checkpoints", "--epochs", "5")
 with x_spying() as x_rec_prune:
-    xgo(os.path.join(TMP, "X_PRUNE"), *ARK, "--epochs", "5")
+    xgo(os.path.join(TMP, "X_PRUNE"), *ARK_OFF, "--epochs", "5")
 assert [e for e, _ in ssl_pretrain.epoch_checkpoints(os.path.join(TMP, "X_KEEP", "ckpt"))] == [1, 2, 3, 4, 5] and x_rec_keep.prunes == []
 assert [e for e, _ in ssl_pretrain.epoch_checkpoints(os.path.join(TMP, "X_PRUNE", "ckpt"))] == [3, 4, 5] and len(x_rec_prune.prunes) == 5
 assert json.load(open(os.path.join(TMP, "X_KEEP", "args.json")))["keep_all_checkpoints"] is True
@@ -2031,9 +2077,9 @@ try:
     xgo(X_RC, *X_TRUNK, "--resume", "--stop_after_epochs", "2")
 finally:
     ssl_pretrain.set_epoch = real_set_epoch
-assert "resumed from" in text_ra and "dataset switch after step 10: VinDrCXR -> MIMIC (cycle 1, dataset 1/4, 4 steps)" in text_ra
-assert [(s["dataset"], s["paths"]) for s in x_rec_ra.steps] == [(s["dataset"], s["paths"]) for s in x_rec_rb.steps[10:]]  # the same batches, image for image
-assert all(torch.equal(a["data"]["collated_global_crops"], b["data"]["collated_global_crops"]) for a, b in zip(x_rec_ra.steps, x_rec_rb.steps[10:]))
+assert "resumed from" in text_ra and "dataset pass after step 22: MIMIC lock (cycle 1, dataset 1/4, a random half, 6 of 12 images, 3 steps)" in text_ra
+assert [(s["dataset"], s["phase"], s["paths"]) for s in x_rec_ra.steps] == [(s["dataset"], s["phase"], s["paths"]) for s in x_rec_rb.steps[X_L:]]  # the same batches (lock halves included)
+assert all(torch.equal(a["data"]["collated_global_crops"], b["data"]["collated_global_crops"]) for a, b in zip(x_rec_ra.steps, x_rec_rb.steps[X_L:]))
 ck_ra, ck_rb, ck_rc2 = (load_ckpt(d, "epoch_0002.pth") for d in (X_RA, X_RB, X_RC))
 assert not same_state(ck_rb["student"], load_ckpt(X_RB, "epoch_0001.pth")["student"])  # cycle 2 trained
 for part in ("student", "teacher", "optimizer", "rng"):
@@ -2043,7 +2089,7 @@ by_step_rb = {r[0]: r[2:13] + r[15:] for r in read_csv(X_RB)[1:]}
 common_r = [r for r in read_csv(X_RA)[1:] if r[0] in by_step_rb]
 assert len(common_r) == len(by_step_rb) and all(r[2:13] + r[15:] == by_step_rb[r[0]] for r in common_r)  # A's rows (its cycle 1 kept, cycle 2 resumed) are B's
 assert not same_state(ck_rc2["student"], ck_rb["student"])  # the control
-print("OK (x) resume: a trunk (recipe on) stopped after cycle 1 and resumed equals 2 cycles straight with set_epoch as under --workers > 0: cycle 2's batches (dataset, images, collated crops) step for "
+print("OK (x) resume: a lock-arm trunk (recipe on) stopped after cycle 1 and resumed equals 2 cycles straight with set_epoch as under --workers > 0: cycle 2's batches (dataset, phase, images, so the lock half too, collated crops) step for "
       "step, the epoch-2 student, teacher, optimizer, RNG and export bitwise, every CSV row's losses / lr / momentum / dataset; the same resume with a replaced torch RNG state differs")
 
 # (h) branches of a cyclic trunk: --branch_from its cycle-1 checkpoint restores everything (8 heads, the teacher blended at that boundary, which the Gram teacher anchors to), refreshes at the next two
@@ -2053,19 +2099,19 @@ with x_spying() as x_rec_t:
     xgo(X_T, *X_TRUNK, "--keep_all_checkpoints", "--stop_after_epochs", "1")
 X_SRC = os.path.join(X_T, "ckpt", "epoch_0001.pth")
 x_src = torch.load(X_SRC, map_location="cpu", weights_only=False)
-assert same_state(x_src["teacher"], x_rec_t.emas[-1]["after"]) and x_rec_t.emas[-1]["step"] == 10  # the checkpoint's teacher is the one blended after step 10
+assert same_state(x_src["teacher"], x_rec_t.emas[-1]["after"]) and x_rec_t.emas[-1]["step"] == 22  # the checkpoint's teacher is the one blended after step 22
 X_BRANCH = ["--branch_from", X_SRC, *RECIPE, *X_MODE, "--keep_all_checkpoints"]  # the trunk's line with --no_gram replaced
 with x_spying() as x_rec_bg:
-    summary_bg, text_bg = xgo(X_BG, *X_BRANCH, "--gram_refresh_steps", "20,30", "--stop_after_epochs", "3")
-assert (summary_bg["step"], summary_bg["epoch"], summary_bg["gram_refreshes"]) == (30, 3, [20, 30]) and "branched from %s: its step 10, epoch 1;" % X_SRC in text_bg, text_bg
+    summary_bg, text_bg = xgo(X_BG, *X_BRANCH, "--gram_refresh_steps", "44,66", "--stop_after_epochs", "3")  # K x epoch_length + i x epoch_length, i = 1, 2
+assert (summary_bg["step"], summary_bg["epoch"], summary_bg["gram_refreshes"]) == (66, 3, [44, 66]) and "branched from %s: its step 22, epoch 1;" % X_SRC in text_bg, text_bg
 first_bg = x_rec_bg.steps[0]
 assert same_state(first_bg["student"], x_src["student"]) and same_state(first_bg["teacher"], x_src["teacher"])  # 8 heads included
 assert same_state(first_bg["gram"], {k: v for k, v in x_src["teacher"].items() if k.startswith("backbone.")})  # anchored to the blended teacher
-assert [e["step"] for e in x_rec_bg.emas] == [10 * c + e for c in (0, 1) for e in X_ENDS]  # the branch's own steps: after global steps 14, 17, 19, 20, 24, 27, 29, 30
+assert [e["step"] for e in x_rec_bg.emas] == [X_L * c + e for c in (0, 1) for e in X_ENDS]  # the branch's own steps: after global steps 31, 37, 41, 44, 53, 59, 63, 66
 x_backbone = lambda sd: {k: v for k, v in sd.items() if k.startswith("backbone.")}  # the Gram teacher's keys
-assert same_state(x_rec_bg.steps[10]["gram"], x_backbone(x_rec_bg.emas[3]["after"])) and not same_state(x_backbone(x_rec_bg.emas[3]["after"]), x_backbone(x_rec_bg.emas[3]["before"]))  # refresh after 20 = blend after 20
-assert same_state(load_ckpt(X_BG, "epoch_0003.pth")["gram_teacher"], x_backbone(x_rec_bg.emas[-1]["after"]))  # and after step 30
-assert "Gram refresh 1/2 after step 20:" in text_bg and [e for e, _ in ssl_pretrain.epoch_checkpoints(os.path.join(X_BG, "ckpt"))] == [2, 3]
+assert same_state(x_rec_bg.steps[X_L]["gram"], x_backbone(x_rec_bg.emas[3]["after"])) and not same_state(x_backbone(x_rec_bg.emas[3]["after"]), x_backbone(x_rec_bg.emas[3]["before"]))  # refresh after 44 = blend after 44
+assert same_state(load_ckpt(X_BG, "epoch_0003.pth")["gram_teacher"], x_backbone(x_rec_bg.emas[-1]["after"]))  # and after step 66
+assert "Gram refresh 1/2 after step 44:" in text_bg and [e for e, _ in ssl_pretrain.epoch_checkpoints(os.path.join(X_BG, "ckpt"))] == [2, 3]
 xgo(X_B0, *X_BRANCH, "--gram_weight", "0", "--gram_refresh_steps", "100", "--stop_after_epochs", "2")
 xgo(X_T, *X_TRUNK, "--keep_all_checkpoints", "--resume", "--stop_after_epochs", "2")
 ck_t2, ck_b0 = load_ckpt(X_T, "epoch_0002.pth"), load_ckpt(X_B0, "epoch_0002.pth")
@@ -2078,10 +2124,10 @@ common_b0 = [r for r in read_csv(X_B0)[1:] if r[0] in by_step_t2]
 assert len(common_b0) >= 5 and all(r[:6] + r[7:12] + r[15:] == by_step_t2[r[0]][:6] + by_step_t2[r[0]][7:12] + by_step_t2[r[0]][15:] for r in common_b0)  # all but gram, gram_weight, timings
 X_DROPPED = ["--branch_from", X_SRC, *RECIPE, "--keep_all_checkpoints"]  # the mode dropped (and with it --heads per_dataset, which needs it)
 for name, extra, diffs in (("xbr_heads", [*X_BRANCH, "--heads", "shared"], ["heads: checkpoint 'per_dataset', now 'shared'"]),
-                           ("xbr_lock", [*X_BRANCH, "--switch_lock_steps", "3"], ["switch_lock_steps: checkpoint 2, now 3"]),
+                           ("xbr_lock", [*X_BRANCH, "--no_lock_half_pass"], ["lock_half_pass: checkpoint True, now False"]),
                            ("xbr_momentum", [*X_BRANCH, "--ark_teacher_momentum", "0.7"], ["ark_teacher_momentum: checkpoint 0.8, now 0.7"]),
                            ("xbr_dropped", X_DROPPED, ["cyclic_ark_teacher: checkpoint True, now False", "teacher_clean_view: checkpoint True, now False", "heads: checkpoint 'per_dataset', now 'shared'",
-                                                     "switch_lock_steps: checkpoint 2, now 0", "ark_teacher_momentum: checkpoint 0.8, now None"]),
+                                                     "lock_half_pass: checkpoint True, now False", "ark_teacher_momentum: checkpoint 0.8, now None"]),
                            ("xbr_keep", [a for a in X_BRANCH if a != "--keep_all_checkpoints"], ["keep_all_checkpoints: checkpoint True, now False"])):
     out = os.path.join(TMP, name)
     message = raises(ValueError, xgo, out, *extra, "--gram_refresh_steps", "100", "--stop_after_epochs", "2")
@@ -2092,10 +2138,10 @@ assert "cannot --resume" in message and "heads: checkpoint 'per_dataset', now 's
 ck_old_mode = dict(ck_t, args={k: v for k, v in ck_t["args"].items() if k not in X_ARK_KEYS})  # the (t) trunk as written before the six keys existed
 ssl_pretrain.check_resume(ck_old_mode, make_args(BR_T, "--no_gram"), 1, 6, ck_t["data_fingerprint"])  # reads as the mixed-batch defaults: passes
 message = raises(ValueError, ssl_pretrain.check_resume, ck_old_mode, make_args(BR_T, *ARK), 1, 6, ck_t["data_fingerprint"])
-assert all(d in message for d in ("cyclic_ark_teacher: checkpoint False, now True", "heads: checkpoint 'shared', now 'per_dataset'", "switch_lock_steps: checkpoint 0, now 2")), message
-print("OK (x) branch: --branch_from a cyclic trunk's cycle-1 checkpoint (whose teacher is the blend after step 10) starts from its student, teacher (8 heads) and a Gram teacher equal to that teacher's "
-      "backbone; Gram refreshes after steps 20 and 30 (the next two cycle boundaries) run and each copies the teacher as blended at that boundary; a --gram_weight 0 branch equals the trunk resumed "
-      "(student, teacher, optimizer, RNG, export, CSV); a branch with --heads shared, another --switch_lock_steps or --ark_teacher_momentum, without the mode or without --keep_all_checkpoints is refused "
+assert all(d in message for d in ("cyclic_ark_teacher: checkpoint False, now True", "heads: checkpoint 'shared', now 'per_dataset'", "lock_half_pass: checkpoint False, now True")), message
+print("OK (x) branch: --branch_from a lock-arm trunk's cycle-1 checkpoint (whose teacher is the blend after step 22) starts from its student, teacher (8 heads) and a Gram teacher equal to that teacher's "
+      "backbone; Gram refreshes after steps 44 and 66 (the next two cycle boundaries) run and each copies the teacher as blended at that boundary; a --gram_weight 0 branch equals the trunk resumed "
+      "(student, teacher, optimizer, RNG, export, CSV); a branch with --heads shared, --no_lock_half_pass, another --ark_teacher_momentum, without the mode or without --keep_all_checkpoints is refused "
       "naming the keys, nothing created; a resume with --heads shared is refused, args.json untouched; a checkpoint without the six keys reads as the mixed-batch run")
 
 # (i) two real ranks (gloo on this CPU, loopback rendezvous; the driver written like (v)'s and (w)'s): every rank trains one dataset per batch, all ranks the same dataset at every step, the
@@ -2124,7 +2170,7 @@ def getitem(self, i):
 
 
 def forward_backward(self, data, *, teacher_temp):
-    found["steps"].append([data["dataset"], list(fetched)])
+    found["steps"].append([data["dataset"], list(fetched), data["phase"]])
     fetched.clear()
     return real_fb(self, data, teacher_temp=teacher_temp)
 
@@ -2156,7 +2202,7 @@ with open(X_DRIVER, "w") as f:
     f.write(X_DRIVER_SOURCE)
 x_dump, X_TWO = os.path.join(TMP, "x_dump"), os.path.join(TMP, "X_TWO")
 os.makedirs(x_dump)
-with open(os.path.join(TMP, "x_spec.json"), "w") as f:  # batch 1 per rank: 8 / 6 / 4 / 2 images over 2 ranks give the same 4 / 3 / 2 / 1 steps
+with open(os.path.join(TMP, "x_spec.json"), "w") as f:  # batch 1 per rank: 12 / 8 / 6 / 4 images (and halves) over 2 ranks give the same passes as batch 2 on one
     json.dump(dict(args=vars(make_args(X_TWO, *X_TRUNK, "--batch_size_per_gpu", "1", "--stop_after_epochs", "2")), vit=TINY_VIT, heads=TINY_HEADS, cfg=X_CFG, dump=x_dump), f)
 with socket.socket() as s:
     s.bind(("127.0.0.1", 0))
@@ -2173,15 +2219,22 @@ assert [p.returncode for p in x_procs] == [0, 0], x_outputs
 x_found = [json.load(open(os.path.join(x_dump, "found_rank%d.json" % r))) for r in range(2)]
 x_models_ranks = [torch.load(os.path.join(x_dump, "models_rank%d.pt" % r), weights_only=False) for r in range(2)]
 for found in x_found:
-    assert [name for name, _ in found["steps"]] == X_PATTERN * 2 and found["blends"] == [10 * c + e for c in (0, 1) for e in X_ENDS], found
-    assert all(len(paths) == 1 and x_dataset_of(paths[0]) == name for name, paths in found["steps"])
+    assert [(name, phase) for name, _, phase in found["steps"]] == X_PATTERN * 2 and found["blends"] == [X_L * c + e for c in (0, 1) for e in X_ENDS], found
+    assert all(len(paths) == 1 and x_dataset_of(paths[0]) == name for name, paths, _ in found["steps"])
     assert found["ddp"] == dict.fromkeys(["backbone"] + ["%s.%s" % (k, n) for k in ("dino_head", "ibot_head") for n in X_ORDER], 0) and found["types"] == ["DistributedDataParallel"]
-assert all(set(a[1]).isdisjoint(b[1]) for a, b in zip(*(f["steps"] for f in x_found)))  # each rank its own shard of the dataset epoch
+assert all(set(a[1]).isdisjoint(b[1]) for a, b in zip(*(f["steps"] for f in x_found)))  # each rank its own shard of the pass
+for cycle in (0, 1):  # the lock halves: both ranks shard the same draw, lock_subset's (the two shards together are that half, less drop_last's leftover of an odd half)
+    for place, name in enumerate(X_ORDER):
+        shards = [[f["steps"][i][1][0] for i in range(X_L * cycle, X_L * (cycle + 1)) if f["steps"][i][0] == name and f["steps"][i][2] == "lock"] for f in x_found]
+        half = {x_images(name)[i] for i in ssl_pretrain.lock_subset(X_COUNTS[name], 100, cycle, place)}
+        assert set(shards[0]).isdisjoint(shards[1]) and set(shards[0]) | set(shards[1]) <= half and len(shards[0]) == len(shards[1]) == X_COUNTS[name] // 2 // 2, (cycle, name, shards)
+        assert X_COUNTS[name] // 2 % 2 or set(shards[0]) | set(shards[1]) == half, (cycle, name)
 assert same_state(x_models_ranks[0], x_models_ranks[1])  # student (backbone, 8 heads) and teacher, bitwise alike on both ranks
-assert (load_ckpt(X_TWO, "epoch_0002.pth")["step"], load_ckpt(X_TWO, "epoch_0002.pth")["world_size"], len(load_ckpt(X_TWO, "epoch_0002.pth")["rng_per_rank"])) == (20, 2, 2)
-print("OK (x) two real ranks (recipe on, batch 1 per rank): both ranks train the cycle MIMIC x4, CheXpert x3, ChestXray14 x2, VinDrCXR x1 twice, each batch's image from its dataset, the same dataset on both "
-      "ranks at every step and disjoint images; both blend after steps 4, 7, 9, 10, 14, 17, 19, 20; the backbone and the 8 heads are 9 DDP modules with find_unused_parameters False on both ranks, and "
-      "the student (all heads) and the teacher end bitwise alike on both; the step-20 epoch-2 checkpoint holds both ranks' RNG states")
+assert (load_ckpt(X_TWO, "epoch_0002.pth")["step"], load_ckpt(X_TWO, "epoch_0002.pth")["world_size"], len(load_ckpt(X_TWO, "epoch_0002.pth")["rng_per_rank"])) == (44, 2, 2)
+print("OK (x) two real ranks (lock arm, recipe on, batch 1 per rank): both ranks train the cycle's 8 passes (MIMIC lock 3 + release 6, ..., VinDrCXR 1 + 2) twice, each batch's image from its dataset, the "
+      "same dataset and phase on both ranks at every step and disjoint images; each lock pass's two shards are disjoint and together the half lock_subset draws (MIMIC 6, CheXpert 4, VinDrCXR 2; "
+      "ChestXray14 2 of its 3); both blend after steps 9, 15, 19, 22, 31, 37, 41, 44; the backbone and the 8 heads are 9 DDP modules with find_unused_parameters False on both ranks, and "
+      "the student (all heads) and the teacher end bitwise alike on both; the step-44 epoch-2 checkpoint holds both ranks' RNG states")
 
 # the CSV of a run written before the dataset column (15 columns) resumes with its rows kept, "-" added
 X_OLD = os.path.join(TMP, "X_OLD")
@@ -2194,6 +2247,43 @@ new_rows = read_csv(X_OLD)
 assert ",".join(new_rows[0]) == CSV_HEADER and new_rows[1:len(old_rows)] == [r + ["-"] for r in old_rows[1:]] and len(new_rows) > len(old_rows)
 assert all(len(r) == 16 and r[15] == "-" for r in new_rows[1:])
 print("OK (x) CSV: a resume of a run whose ssl_losses.csv has the 15 columns from before the dataset column keeps its %d rows (with '-' as their dataset) under the 16-column header" % (len(old_rows) - 1))
+
+# the resume guard in the mode (Codex r1 P2): which dataset owns an image decides its heads and passes, so data_fingerprint hashes (dataset, path) per dataset in cycle order. A repartition that keeps
+# the flattened list (--data_set order) and every pass length (the last 4 MIMIC images listed first in CheXpert's list instead: MIMIC 8, CheXpert 12) passed the flat hash; now it is refused both ways,
+# on --resume and --branch_from, naming the image list. Outside the mode the flat hash is the one it always was
+x_moved = os.path.join(TMP, "data_cyclic_moved")
+os.makedirs(x_moved)
+with open(X_CFG["MIMIC"]["train_list"]) as f:
+    x_mimic_rows = f.read().splitlines()
+with open(X_CFG["CheXpert"]["train_list"]) as f:
+    x_chexpert_rows = f.read().splitlines()
+x_moved_cfg = dict(X_CFG, MIMIC=dict(X_CFG["MIMIC"], train_list=os.path.join(x_moved, "MIMIC.list")), CheXpert=dict(X_CFG["CheXpert"], train_list=os.path.join(x_moved, "CheXpert.list")))
+with open(x_moved_cfg["MIMIC"]["train_list"], "w") as f:  # header + the first 8 rows
+    f.write("\n".join(x_mimic_rows[:9]) + "\n")
+with open(x_moved_cfg["CheXpert"]["train_list"], "w") as f:  # header + the moved 4 as absolute paths (os.path.join keeps them) + its own 8
+    f.write("\n".join([x_chexpert_rows[0]] + ["%s,F" % path for path in x_images("MIMIC")[8:]] + x_chexpert_rows[1:]) + "\n")
+flat = lambda cfg: [p for name in ("VinDrCXR", "ChestXray14", "MIMIC", "CheXpert") for p in ssl_data.image_paths(name, cfg[name]["data_dir"], cfg[name]["train_list"])]
+assert flat(x_moved_cfg) == flat(X_CFG) and len(ssl_data.image_paths("CheXpert", X_CFG["CheXpert"]["data_dir"], x_moved_cfg["CheXpert"]["train_list"])) == 12
+x_flat_hash = hashlib.sha256("\n".join(flat(X_CFG)).encode()).hexdigest()  # the mixed-batch guard: the same for both partitions
+X_FP, X_FPM = os.path.join(TMP, "X_FP"), os.path.join(TMP, "X_FPM")
+fp_summary, _ = xgo(X_FP, *ARK_OFF, "--stop_after_epochs", "1")
+fpm_summary, fpm_text = xgo(X_FPM, *ARK_OFF, "--stop_after_epochs", "1", cfg=x_moved_cfg)
+assert fp_summary["epoch_length"] == fpm_summary["epoch_length"] == 15 and "CheXpert 12 images: release 6 steps, MIMIC 8 images: release 4 steps" in fpm_text  # same length, other partition
+ck_fp, ck_fpm = load_ckpt(X_FP, "epoch_0001.pth"), load_ckpt(X_FPM, "epoch_0001.pth")
+assert ck_fp["data_fingerprint"] == hashlib.sha256("\n".join("%s\t%s" % (name, p) for name in X_ORDER for p in x_images(name)).encode()).hexdigest() != ck_fpm["data_fingerprint"]
+assert x_flat_hash not in (ck_fp["data_fingerprint"], ck_fpm["data_fingerprint"]) and ck2["data_fingerprint"] == hashlib.sha256("\n".join(flat(CFG)).encode()).hexdigest()  # (g)'s mixed run: the flat hash
+for out, own_cfg, other_cfg, src in ((X_FP, X_CFG, x_moved_cfg, X_FPM), (X_FPM, x_moved_cfg, X_CFG, X_FP)):  # src: the other run, trained on other_cfg
+    before_fp = open(os.path.join(out, "args.json")).read()
+    message = raises(ValueError, xgo, out, *ARK_OFF, "--resume", "--stop_after_epochs", "2", cfg=other_cfg)
+    assert "cannot --resume" in message and "training image list" in message and open(os.path.join(out, "args.json")).read() == before_fp, message
+    branch_out = os.path.join(TMP, "xfp_branch_" + os.path.basename(out))
+    message = raises(ValueError, xgo, branch_out, "--branch_from", os.path.join(src, "ckpt", "epoch_0001.pth"), *ARK_OFF[1:], "--gram_refresh_steps", "100", "--stop_after_epochs", "2",
+                     cfg=own_cfg)  # a branch of the other run over this one's partition
+    assert "cannot --branch_from" in message and "training image list" in message and not os.path.exists(branch_out), message
+print("OK (x) fingerprint: two runs over the same flattened image list (the mixed-batch hash identical) but with 4 images moved from MIMIC's list to CheXpert's (the same 15-step cycle, another order and other "
+      "heads per image) carry different data_fingerprints (the (dataset, path) hash in cycle order); each refuses a --resume and a --branch_from of the other, naming the training image list, args.json "
+      "untouched and no branch dir created; a mixed-batch checkpoint's fingerprint is the flat hash as before")
+
 
 # (k) launch scripts ------------------------------------------------------------------------------------------------------------
 scripts = [os.path.join(REPO, "chain", f) for f in ("ssl_common.sh", "pilot_a.sh", "pilot_b.sh", "main.sh", "constlr.sh", "hires.sh")]
@@ -2760,62 +2850,81 @@ print("OK (k) plain no-Gram trunk: constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_PLAI
       "the recipe at the trainer's defaults; CONSTLR_PLAIN other than empty or 1, 1 without CONSTLR_NOGRAM=1 or 1 with any CONSTLR_BRANCH_* is refused before anything is read; the phase, the no-Gram trunk "
       "and its branches launch and print exactly as before, the plain stop file present or absent and CONSTLR_PLAIN empty")
 
-# the Ark-teacher trunk ("DINO-X ConstLR 224, no Gram, Ark teacher"): CONSTLR_NOGRAM=1 CONSTLR_ARK=1 (what run_d1_8_constlr_arkteacher_gaudi.sh sets) launches the no-Gram trunk's line with ARK_FLAGS appended
-# (--cyclic_ark_teacher --heads per_dataset --switch_lock_steps 100 --keep_all_checkpoints), into its own run dir, with the stop epoch from its own cluster-only file (none of the other three is read); its Gram
-# branches are CONSTLR_BRANCH_ARK=1 with the four CONSTLR_BRANCH_*, through the branch wrapper: that trunk's line with --no_gram replaced by the branch pair, ARK_FLAGS kept. The phase, the no-Gram trunk,
-# the plain trunk and the no-Gram trunk's branches launch and print exactly as before
-ARK_ENV, ARK_RUN, ARK_STOP_FILE = dict(NOGRAM_ENV, CONSTLR_ARK="1"), "/workspace/ssl_dinov3_cxr_constlr_arkteacher_seed_100", "constlr_arkteacher_stop_after.txt"
-ARK_TRUNK = "ssl_dinov3_cxr_constlr_arkteacher_seed_100"
-ARK_FLAGS = ["--cyclic_ark_teacher", "--heads", "per_dataset", "--switch_lock_steps", "100", "--keep_all_checkpoints"]
-ARK_RUN_LINE = ("run: ssl_dinov3_cxr_constlr_arkteacher_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; DINOv3 recipe: --drop_path_rate 0.3 --rope_rescale_coords 2 "
-                "--untie_local_cls_norm; Ark teacher: --cyclic_ark_teacher --heads per_dataset --switch_lock_steps 100 --keep_all_checkpoints after --no_gram (clean teacher views implied, --ark_teacher_momentum "
-                "0.8 by default; an epoch is a cycle over the four datasets); stop after epoch %s from chain/constlr_arkteacher_stop_after.txt)")
+# the Ark-teacher trunk ("DINO-X ConstLR 224, no Gram, Ark teacher"): CONSTLR_NOGRAM=1 CONSTLR_ARK=1 (what run_d1_8_constlr_arkteacher_gaudi.sh sets) launches the no-Gram trunk's line with the arm's ARK_FLAGS
+# appended (--cyclic_ark_teacher --heads per_dataset <lock flag> --keep_all_checkpoints). CONSTLR_ARK_LOCK picks the arm (0 when unset or empty: --no_lock_half_pass; 1: --lock_half_pass), and the arm is in
+# the run dir and the stop file (ssl_dinov3_cxr_constlr_arkteacher[_lock]_seed_100, chain/constlr_arkteacher[_lock]_stop_after.txt; none of the others read). Its Gram branches are CONSTLR_BRANCH_ARK=1 (with
+# the same CONSTLR_ARK_LOCK) with the four CONSTLR_BRANCH_*, through the branch wrapper: that arm's trunk line with --no_gram replaced by the branch pair, ARK_FLAGS kept, the lock checked against the trunk's
+# args.json. The phase, the no-Gram trunk, the plain trunk and the no-Gram trunk's branches launch and print exactly as before
+ARK_ENV, ARK_STOP_FILE, ARK_LOCK_STOP_FILE = dict(NOGRAM_ENV, CONSTLR_ARK="1"), "constlr_arkteacher_stop_after.txt", "constlr_arkteacher_lock_stop_after.txt"
+ARK_LOCK_ENV = dict(ARK_ENV, CONSTLR_ARK_LOCK="1")
+ARK_TRUNKS = {"0": "ssl_dinov3_cxr_constlr_arkteacher_seed_100", "1": "ssl_dinov3_cxr_constlr_arkteacher_lock_seed_100"}
+ARK_RUNS = {lock: "/workspace/" + trunk for lock, trunk in ARK_TRUNKS.items()}
+ARK_FLAGS_OF = {lock: ["--cyclic_ark_teacher", "--heads", "per_dataset", flag, "--keep_all_checkpoints"] for lock, flag in (("0", "--no_lock_half_pass"), ("1", "--lock_half_pass"))}
+ARK_LOCK_NOTES = {"0": "no lock passes: the full-pass release per dataset alone (CONSTLR_ARK_LOCK=0)", "1": "FX lock-release: half-pass lock + full-pass release per dataset (CONSTLR_ARK_LOCK=1)"}
 NOGRAM_RUN_LINE = ("run: ssl_dinov3_cxr_constlr_nogram_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; DINOv3 recipe: --drop_path_rate 0.3 --rope_rescale_coords 2 "
                    "--untie_local_cls_norm; stop after epoch %s from chain/constlr_nogram_stop_after.txt)")
 
 
-def ark_run(root, env=ARK_ENV, **override):  # constlr_run with all four stop files written (the phase's 30, the no-Gram trunk's 100, the plain 60, the Ark " 70 "; None: absent)
-    return constlr_run(root, env=env, **dict({PLAIN_STOP_FILE: "60\n", ARK_STOP_FILE: " 70 \n"}, **override))
+def ark_run_line(lock, stop):  # what constlr.sh prints for the arm
+    return ("run: %s (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; DINOv3 recipe: --drop_path_rate 0.3 --rope_rescale_coords 2 --untie_local_cls_norm; Ark teacher: %s "
+            "after --no_gram (%s; clean teacher views implied, --ark_teacher_momentum 0.8 by default; an epoch is a cycle over the four datasets); stop after epoch %s from chain/%s)"
+            % (ARK_TRUNKS[lock], " ".join(ARK_FLAGS_OF[lock]), ARK_LOCK_NOTES[lock], stop, ARK_LOCK_STOP_FILE if lock == "1" else ARK_STOP_FILE))
 
 
-def ark_argv_for(stop):  # nogram_argv_for(stop) with the run dir swapped and ARK_FLAGS appended
+def ark_run(root, env=ARK_ENV, **override):  # constlr_run with all five stop files written (the phase's 30, the no-Gram trunk's 100, the plain 60, the Ark arms' " 70 " / " 80 "; None: absent)
+    return constlr_run(root, env=env, **dict({PLAIN_STOP_FILE: "60\n", ARK_STOP_FILE: " 70 \n", ARK_LOCK_STOP_FILE: " 80 \n"}, **override))
+
+
+def ark_argv_for(stop, lock="0"):  # nogram_argv_for(stop) with the arm's run dir and its ARK_FLAGS appended
     argv = nogram_argv_for(stop)
     assert argv[-1:] == ["--no_gram"] and argv.count(NOGRAM_RUN) == 1
-    return [ARK_RUN if arg == NOGRAM_RUN else arg for arg in argv] + ARK_FLAGS
+    return [ARK_RUNS[lock] if arg == NOGRAM_RUN else arg for arg in argv] + ARK_FLAGS_OF[lock]
 
 
 ark_root = sandbox()
-result, ark_argv = ark_run(ark_root)
-assert result.returncode == 0 and result.stderr == "" and ark_argv == ark_argv_for("70"), (result.stderr, ark_argv)
-assert result.stdout.splitlines() == [ARK_RUN_LINE % "70"], result.stdout
-expanded["constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_ARK=1"] = "./gaudi.sh " + " ".join(ark_argv)
-result, trunk_70 = constlr_run(ark_root, env=NOGRAM_ENV, **{"constlr_nogram_stop_after.txt": "70\n"})  # the no-Gram trunk at the same stop epoch: this line minus ARK_FLAGS, its own run dir
-assert result.returncode == 0 and trunk_70 == nogram_argv_for("70") and ark_argv == [ARK_RUN if arg == NOGRAM_RUN else arg for arg in trunk_70] + ARK_FLAGS, (trunk_70, ark_argv)
-# the trainer reads it as meant: stop after cycle 70 of the 1000-epoch ceiling, the mode with its resolved settings (clean views, momentum 0.8, no per-step momentum), and every other parsed setting the
-# no-Gram trunk's: only the run dir and the six mode settings (with --momentum_teacher, which the mode leaves None) differ
-ark_parsed = ssl_pretrain.parse_args(ark_argv[ark_argv.index("ssl_pretrain.py") + 1:])
+ark_argvs = {}
+for lock, env, stop in (("0", ARK_ENV, "70"), ("0", dict(ARK_ENV, CONSTLR_ARK_LOCK=""), "70"), ("0", dict(ARK_ENV, CONSTLR_ARK_LOCK="0"), "70"), ("1", ARK_LOCK_ENV, "80")):
+    result, argv = ark_run(ark_root, env=env)
+    assert result.returncode == 0 and result.stderr == "" and argv == ark_argv_for(stop, lock), (lock, env, result.stderr, argv)
+    assert result.stdout.splitlines() == [ark_run_line(lock, stop)], result.stdout
+    ark_argvs[lock] = argv
+expanded["constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_ARK=1"] = "./gaudi.sh " + " ".join(ark_argvs["0"])
+expanded["constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_ARK=1 CONSTLR_ARK_LOCK=1"] = "./gaudi.sh " + " ".join(ark_argvs["1"])
+assert [(a, b) for a, b in zip(ark_argvs["0"], ark_argvs["1"]) if a != b] == [(ARK_RUNS["0"], ARK_RUNS["1"]), ("70", "80"), ("--no_lock_half_pass", "--lock_half_pass")]  # the run dir, its stop file, the flag
+result, trunk_70 = constlr_run(ark_root, env=NOGRAM_ENV, **{"constlr_nogram_stop_after.txt": "70\n"})  # the no-Gram trunk at the same stop epoch: the arm's line minus ARK_FLAGS, its own run dir
+assert result.returncode == 0 and trunk_70 == nogram_argv_for("70") and ark_argvs["0"] == [ARK_RUNS["0"] if arg == NOGRAM_RUN else arg for arg in trunk_70] + ARK_FLAGS_OF["0"], (trunk_70, ark_argvs["0"])
+# the trainer reads both as meant: stop after cycle 70 / 80 of the 1000-epoch ceiling, the mode with its resolved settings (clean views, momentum 0.8, no per-step momentum), the arm's lock, and every other
+# parsed setting the no-Gram trunk's: only the run dir, the stop epoch and the six mode settings (with --momentum_teacher, which the mode leaves None) differ
 trunk_parsed_70 = ssl_pretrain.parse_args(trunk_70[trunk_70.index("ssl_pretrain.py") + 1:])
-assert ssl_pretrain.check_args(ark_parsed) == 70 and ark_parsed.epochs == 1000 and ark_parsed.no_gram and ark_parsed.resume
-assert tuple(getattr(ark_parsed, k) for k in X_ARK_KEYS) == (True, 0.8, True, "per_dataset", 100, True) and ark_parsed.momentum_teacher is None
-assert tuple(getattr(ark_parsed, k) for k in RECIPE_KEYS) == (0.3, 2.0, True)
-assert {k for k in vars(ark_parsed) if getattr(ark_parsed, k) != getattr(trunk_parsed_70, k)} == {"output_dir", "momentum_teacher", *X_ARK_KEYS}
-# a missing or invalid Ark stop file is refused naming itself (none of the other three, which stay valid) before gaudi.sh is reached, and before any run: line
-for stop in (None, "", "0", "2.5", "thirty", "-3", "1001", "18446744073709551617"):
-    result, refused_argv = ark_run(ark_root, **{ARK_STOP_FILE: stop})
-    assert result.returncode == 1 and "ERROR" in result.stderr and ARK_STOP_FILE in result.stderr and refused_argv is None and result.stdout == "", (stop, result.stderr)
-    assert not any(other in result.stderr for other in ("constlr_stop_after.txt", "constlr_nogram_stop_after.txt", PLAIN_STOP_FILE)), (stop, result.stderr)
-assert "ceiling of 1000" in result.stderr, result.stderr
-result, solo_argv = ark_run(ark_root, **{"constlr_stop_after.txt": None, "constlr_nogram_stop_after.txt": None, PLAIN_STOP_FILE: None})  # it needs none of the other three
-assert result.returncode == 0 and solo_argv == ark_argv, (result.stderr, solo_argv)
-# the others are byte-unchanged: the phase, the no-Gram trunk and the plain trunk with the Ark stop file present (not read) or absent and CONSTLR_ARK / CONSTLR_BRANCH_ARK empty, and the no-Gram trunk's branch
-ark_empties = ({}, dict(CONSTLR_ARK=""), dict(CONSTLR_BRANCH_ARK=""), dict(CONSTLR_ARK="", CONSTLR_BRANCH_ARK=""))
+for lock, stop in (("0", 70), ("1", 80)):
+    ark_parsed = ssl_pretrain.parse_args(ark_argvs[lock][ark_argvs[lock].index("ssl_pretrain.py") + 1:])
+    assert ssl_pretrain.check_args(ark_parsed) == stop and ark_parsed.epochs == 1000 and ark_parsed.no_gram and ark_parsed.resume
+    assert tuple(getattr(ark_parsed, k) for k in X_ARK_KEYS) == (True, 0.8, True, "per_dataset", lock == "1", True) and ark_parsed.momentum_teacher is None
+    assert tuple(getattr(ark_parsed, k) for k in RECIPE_KEYS) == (0.3, 2.0, True)
+    differs = {"output_dir", "momentum_teacher", *X_ARK_KEYS} - ({"lock_half_pass"} if lock == "0" else set()) | ({"stop_after_epochs"} if stop != 70 else set())  # lock 0 = the trunk's False
+    assert {k for k in vars(ark_parsed) if getattr(ark_parsed, k) != getattr(trunk_parsed_70, k)} == differs, (lock, differs)
+ark_parsed = ssl_pretrain.parse_args(ark_argvs["0"][ark_argvs["0"].index("ssl_pretrain.py") + 1:])  # the default arm, for the smoke check below
+# a missing or invalid stop file of either arm is refused naming itself (none of the others, which stay valid) before gaudi.sh is reached, and before any run: line; each arm reads only its own
+for lock, env, own in (("0", ARK_ENV, ARK_STOP_FILE), ("1", ARK_LOCK_ENV, ARK_LOCK_STOP_FILE)):
+    for stop in (None, "", "0", "2.5", "thirty", "-3", "1001", "18446744073709551617"):
+        result, refused_argv = ark_run(ark_root, env=env, **{own: stop})
+        assert result.returncode == 1 and "ERROR" in result.stderr and own in result.stderr and refused_argv is None and result.stdout == "", (lock, stop, result.stderr)
+        others = {"constlr_stop_after.txt", "constlr_nogram_stop_after.txt", PLAIN_STOP_FILE, ARK_STOP_FILE, ARK_LOCK_STOP_FILE} - {own}
+        assert not any("chain/" + other in result.stderr for other in others), (lock, stop, result.stderr)
+    assert "ceiling of 1000" in result.stderr, result.stderr
+    result, solo_argv = ark_run(ark_root, env=env, **{name: None for name in {"constlr_stop_after.txt", "constlr_nogram_stop_after.txt", PLAIN_STOP_FILE, ARK_STOP_FILE, ARK_LOCK_STOP_FILE} - {own}})
+    assert result.returncode == 0 and solo_argv == ark_argvs[lock], (lock, result.stderr, solo_argv)
+# the others are byte-unchanged: the phase, the no-Gram trunk and the plain trunk with the Ark stop files present (not read) or absent and CONSTLR_ARK / CONSTLR_BRANCH_ARK / CONSTLR_ARK_LOCK empty,
+# and the no-Gram trunk's branch
+ark_empties = ({}, dict(CONSTLR_ARK=""), dict(CONSTLR_BRANCH_ARK=""), dict(CONSTLR_ARK_LOCK=""), dict(CONSTLR_ARK="", CONSTLR_BRANCH_ARK="", CONSTLR_ARK_LOCK=""))
 for ark_file in (" 70 \n", None):
     for empty in ark_empties:
-        result, kept_argv = ark_run(ark_root, env=dict(ALLOC4, **empty), **{ARK_STOP_FILE: ark_file})
+        files = {ARK_STOP_FILE: ark_file, ARK_LOCK_STOP_FILE: ark_file}
+        result, kept_argv = ark_run(ark_root, env=dict(ALLOC4, **empty), **files)
         assert result.returncode == 0 and kept_argv == constlr_argv("30") and (result.stdout, result.stderr) == ("", ""), (ark_file, empty, result.stderr, kept_argv)
-        result, kept_argv = ark_run(ark_root, env=dict(NOGRAM_ENV, **empty), **{ARK_STOP_FILE: ark_file})
+        result, kept_argv = ark_run(ark_root, env=dict(NOGRAM_ENV, **empty), **files)
         assert result.returncode == 0 and kept_argv == nogram_argv_for("100") and result.stderr == "" and result.stdout.splitlines() == [NOGRAM_RUN_LINE % "100"], (ark_file, empty, result.stdout)
-        result, kept_argv = ark_run(ark_root, env=dict(PLAIN_ENV, **empty), **{ARK_STOP_FILE: ark_file})
+        result, kept_argv = ark_run(ark_root, env=dict(PLAIN_ENV, **empty), **files)
         assert result.returncode == 0 and kept_argv == plain_argv_for("60") and result.stderr == "" and result.stdout.startswith("run: ssl_dinov3_cxr_constlr_nogram_plain_seed_100 ("), (ark_file, empty)
 for empty in ark_empties:
     bres_ark, kept_bargv = branch_run(branch_dir, "10", "40", env=dict(ALLOC4, **empty))
@@ -2826,8 +2935,12 @@ ARK_NEEDS_NOGRAM = "ERROR: CONSTLR_ARK=1 is set without CONSTLR_NOGRAM=1: the Ar
 ARK_NO_PLAIN = "ERROR: CONSTLR_ARK and CONSTLR_PLAIN are both set: the Ark-teacher trunk is the no-Gram trunk with the DINOv3 recipe, so unset CONSTLR_PLAIN\n"
 ARK_NO_BRANCH = ("ERROR: CONSTLR_ARK and CONSTLR_BRANCH_* are both set: a branch of the Ark-teacher trunk is CONSTLR_BRANCH_ARK=1 with the CONSTLR_BRANCH_* variables, so unset CONSTLR_ARK\n")
 BRANCH_ARK_NEEDS_BRANCH = ("ERROR: CONSTLR_BRANCH_ARK=1 is set without the CONSTLR_BRANCH_* variables: it picks the Ark-teacher trunk for a branch (run_d1_8_branch_gram_gaudi.sh sets the four)\n")
+ARK_LOCK_ALONE = "ERROR: CONSTLR_ARK_LOCK is set without CONSTLR_ARK=1 or CONSTLR_BRANCH_ARK=1: it picks the Ark-teacher trunk's lock arm, so set one of them\n"
 ark_refusals = [(dict(NOGRAM_ENV, CONSTLR_ARK=value), "ERROR: CONSTLR_ARK holds '%s', which is not empty or 1\n" % value) for value in ("0", "yes", "2", " 1")]
 ark_refusals += [(dict(ALLOC4, CONSTLR_BRANCH_ARK=value), "ERROR: CONSTLR_BRANCH_ARK holds '%s', which is not empty or 1\n" % value) for value in ("0", "yes", " 1")]
+ark_refusals += [(dict(ARK_ENV, CONSTLR_ARK_LOCK=value), "ERROR: CONSTLR_ARK_LOCK holds '%s', which is not empty, 0 or 1\n" % value) for value in ("2", "yes", "true", " 1", "01", "-1")]
+ark_refusals += [(dict(ALLOC4, CONSTLR_ARK_LOCK=value), ARK_LOCK_ALONE) for value in ("0", "1")] + [(dict(NOGRAM_ENV, CONSTLR_ARK_LOCK="1"), ARK_LOCK_ALONE),
+                                                                                                   (dict(PLAIN_ENV, CONSTLR_ARK_LOCK="0"), ARK_LOCK_ALONE)]
 ark_refusals += [(dict(ALLOC4, CONSTLR_ARK="1"), ARK_NEEDS_NOGRAM), (dict(ALLOC4, CONSTLR_ARK="1", CONSTLR_NOGRAM=""), ARK_NEEDS_NOGRAM), (dict(PLAIN_ENV, CONSTLR_ARK="1"), ARK_NO_PLAIN),
                  (dict(ALLOC4, CONSTLR_BRANCH_ARK="1"), BRANCH_ARK_NEEDS_BRANCH), (dict(ARK_ENV, CONSTLR_BRANCH_ARK="1"), BRANCH_ARK_NEEDS_BRANCH)]
 ark_refusals += [(dict(ALLOC4, CONSTLR_ARK="1", **branch_vars), ARK_NO_BRANCH) for branch_vars in (dict(CONSTLR_BRANCH_EPOCH="10"), branch_all, dict(branch_all, CONSTLR_BRANCH_ARK="1"))]
@@ -2837,45 +2950,56 @@ for env, expected_error in ark_refusals:
     result, refused_argv = ark_run(ark_root, env=env)
     assert result.returncode == 1 and result.stderr == expected_error and result.stdout == "" and refused_argv is None, (env, result.stderr)
 branch_refused(branch_root(), ("10", "40"), "CONSTLR_ARK", "CONSTLR_BRANCH_*", env=dict(ALLOC4, CONSTLR_ARK="1"))  # the branch wrapper sets all four: refused naming both
-# a branch of the Ark-teacher trunk: CONSTLR_BRANCH_ARK=1 through the wrapper reads that trunk's args.json (the cycle's epoch_length) and source, and launches its line with --no_gram replaced
-# by the branch pair, ARK_FLAGS kept after it; without the variable the same arguments name the no-Gram trunk's source instead
-ARK_BRANCH_ENV = dict(ALLOC4, CONSTLR_BRANCH_ARK="1")
+branch_refused(branch_root(), ("10", "40"), "CONSTLR_ARK_LOCK", env=dict(ALLOC4, CONSTLR_ARK_LOCK="1"))  # a lock arm without CONSTLR_BRANCH_ARK=1 names nothing to pick
+# a branch of either Ark-teacher arm: CONSTLR_BRANCH_ARK=1 (and the arm's CONSTLR_ARK_LOCK) through the wrapper reads that arm's trunk (args.json: the cycle's epoch_length and its lock_half_pass, which
+# must be the arm's) and source, and launches its line with --no_gram replaced by the branch pair, ARK_FLAGS kept after it; without the variables the same arguments name the no-Gram trunk's source
 
 
-def ark_branch_root(epoch_length=2665):  # branch_root() plus a stub Ark-teacher trunk with its epoch-1 checkpoint
+def ark_branch_root(lock_json={"0": False, "1": True}, epoch_length={"0": 2665, "1": 3997}):  # branch_root() plus both stub Ark-teacher trunks, each with its epoch-1 checkpoint
     root = branch_root()
-    os.makedirs(os.path.join(root, ARK_TRUNK, "ckpt"))
-    with open(os.path.join(root, ARK_TRUNK, "args.json"), "w") as f:
-        json.dump(dict(no_gram=True, cyclic_ark_teacher=True, heads="per_dataset", data_set=["VinDrCXR", "ChestXray14", "MIMIC", "CheXpert"], epoch_length=epoch_length,
-                       total_steps=1000 * epoch_length), f, indent=2)
-    open(os.path.join(root, ARK_TRUNK, "ckpt", "epoch_0001.pth"), "w").close()
+    for lock, trunk in ARK_TRUNKS.items():
+        os.makedirs(os.path.join(root, trunk, "ckpt"))
+        record = dict(no_gram=True, cyclic_ark_teacher=True, heads="per_dataset", data_set=["VinDrCXR", "ChestXray14", "MIMIC", "CheXpert"], epoch_length=epoch_length[lock],
+                      total_steps=1000 * epoch_length[lock])
+        if lock_json.get(lock) is not None:
+            record["lock_half_pass"] = lock_json[lock]
+        with open(os.path.join(root, trunk, "args.json"), "w") as f:
+            json.dump(record, f, indent=2)
+        open(os.path.join(root, trunk, "ckpt", "epoch_0001.pth"), "w").close()
     return root
 
 
 ark_branch_dir = ark_branch_root()
-ARK_BRANCH_RUN, ARK_SRC1 = "ssl_dinov3_cxr_constlr_arkteacher_e0001_gram_every2665x30_seed_100", ARK_RUN + "/ckpt/epoch_0001.pth"
-ark_steps30 = ",".join(str(2665 + 2665 * i) for i in range(1, 31))  # the next 30 cycle boundaries
-bres_ab, ark_bargv = branch_run(ark_branch_dir, "1", "40", "2665", "30", env=ARK_BRANCH_ENV)
-assert bres_ab.returncode == 0 and bres_ab.stderr == "", bres_ab.stderr
-assert ark_bargv == [("/workspace/" + ARK_BRANCH_RUN) if arg == ARK_RUN else arg for arg in ark_argv_for("40")[:-7]] + [
-    "--branch_from", ARK_SRC1, "--gram_refresh_steps", ark_steps30] + ARK_FLAGS, ark_bargv
-assert bres_ab.stdout.splitlines() == [
-    "run: %s (Gram-anchored branch of %s from its epoch 1: --branch_from %s --gram_refresh_steps in place of --no_gram; stop after epoch 40)" % (ARK_BRANCH_RUN, ARK_TRUNK, ARK_SRC1),
-    "gram refresh steps: %s (branch step 2665 = epoch 1 x epoch_length 2665 from %s/args.json, then every 2665 steps, 30 times)" % (ark_steps30, ARK_TRUNK)], bres_ab.stdout
-expanded["CONSTLR_BRANCH_ARK=1 run_d1_8_branch_gram_gaudi.sh 1 40 2665 30"] = "./gaudi.sh " + " ".join(ark_bargv)
-result, ark_trunk_40 = ark_run(sandbox(), **{ARK_STOP_FILE: "40\n"})  # the real Ark-teacher trunk's line at stop 40: the branch's but for the run dir and the pair in place of --no_gram
-assert result.returncode == 0 and ark_trunk_40 == ark_argv_for("40")
-ark_cut = ark_trunk_40.index("--no_gram")
-assert ark_bargv[:ark_cut] == [("/workspace/" + ARK_BRANCH_RUN) if arg == ARK_RUN else arg for arg in ark_trunk_40[:ark_cut]] and ark_bargv[ark_cut + 4:] == ark_trunk_40[ark_cut + 1:] == ARK_FLAGS
-ark_bparsed = ssl_pretrain.parse_args(ark_bargv[ark_bargv.index("ssl_pretrain.py") + 1:])
-ark_tparsed = ssl_pretrain.parse_args(ark_trunk_40[ark_trunk_40.index("ssl_pretrain.py") + 1:])
-assert (ark_bparsed.branch_from, ark_bparsed.gram_refresh_steps, ark_bparsed.no_gram) == (ARK_SRC1, [2665 * i for i in range(2, 32)], False)
-assert all(getattr(ark_bparsed, k) == getattr(ark_tparsed, k) for k in branch_locked_alike), \
-    {k: (getattr(ark_bparsed, k), getattr(ark_tparsed, k)) for k in branch_locked_alike if getattr(ark_bparsed, k) != getattr(ark_tparsed, k)}  # what --branch_from checks against the source
-branch_refused(ark_branch_dir, ("5", "40"), ARK_TRUNK + "/ckpt/epoch_0005.pth", "nothing to branch from", env=ARK_BRANCH_ENV)
+for lock, env, length in (("0", dict(ALLOC4, CONSTLR_BRANCH_ARK="1"), 2665), ("1", dict(ALLOC4, CONSTLR_BRANCH_ARK="1", CONSTLR_ARK_LOCK="1"), 3997)):
+    trunk = ARK_TRUNKS[lock]
+    run_ab, src_ab = "%s_e0001_gram_every%dx30_seed_100" % (trunk[:-len("_seed_100")], length), ARK_RUNS[lock] + "/ckpt/epoch_0001.pth"
+    steps_ab = ",".join(str(length + length * i) for i in range(1, 31))  # the next 30 cycle boundaries
+    bres_ab, ark_bargv = branch_run(ark_branch_dir, "1", "40", str(length), "30", env=env)
+    assert bres_ab.returncode == 0 and bres_ab.stderr == "", (lock, bres_ab.stderr)
+    assert ark_bargv == [("/workspace/" + run_ab) if arg == ARK_RUNS[lock] else arg for arg in ark_argv_for("40", lock)[:-6]] + [
+        "--branch_from", src_ab, "--gram_refresh_steps", steps_ab] + ARK_FLAGS_OF[lock], (lock, ark_bargv)
+    assert ("_lock_e0001_" in run_ab) == (lock == "1") and bres_ab.stdout.splitlines() == [
+        "run: %s (Gram-anchored branch of %s from its epoch 1: --branch_from %s --gram_refresh_steps in place of --no_gram; stop after epoch 40)" % (run_ab, trunk, src_ab),
+        "gram refresh steps: %s (branch step %d = epoch 1 x epoch_length %d from %s/args.json, then every %d steps, 30 times)" % (steps_ab, length, length, trunk, length)], bres_ab.stdout
+    expanded["CONSTLR_BRANCH_ARK=1 CONSTLR_ARK_LOCK=%s run_d1_8_branch_gram_gaudi.sh 1 40 %d 30" % (lock, length)] = "./gaudi.sh " + " ".join(ark_bargv)
+    result, ark_trunk_40 = ark_run(sandbox(), env=dict(ARK_ENV, CONSTLR_ARK_LOCK=lock), **{ARK_LOCK_STOP_FILE if lock == "1" else ARK_STOP_FILE: "40\n"})  # the real trunk line of the arm at stop 40
+    assert result.returncode == 0 and ark_trunk_40 == ark_argv_for("40", lock)
+    ark_cut = ark_trunk_40.index("--no_gram")
+    assert ark_bargv[:ark_cut] == [("/workspace/" + run_ab) if arg == ARK_RUNS[lock] else arg for arg in ark_trunk_40[:ark_cut]] and ark_bargv[ark_cut + 4:] == ark_trunk_40[ark_cut + 1:] == ARK_FLAGS_OF[lock]
+    ark_bparsed = ssl_pretrain.parse_args(ark_bargv[ark_bargv.index("ssl_pretrain.py") + 1:])
+    ark_tparsed = ssl_pretrain.parse_args(ark_trunk_40[ark_trunk_40.index("ssl_pretrain.py") + 1:])
+    assert (ark_bparsed.branch_from, ark_bparsed.gram_refresh_steps, ark_bparsed.no_gram, ark_bparsed.lock_half_pass) == (src_ab, [length * i for i in range(2, 32)], False, lock == "1")
+    assert all(getattr(ark_bparsed, k) == getattr(ark_tparsed, k) for k in branch_locked_alike), \
+        {k: (getattr(ark_bparsed, k), getattr(ark_tparsed, k)) for k in branch_locked_alike if getattr(ark_bparsed, k) != getattr(ark_tparsed, k)}  # what --branch_from checks against the source
+    branch_refused(ark_branch_dir, ("5", "40"), trunk + "/ckpt/epoch_0005.pth", "nothing to branch from", env=env)
 branch_refused(ark_branch_dir, ("1", "40"), BRANCH_TRUNK + "/ckpt/epoch_0001.pth", "nothing to branch from")  # without CONSTLR_BRANCH_ARK=1: the no-Gram trunk's source
-# the wrappers: bash -n, the executable bit, the sbatch headers, the code (the trunk's: the no-Gram trunk's wrapper but for its last line), the comments' recipe, reasons and stop file, and a copy with its
-# cd pointed at a sandbox launching the Ark line from outside the repo; the smoke job launches the trunk's flags for 1500 steps (past MIMIC's 1441-step dataset epoch at 64 x 4) into a throwaway run dir
+# the branch inherits its trunk's lock: a trunk whose args.json records the other arm's lock_half_pass, or none, is refused naming it, before anything is launched
+for lock_json, env, words in (({"0": True}, dict(ALLOC4, CONSTLR_BRANCH_ARK="1"), ["lock_half_pass 'true'", "not the false of CONSTLR_ARK_LOCK=0"]),
+                              ({"1": False}, dict(ALLOC4, CONSTLR_BRANCH_ARK="1", CONSTLR_ARK_LOCK="1"), ["lock_half_pass 'false'", "not the true of CONSTLR_ARK_LOCK=1"]),
+                              ({"0": None}, dict(ALLOC4, CONSTLR_BRANCH_ARK="1"), ["lock_half_pass ''"])):
+    branch_refused(ark_branch_root(lock_json=dict({"0": False, "1": True}, **lock_json)), ("1", "40", "2665", "30"), "args.json", *words, env=env)
+# the wrappers: bash -n, the executable bit, the sbatch headers, the code (the trunk's: the no-Gram trunk's wrapper but for its last line), the comments' recipe, arms, reasons and stop files, and a copy
+# with its cd pointed at a sandbox launching either arm's line from outside the repo; the smoke job launches the arm's flags for 2300 steps into the arm's throwaway run dir
 ARK_SCRIPT, ARK_SMOKE = os.path.join(REPO, "run_d1_8_constlr_arkteacher_gaudi.sh"), os.path.join(REPO, "run_d1_8_arkteacher_smoke_gaudi.sh")
 for script in (ARK_SCRIPT, ARK_SMOKE):
     assert os.access(script, os.X_OK) and stat.S_IMODE(os.stat(script).st_mode) == 0o755, script
@@ -2887,39 +3011,60 @@ assert [line[len("#SBATCH "):] for line in ark_lines if line.startswith("#SBATCH
 ark_code = [line for line in ark_lines if line and not line.startswith("#")]
 assert ark_code[-1] == "CONSTLR_NOGRAM=1 CONSTLR_ARK=1 exec ./chain/constlr.sh" and ark_code[:-1] == nogram_code[:-1], ark_code
 assert all(line.startswith("#") for line in ark_lines if "phases.txt" in line), ark_lines
-for needle in ("chain/constlr_arkteacher_stop_after.txt", "largest", "0.80 x teacher + 0.20 x student", "clean views", "per dataset", "first 100 steps", "Gram off", "cycle 1", "4.3 GB"):
+for needle in ("chain/constlr_arkteacher_stop_after.txt", "chain/constlr_arkteacher_lock_stop_after.txt", "ssl_dinov3_cxr_constlr_arkteacher_lock_seed_100", "CONSTLR_ARK_LOCK=1", "largest",
+               "0.80 x teacher + 0.20 x student", "clean views", "per dataset", "a random half", "Gram off", "cycle 1", "4.3 GB"):
     assert needle in ark_text, needle
 ark_wrap_root = sandbox(timing=True)
 open(os.path.join(ark_wrap_root, "chain", "main_lr.txt"), "w").write("0.002\n")
-open(os.path.join(ark_wrap_root, "chain", ARK_STOP_FILE), "w").write("70\n")  # the only stop file
+open(os.path.join(ark_wrap_root, "chain", ARK_STOP_FILE), "w").write("70\n")  # the arms' stop files only
+open(os.path.join(ark_wrap_root, "chain", ARK_LOCK_STOP_FILE), "w").write("80\n")
 assert ark_text.count(BRANCH_CD) == 1, BRANCH_CD
 open(os.path.join(ark_wrap_root, "ark_wrapper.sh"), "w").write(ark_text.replace(BRANCH_CD, "cd %s || exit 1" % shlex.quote(ark_wrap_root)))
-result = subprocess.run(["bash", os.path.join(ark_wrap_root, "ark_wrapper.sh")], cwd=branch_elsewhere, env=ALLOC4, capture_output=True, text=True)
-assert result.returncode == 0 and result.stderr == "" and launched(ark_wrap_root) == ark_argv_for("70") and result.stdout.splitlines() == [ARK_RUN_LINE % "70"], (result.stderr, launched(ark_wrap_root))
+for lock, env, stop in (("0", ALLOC4, "70"), ("1", dict(ALLOC4, CONSTLR_ARK_LOCK="1"), "80")):
+    if os.path.exists(os.path.join(ark_wrap_root, "argv.txt")):
+        os.remove(os.path.join(ark_wrap_root, "argv.txt"))
+    result = subprocess.run(["bash", os.path.join(ark_wrap_root, "ark_wrapper.sh")], cwd=branch_elsewhere, env=env, capture_output=True, text=True)
+    assert result.returncode == 0 and result.stderr == "" and launched(ark_wrap_root) == ark_argv_for(stop, lock) and result.stdout.splitlines() == [ark_run_line(lock, stop)], (lock, result.stderr)
 assert os.path.exists(os.path.join(ark_wrap_root, "cards_checked"))
 smoke_text = open(ARK_SMOKE).read()
 assert [line[len("#SBATCH "):] for line in smoke_text.splitlines() if line.startswith("#SBATCH ")] == [
-    "--job-name=d1-8-arkteacher-smoke", "-A grp_jliang12", "-p gaudi", "-q public", "-t 01:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"]
+    "--job-name=d1-8-arkteacher-smoke", "-A grp_jliang12", "-p gaudi", "-q public", "-t 01:15:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"]
 smoke_root = sandbox(timing=True)
 shutil.copy(ARK_SMOKE, smoke_root)
-result = run_script(smoke_root, os.path.join(smoke_root, "run_d1_8_arkteacher_smoke_gaudi.sh"), cwd=branch_elsewhere, env=dict(ALLOC4, ARK_ROOT=smoke_root))
-smoke_argv = launched(smoke_root)
-assert result.returncode == 0 and smoke_argv == COMMON + ["/workspace/ssl_dinov3_cxr_arkteacher_smoke_seed_100", "--resume", *RECIPE, "--no_gram", *ARK_FLAGS, "--lr", "0.002", "--min_lr", "0.002",
-                                                         "--no_lr_scaling", "--epochs", "1000", "--max_steps", "1500"], (result.stderr, smoke_argv)
-smoke_parsed = ssl_pretrain.parse_args(smoke_argv[smoke_argv.index("ssl_pretrain.py") + 1:])
-assert smoke_parsed.max_steps == 1500 > 368960 // 4 // 64 == 1441 and {k for k in vars(smoke_parsed) if getattr(smoke_parsed, k) != getattr(ark_parsed, k)} == {"output_dir", "max_steps", "stop_after_epochs"}
-for needle in ("cycle (--cyclic_ark_teacher)", "dataset switch after step 1441: MIMIC -> CheXpert", "teacher blend after step 1441", "--max_steps 1500 reached at step 1500"):
+for lock, smoke_env, smoke_dir in (("0", dict(ALLOC4, ARK_ROOT=smoke_root), "ssl_dinov3_cxr_arkteacher_smoke_seed_100"),
+                                   ("0", dict(ALLOC4, ARK_ROOT=smoke_root, CONSTLR_ARK_LOCK="0"), "ssl_dinov3_cxr_arkteacher_smoke_seed_100"),
+                                   ("1", dict(ALLOC4, ARK_ROOT=smoke_root, CONSTLR_ARK_LOCK="1"), "ssl_dinov3_cxr_arkteacher_lock_smoke_seed_100")):
+    if os.path.exists(os.path.join(smoke_root, "argv.txt")):
+        os.remove(os.path.join(smoke_root, "argv.txt"))
+    result = run_script(smoke_root, os.path.join(smoke_root, "run_d1_8_arkteacher_smoke_gaudi.sh"), cwd=branch_elsewhere, env=smoke_env)
+    smoke_argv = launched(smoke_root)
+    assert result.returncode == 0 and smoke_argv == COMMON + ["/workspace/" + smoke_dir, "--resume", *RECIPE, "--no_gram", *ARK_FLAGS_OF[lock], "--lr", "0.002", "--min_lr", "0.002",
+                                                             "--no_lr_scaling", "--epochs", "1000", "--max_steps", "2300"], (lock, result.stderr, smoke_argv)
+    smoke_parsed = ssl_pretrain.parse_args(smoke_argv[smoke_argv.index("ssl_pretrain.py") + 1:])
+    trunk_arm = ssl_pretrain.parse_args(ark_argvs[lock][ark_argvs[lock].index("ssl_pretrain.py") + 1:])
+    assert {k for k in vars(smoke_parsed) if getattr(smoke_parsed, k) != getattr(trunk_arm, k)} == {"output_dir", "max_steps", "stop_after_epochs"}  # the arm's trunk line, cut short
+    expanded["run_d1_8_arkteacher_smoke_gaudi.sh (CONSTLR_ARK_LOCK=%s)" % lock] = "./gaudi.sh " + " ".join(smoke_argv)
+# 2300 steps cross the first dataset boundary in both arms at 64 x 4: MIMIC's release alone (1441), or its lock + release (720 + 1441 = 2161), each followed by CheXpert's first pass
+assert 368960 // 4 // 64 == 1441 and 368960 // 2 // 4 // 64 == 720 and 1441 < 720 + 1441 < 2300 < 1441 + 872 and 720 + 1441 + 223414 // 2 // 4 // 64 > 2300
+for value in ("2", "yes", " 1"):
+    os.remove(os.path.join(smoke_root, "argv.txt"))
+    result = run_script(smoke_root, os.path.join(smoke_root, "run_d1_8_arkteacher_smoke_gaudi.sh"), cwd=branch_elsewhere, env=dict(ALLOC4, ARK_ROOT=smoke_root, CONSTLR_ARK_LOCK=value))
+    assert result.returncode == 1 and result.stderr == "ERROR: CONSTLR_ARK_LOCK holds '%s', which is not empty, 0 or 1\n" % value and launched(smoke_root) is None, (value, result.stderr)
+    open(os.path.join(smoke_root, "argv.txt"), "w").close()
+for needle in ("cycle (--cyclic_ark_teacher)", "dataset pass after step 0: MIMIC lock", "teacher blend after step 1441 [2161]", "--max_steps 2300 reached at step 2300",
+               "ssl_dinov3_cxr_arkteacher_lock_smoke_seed_100"):
     assert needle in smoke_text, needle  # the expected log lines it documents
-expanded["run_d1_8_arkteacher_smoke_gaudi.sh"] = "./gaudi.sh " + " ".join(smoke_argv)
 print("OK (k) Ark-teacher trunk: constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_ARK=1 (run_d1_8_constlr_arkteacher_gaudi.sh: mode 755, 4 cards, the no-Gram trunk's wrapper but for the job name, the comments and "
-      "CONSTLR_ARK=1, names phases.txt only in comments, launches from outside the repo) launches the no-Gram trunk's line with --cyclic_ark_teacher --heads per_dataset --switch_lock_steps 100 "
-      "--keep_all_checkpoints appended, into ssl_dinov3_cxr_constlr_arkteacher_seed_100, stop epoch from constlr_arkteacher_stop_after.txt only (refused naming itself), and prints the flags in its run: line; "
-      "the argv parses to the trunk's settings but the run dir and the mode (clean views, momentum 0.8, no per-step momentum); CONSTLR_ARK other than empty or 1, without CONSTLR_NOGRAM=1, with CONSTLR_PLAIN "
-      "or any CONSTLR_BRANCH_*, and CONSTLR_BRANCH_ARK other than empty or 1 or without the CONSTLR_BRANCH_* are refused with their exact text before anything is read; CONSTLR_BRANCH_ARK=1 through the "
-      "branch wrapper (`1 40 2665 30`) launches that trunk's line with --no_gram replaced by --branch_from its epoch_0001 --gram_refresh_steps at the next 30 cycle boundaries (its args.json's "
-      "epoch_length), ARK_FLAGS kept, every --branch_from-checked setting = the trunk's; the phase, the no-Gram trunk, the plain trunk and the no-Gram branches launch and print exactly as before with "
-      "CONSTLR_ARK / CONSTLR_BRANCH_ARK empty and the Ark stop file present or absent; run_d1_8_arkteacher_smoke_gaudi.sh (1 hour) launches the trunk's flags for 1500 steps (> MIMIC's 1441) into "
-      "ssl_dinov3_cxr_arkteacher_smoke_seed_100")
+      "CONSTLR_ARK=1, names phases.txt only in comments, launches both arms from outside the repo) launches the no-Gram trunk's line with --cyclic_ark_teacher --heads per_dataset <lock flag> "
+      "--keep_all_checkpoints appended; CONSTLR_ARK_LOCK picks the arm (unset, empty or 0: --no_lock_half_pass into ssl_dinov3_cxr_constlr_arkteacher_seed_100 with constlr_arkteacher_stop_after.txt; 1: "
+      "--lock_half_pass into ssl_dinov3_cxr_constlr_arkteacher_lock_seed_100 with constlr_arkteacher_lock_stop_after.txt; the two lines differ in just those three), each arm reads only its own stop file "
+      "(refused naming itself) and prints the flags and the arm in its run: line; the argv parses to the trunk's settings but the run dir and the mode; CONSTLR_ARK other than empty or 1, without "
+      "CONSTLR_NOGRAM=1, with CONSTLR_PLAIN or any CONSTLR_BRANCH_*, CONSTLR_BRANCH_ARK other than empty or 1 or without the CONSTLR_BRANCH_*, CONSTLR_ARK_LOCK other than empty, 0 or 1 or set without "
+      "CONSTLR_ARK / CONSTLR_BRANCH_ARK are refused with their exact text before anything is read; CONSTLR_BRANCH_ARK=1 through the branch wrapper (`1 40 <epoch_length> 30`) launches the arm's trunk line "
+      "with --no_gram replaced by --branch_from its epoch_0001 --gram_refresh_steps at the next 30 cycle boundaries (2665 / 3997 from its args.json), ARK_FLAGS kept, the _lock token in the lock arm's "
+      "branch dir, every --branch_from-checked setting = the trunk's, and a trunk args.json with the other lock_half_pass or none is refused; the phase, the no-Gram trunk, the plain trunk and the no-Gram "
+      "branches launch and print exactly as before with the three variables empty and the Ark stop files present or absent; run_d1_8_arkteacher_smoke_gaudi.sh (75 min) launches the arm's flags for 2300 "
+      "steps (past MIMIC's release, 1441, or lock + release, 2161) into ssl_dinov3_cxr_arkteacher[_lock]_smoke_seed_100 and refuses another CONSTLR_ARK_LOCK")
 
 # hires.sh ("DINO-X ConstLR 512 px"): a separate run from the stock weights, constlr.sh with only the crops and the batch changed. Four setting files,
 # each missing or invalid one refused naming it before gaudi.sh is reached (the LR file is constlr's own main_lr.txt)
