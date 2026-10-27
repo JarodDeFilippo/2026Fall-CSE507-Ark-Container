@@ -14,12 +14,20 @@
 # and Gram teacher 448: the trainer's defaults, as in constlr. The trunk keeps running; the branch is a new run dir, so it never writes to the trunk's.
 # The trunk's line carries DINOv3's --drop_path_rate 0.3 --rope_rescale_coords 2 --untie_local_cls_norm (2026-10-26), so a branch passes them too (--branch_from requires them to match the source), and
 # neither is an exact ConstLR-224 control.
-# Usage: sbatch run_d1_8_branch_gram_gaudi.sh <K> <STOP> [EVERY] [COUNT]   (EVERY default 10000, COUNT default 3: Meta's 10k x 3, DINOv3 Appendix C)
+# Usage: sbatch run_d1_8_branch_gram_gaudi.sh <K> <STOP> [EVERY] [COUNT] [GRAM_EPOCH]   (EVERY default 10000, COUNT default 3: Meta's 10k x 3, DINOv3 Appendix C; GRAM_EPOCH: none)
 #   K = the trunk epoch to branch from (its ckpt/epoch_<K %04d>.pth must exist when the branch first starts: the trunk keeps every 10th epoch and its last 3); STOP = the epoch the branch stops after (above K, at most the 1000 ceiling);
 #   EVERY / COUNT = the Gram refreshes: COUNT of them, EVERY steps apart, the first one EVERY steps after the branch step.
 # Refresh steps are absolute global steps: K x the trunk's epoch_length (read from its args.json, where the trainer writes it) + i x EVERY, i = 1..COUNT. The two planned runs, at the trunk's epoch_length 2666 (4 cards):
 #   sbatch run_d1_8_branch_gram_gaudi.sh 10 40          -> run dir ssl_dinov3_cxr_constlr_nogram_e0010_gram_every10000x3_seed_100, Gram refreshes after steps 36660,46660,56660
 #   sbatch run_d1_8_branch_gram_gaudi.sh 10 40 2666 30  -> run dir ssl_dinov3_cxr_constlr_nogram_e0010_gram_every2666x30_seed_100, one refresh per epoch for 30 epochs (the professor's idea)
+# GRAM_EPOCH = J (optional, below K; CONSTLR_BRANCH_GRAM_EPOCH): the Gram teacher is anchored to the EMA teacher backbone of the trunk's EARLIER ckpt/epoch_<J %04d>.pth (ssl_pretrain.py --gram_teacher_from,
+# appended to the line) instead of the branch point's, and the run dir gets _gt<J %04d> right after _e<K %04d>. DINOv3's rule (Sec. 4.2; App. C p. 58): the Gram teacher is an early iteration of the
+# teacher, whose dense features are better, switched on late with w_Gram 2 and refreshed from the EMA teacher every 10k steps, at most three times. The planned run (Jarod, 2026-10-27):
+#   sbatch run_d1_8_branch_gram_gaudi.sh 100 130 2666 3 10  -> ssl_dinov3_cxr_constlr_nogram_e0100_gt0010_gram_every2666x3_seed_100, the Gram teacher from trunk epoch 10 (ckpt/epoch_0010.pth, which the
+#                                                              trunk keeps), refreshed after steps 269266,271932,274598: one epoch apart, three of them (100 x the trunk's epoch_length, read from its
+#                                                              args.json as above, + 2666 i)
+# Pass the same five arguments on every re-submit of such a branch: without the fifth the same K / STOP / EVERY / COUNT name the branch without it, another run dir, which would start over from
+# the source. Without the fifth argument nothing changes: the line, the run dir and the printed lines are the four-argument ones (an inherited CONSTLR_BRANCH_GRAM_EPOCH is cleared on the last line).
 # chain/constlr.sh owns the recipe (the LR file, --min_lr = --lr, --no_lr_scaling, the 1000 ceiling, ssl_launch); the setting on the last line is its CONSTLR_BRANCH_* override. It validates everything and prints
 # the `run:` and `gram refresh steps:` lines before launching (see its header).
 # Extend a branch: re-submit with a larger STOP and the SAME K / EVERY / COUNT (they name the run dir and fix the refresh list, which --resume locks); it resumes from its last epoch checkpoint, and the source
@@ -36,11 +44,11 @@
 # NOT a chain phase: it is submitted on its own and must never be added to chain/phases.txt. The log is the Slurm .out (no chain/log file, no chain/done marker); its first lines must show the `run:` line, the
 # `gram refresh steps:` line, the trainer's `Gram refresh scheduled after step ...` lines and its `branched from ...` line (a re-submit: `resumed from ...`).
 export PT_HPU_LAZY_MODE=1
-[[ $# -ge 2 && $# -le 4 ]] || { echo "ERROR: usage: sbatch run_d1_8_branch_gram_gaudi.sh <K> <STOP> [EVERY=10000] [COUNT=3]; got $# arguments" >&2; exit 1; }
+[[ $# -ge 2 && $# -le 5 ]] || { echo "ERROR: usage: sbatch run_d1_8_branch_gram_gaudi.sh <K> <STOP> [EVERY=10000] [COUNT=3] [GRAM_EPOCH]; got $# arguments" >&2; exit 1; }
 cd /scratch/$USER/2026Fall-CSE507-Ark-Container || exit 1
 # fail closed: --cleanenv drops SLURM_JOB_GPUS, so check the container sees exactly the allocated cards before the ranks start
 ./gaudi_check_cards.sh || exit 1
 # report-only: at 15 min, log whether every allocated card is busy (gaudi_verify_busy.sh)
 [[ -x ./gaudi_verify_busy.sh ]] || { echo "ERROR: gaudi_verify_busy.sh missing or not executable; refusing to train unverified" >&2; exit 1; }
 ./gaudi_verify_busy.sh 900 &
-CONSTLR_BRANCH_EPOCH=$1 CONSTLR_BRANCH_STOP=$2 CONSTLR_BRANCH_EVERY=${3:-10000} CONSTLR_BRANCH_COUNT=${4:-3} exec ./chain/constlr.sh
+CONSTLR_BRANCH_EPOCH=$1 CONSTLR_BRANCH_STOP=$2 CONSTLR_BRANCH_EVERY=${3:-10000} CONSTLR_BRANCH_COUNT=${4:-3} CONSTLR_BRANCH_GRAM_EPOCH=${5:-} exec ./chain/constlr.sh
