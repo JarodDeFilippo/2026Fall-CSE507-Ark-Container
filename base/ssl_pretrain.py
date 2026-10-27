@@ -22,6 +22,8 @@ Each student submodule (backbone, dino_head, ibot_head) is its own DDP module wi
 gradient on every step (both heads, the mask token, the storage tokens and, with --untie_local_cls_norm, local_cls_norm; the --freeze_backbone_epochs freeze
 and the last-layer freeze are LR-0 freezes, so their gradients still flow), which saves DDP its per-iteration search for unused parameters, and if that ever
 stops being true DDP raises at the next forward instead of hanging (Ark+ fine-tuning keeps the default, True: one dataset head is active per step).
+With --heads per_dataset each dataset's DINO and iBOT head is its own DDP module too: a step runs only its batch's pair, every parameter of which gets a
+gradient, and the other heads' DDP modules see no forward that step (their grads stay None, so AdamW leaves them, weight decay included, untouched).
 
 --no_gram trains with no Gram teacher at all: none is built (build_models gram=False), moved to the device, loaded (--init_from_checkpoint
 included) or run; no Gram loss is computed, nothing is refreshed, and the batches carry no Gram crops (the global crops are still cut at
@@ -60,6 +62,35 @@ branches unchanged: the three are locked on --resume (a checkpoint without the k
 source must match them. With --untie_local_cls_norm the stock --pretrained_weights file loads strictly and local_cls_norm starts as a copy of its
 norm (one line says so); the epoch checkpoints carry local_cls_norm (student, EMA teacher, Gram teacher) and the exports leave it out (the stock 188
 keys, as before). An --init_from_checkpoint source must match the flag: its student and teacher load strictly.
+
+--cyclic_ark_teacher is the Ark+ / Foundation X teacher transplanted into this trainer (Jarod, 2026-10-26). A cycle replaces the mixed-batch epoch: one full
+pass over each --data_set in turn, largest first by image count (computed and logged; on the four CXR sets MIMIC, CheXpert, ChestXray14, VinDrCXR,
+whatever the --data_set order; a tie keeps that order), every batch from one dataset. Each dataset has its own DistributedSampler (shuffle, drop_last,
+per rank) and loader, and set_epoch is called as each dataset epoch starts with that dataset epoch's own index (cycle x the dataset count + its place), so no
+two of them share a sampler permutation seed or a worker base seed. epoch_length is the sum of the per-dataset loader lengths (2665 at global batch 256
+against the mixed loader's 2666), and everything per epoch (LR warmup, teacher-temperature warmup, --freeze_backbone_epochs, --stop_after_epochs,
+checkpoints and exports, the CSV epoch column, --gram_refresh_steps) is per cycle, unchanged in code. Checkpoints are written at cycle ends only, so a
+resume restarts at a cycle boundary and a kill mid-cycle loses at most that cycle (about 33 min on 4 cards). The per-step EMA is not run: the teacher is
+frozen within a dataset epoch and after its last step teacher <- m x teacher + (1 - m) x student for the backbone and every head (SSLMetaArch.update_ema
+with m = --ark_teacher_momentum, default 0.8, the old teacher's weight; Ark+ trainer.py's ema_mode "epoch" update, over the parameters), the frozen first
+cycle's boundaries included; a Gram refresh due at the same step comes after the blend, so it copies the blended teacher. --momentum_teacher is refused
+in the mode (args.json records None). The teacher scores clean views (--teacher_clean_view, implied; given as well it is the same run, so it is not
+refused): the two global crops' RandomResizedCrop + flip, resized to --global_crops_size, with no color jitter and no blur, i.e. the undistorted base the
+Gram crops are cut from (DataAugmentationCXR teacher_no_distortions; collated as collated_global_crops_teacher); the student's and the Gram teacher's crops
+are unchanged and draw the same RNG. Alone, --teacher_clean_view gives the per-step EMA teacher the same clean views (an ablation arm). For the first
+--switch_lock_steps steps of every dataset epoch (default 100 in the mode) the backbone LR is 0, the --freeze_backbone_epochs mechanism; heads train; in
+the frozen first cycle it is a no-op, and a dataset epoch not longer than the lock (VinDrCXR: 58 steps at 256) keeps its backbone at LR 0 throughout (one
+line says so). One line per dataset epoch names the switch, its step and lock, and one per boundary the blend. --heads per_dataset (the mode only: a mixed
+batch has no single dataset) builds one DINO and one iBOT head per dataset (nn.ModuleDicts keyed by name, HEAD_KWARGS, random init), student and teacher;
+the batch's dataset picks the pair for the DINO and iBOT losses (KoLeo acts on the backbone's CLS before any head, so no head is involved there; Sinkhorn-
+Knopp is per batch), the optimizer's groups take every head with today's multipliers, the last-layer freeze (FREEZE_LAST_LAYER_EPOCHS) reaches every head's last layer, and the
+export is the backbone, unchanged. --keep_all_checkpoints (any mode) never prunes ckpt/epoch_*.pth. ssl_losses.csv gains a last column, dataset (the
+batch's dataset; "-" outside the mode, so the 15 numeric columns before it are what they were: the DINO-X report builder, chain/gate.py and the DINO-X
+audit read the CSV by header name; a resume keeps the rows of a CSV written before the column, with "-" added), every dataset epoch's last step is a log
+row, and its momentum column is the momentum the step applied: --momentum_teacher outside the mode, 1.0 in it but --ark_teacher_momentum at a dataset
+epoch's last step. All six settings are locked on --resume (a checkpoint without the keys reads as the mixed-batch defaults), recorded in args.json and
+matched by --branch_from: a Gram branch of a cyclic no-Gram trunk restores everything (all heads, the teacher blended at that cycle boundary, which the
+Gram teacher anchors to), and its absolute --gram_refresh_steps at cycle boundaries are K x epoch_length + i x epoch_length.
 """
 import argparse
 import csv
@@ -79,8 +110,8 @@ from torch import nn
 
 from accelerator import Accelerator
 from models import DINOV3_VITB16_KWARGS
-from ssl_dinov3.data import (DATASET_NAMES, DataAugmentationCXR, build_data_loader, build_dataset, make_collate_fn,
-                             set_epoch)
+from ssl_dinov3.data import (DATASET_NAMES, DataAugmentationCXR, SSLImageDataset, build_data_loader, build_dataset, image_paths,
+                             make_collate_fn, set_epoch)
 from ssl_dinov3.meta import SSLMetaArch
 from ssl_dinov3.model import HEAD_KWARGS, build_models, export_backbone
 from ssl_dinov3.optim import apply_optim_scheduler, build_optimizer, build_schedules, get_params_groups
@@ -89,30 +120,39 @@ from utils import get_config
 CLIP_GRAD = 3.0  # dinov3 optim.clip_grad, applied per student submodule
 FREEZE_LAST_LAYER_EPOCHS = 1  # dinov3 optim.freeze_last_layer_epochs
 # dino_global .. total: global means over ranks (Ark-style: host-built tensor all-reduced); step_time / data_time: see run()
+# dataset: the batch's dataset under --cyclic_ark_teacher, "-" otherwise (last, so the 15 columns before it are the ones they always were)
 CSV_HEADER = ["step", "epoch", "dino_global", "dino_local", "koleo", "ibot", "gram", "total", "lr", "wd", "momentum",
-              "teacher_temp", "gram_weight", "step_time", "data_time"]
+              "teacher_temp", "gram_weight", "step_time", "data_time", "dataset"]
 LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "ibot_loss", "gram_loss")
 # what shapes the run: a --resume must match its checkpoint on these (the other flags may change between invocations).
 # init_from_checkpoint: a run started from one resumes only with the same one (not re-applied then); any other run's checkpoint is refused
 # no_gram: a no-Gram run resumes only as one (its checkpoint has no Gram teacher), and a Gram run never as one
 # branch_from: a branch resumes only as the same branch (its source is read only at its start); a trunk or any other run never as one
 # drop_path_rate / rope_rescale_coords / untie_local_cls_norm: the student's training recipe (its forward; untied, its parameters too)
+# cyclic_ark_teacher / ark_teacher_momentum / teacher_clean_view / heads / switch_lock_steps / keep_all_checkpoints: the Ark-teacher mode (its data order,
+# teacher rule, teacher views, head parameters, backbone locks, checkpoint record); a --branch_from must match them too (none is branch-free)
 RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_lr_scaling", "warmup_epochs",
                 "weight_decay", "momentum_teacher", "teacher_temp_warmup_epochs", "gram_weight", "global_crops_size",
                 "local_crops_size", "gram_teacher_size", "gram_refresh_steps", "freeze_backbone_epochs", "local_crops_number",
                 "seed", "bf16", "world_size", "init_from_checkpoint", "no_gram", "branch_from", "drop_path_rate",
-                "rope_rescale_coords", "untie_local_cls_norm")
+                "rope_rescale_coords", "untie_local_cls_norm", "cyclic_ark_teacher", "ark_teacher_momentum", "teacher_clean_view", "heads",
+                "switch_lock_steps", "keep_all_checkpoints")
 # checkpoints written before the crop-size flags existed (pilots, main, constlr) were all trained at these
 CROP_DEFAULTS = dict(global_crops_size=224, local_crops_size=96, gram_teacher_size=448)
-# keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off, no --branch_from, and no
-# recipe setting (drop path 0, no RoPE rescale, tied CLS norm)
-ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None, drop_path_rate=0.0, rope_rescale_coords=None, untie_local_cls_norm=False)
+# keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off, no --branch_from, no
+# recipe setting (drop path 0, no RoPE rescale, tied CLS norm), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads,
+# no switch locks, the pruned checkpoint record)
+ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None, drop_path_rate=0.0, rope_rescale_coords=None, untie_local_cls_norm=False,
+                    cyclic_ark_teacher=False, ark_teacher_momentum=None, teacher_clean_view=False, heads="shared", switch_lock_steps=0,
+                    keep_all_checkpoints=False)
 # what a --branch_from start may differ from its source in (check_resume skips these): the Gram switch and knobs the branch turns on, the path itself,
 # and the source's own init provenance (its full state is restored; a branch cannot pass --init_from_checkpoint, so it would always differ)
 BRANCH_FREE = ("no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from", "init_from_checkpoint")
 BRANCH_SOURCE_KEYS = ("student", "teacher", "optimizer", "step", "epoch", "rng", "args", "world_size")  # a full epoch checkpoint (save_state)
 PATCH_SIZE = 16  # DINOV3_VITB16_KWARGS patch_size: every crop side must be a multiple of it
 DEFAULT_GRAM_REFRESH_STEPS = "10000,20000,30000"  # --gram_refresh_steps when not given (Meta's three refreshes); --no_gram: none
+DEFAULT_MOMENTUM_TEACHER = 0.999  # --momentum_teacher when not given; --cyclic_ark_teacher: none (no per-step EMA)
+ARK_TEACHER_MOMENTUM, SWITCH_LOCK_STEPS = 0.8, 100  # --ark_teacher_momentum / --switch_lock_steps when not given, under --cyclic_ark_teacher
 
 
 def parse_steps(text):
@@ -161,7 +201,8 @@ def parse_args(argv=None):
                    help="--lr/--min_lr are absolute (default: scaled by dinov3's sqrt_wrt_1024 rule)")
     p.add_argument("--warmup_epochs", type=int, default=4)
     p.add_argument("--weight_decay", type=float, default=0.04)
-    p.add_argument("--momentum_teacher", type=float, default=0.999)
+    p.add_argument("--momentum_teacher", type=float, default=None,
+                   help=f"per-step EMA teacher momentum (default {DEFAULT_MOMENTUM_TEACHER}); refused with --cyclic_ark_teacher, which has no per-step EMA")
     p.add_argument("--teacher_temp_warmup_epochs", type=int, default=12)
     p.add_argument("--no_gram", action="store_true",
                    help="train with no Gram teacher at all (none built or loaded, no Gram loss, no refreshes); the 2026-10-23 trunk run")
@@ -186,6 +227,20 @@ def parse_args(argv=None):
     p.add_argument("--untie_local_cls_norm", action="store_true",
                    help="a second student LayerNorm for the local crops' CLS and register tokens (Meta's untie_global_and_local_cls_norm); "
                         "train mode only, initialized from the stock norm, not exported")
+    p.add_argument("--cyclic_ark_teacher", action="store_true",
+                   help="the Ark+ / FX teacher: a cycle (= one epoch) is one pass over each --data_set in turn, largest first, every batch from one "
+                        "dataset; no per-step EMA: at the end of every dataset epoch teacher <- m x teacher + (1 - m) x student (--ark_teacher_momentum), "
+                        "backbone and all heads; implies --teacher_clean_view")
+    p.add_argument("--ark_teacher_momentum", type=float, default=None,
+                   help=f"--cyclic_ark_teacher only: m, the old teacher's weight in the blend at every dataset-epoch end, in [0, 1) (default {ARK_TEACHER_MOMENTUM})")
+    p.add_argument("--teacher_clean_view", action="store_true",
+                   help="the EMA teacher scores the global crops' geometry only (the student's crop + flip, resized to --global_crops_size; no color "
+                        "jitter, no blur); the student's and the Gram teacher's crops are unchanged. Implied by --cyclic_ark_teacher")
+    p.add_argument("--heads", choices=("shared", "per_dataset"), default="shared",
+                   help="per_dataset (--cyclic_ark_teacher only): one DINO and one iBOT head per dataset, student and teacher, the batch's pair used")
+    p.add_argument("--switch_lock_steps", type=int, default=None,
+                   help=f"--cyclic_ark_teacher only: backbone LR 0 (heads train) for the first N steps of every dataset epoch (default {SWITCH_LOCK_STEPS})")
+    p.add_argument("--keep_all_checkpoints", action="store_true", help="never prune ckpt/epoch_*.pth (default: the last 3 and every 10th are kept)")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--workers", type=int, default=16)
     p.add_argument("--seed", type=int, default=100)
@@ -222,6 +277,31 @@ def parse_args(argv=None):
             args.gram_refresh_steps = parse_steps(DEFAULT_GRAM_REFRESH_STEPS)
     if args.gram_teacher_size is None:
         args.gram_teacher_size = 2 * args.global_crops_size
+    if args.cyclic_ark_teacher:  # the teacher moves only at dataset-epoch ends, so the per-step momentum has nothing to act on
+        if args.momentum_teacher is not None:
+            p.error("--momentum_teacher cannot be combined with --cyclic_ark_teacher (there is no per-step EMA: the teacher is blended at every "
+                    "dataset-epoch end with --ark_teacher_momentum)")
+        if len(set(args.data_set)) != len(args.data_set):
+            p.error(f"--cyclic_ark_teacher needs every --data_set once (a cycle is one pass over each dataset), got {args.data_set}")
+        args.teacher_clean_view = True  # implied (given as well, it is the same run)
+        if args.ark_teacher_momentum is None:
+            args.ark_teacher_momentum = ARK_TEACHER_MOMENTUM
+        if not 0.0 <= args.ark_teacher_momentum < 1.0:  # 1 would never move the teacher (and NaN fails both)
+            p.error(f"--ark_teacher_momentum must be in [0, 1), got {args.ark_teacher_momentum}")
+        if args.switch_lock_steps is None:
+            args.switch_lock_steps = SWITCH_LOCK_STEPS
+        if args.switch_lock_steps < 0:
+            p.error(f"--switch_lock_steps must be >= 0, got {args.switch_lock_steps}")
+    else:  # a mixed batch has no dataset: nothing to blend at, lock after or pick a head by
+        for name, why in (("ark_teacher_momentum", "there is no dataset-epoch end to blend the teacher at"),
+                          ("switch_lock_steps", "there is no dataset switch to lock the backbone after")):
+            if getattr(args, name) is not None:
+                p.error(f"--{name} needs --cyclic_ark_teacher ({why})")
+        if args.heads == "per_dataset":
+            p.error("--heads per_dataset needs --cyclic_ark_teacher (a mixed batch has no single dataset to pick a head pair by)")
+        args.switch_lock_steps = 0
+        if args.momentum_teacher is None:
+            args.momentum_teacher = DEFAULT_MOMENTUM_TEACHER
     return args
 
 
@@ -363,7 +443,8 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                   untie_global_and_local_cls_norm=args.untie_local_cls_norm)
     student, teacher, gram_teacher = build_models(dict(vit_kwargs or DINOV3_VITB16_KWARGS, **recipe),
                                                   None if weights_from else args.pretrained_weights,
-                                                  head_kwargs or HEAD_KWARGS, gram=not args.no_gram)
+                                                  head_kwargs or HEAD_KWARGS, gram=not args.no_gram,
+                                                  heads=list(args.data_set) if args.heads == "per_dataset" else None)
     # the init and the EMA / Gram copies are done: from here each rank draws its own model-side randomness (drop path, RoPE rescale), as Meta seeds
     # seed + rank; rank 0 keeps args.seed. The data loaders seed per rank themselves (build_data_loader, set_epoch)
     random.seed(args.seed + rank)
@@ -378,6 +459,12 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     if args.no_gram:
         say("Gram: OFF (--no_gram): no Gram teacher built or loaded, no Gram loss, no Gram refreshes; "
             "ssl_losses.csv gram and gram_weight columns are 0.0")
+    if args.heads == "per_dataset":
+        say(f"heads: per_dataset: one DINO and one iBOT head per dataset ({', '.join(args.data_set)}), student and EMA teacher; each step trains and "
+            "scores with its batch's pair only")
+    if args.teacher_clean_view:
+        say(f"teacher views: clean (--teacher_clean_view{', implied by --cyclic_ark_teacher' if args.cyclic_ark_teacher else ''}): the EMA teacher scores the "
+            f"global crops' crop + flip only, resized to {args.global_crops_size}, no color jitter or blur; the student's and the Gram teacher's crops are unchanged")
     # a resume of this run restores its own checkpoint below instead (check_resume: same init_from_checkpoint or refused)
     if args.init_from_checkpoint and not resuming_own:
         init = torch.load(args.init_from_checkpoint, map_location="cpu", weights_only=False)
@@ -398,9 +485,16 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     student, teacher = student.to(device), teacher.to(device)
     if gram_teacher is not None:
         gram_teacher = gram_teacher.to(device)
-    # Meta calls student.backbone / dino_head / ibot_head separately, so each is its own DDP module; every parameter gets a gradient every step (docstring)
-    student = nn.ModuleDict({k: accelerator.wrap_model(m, find_unused_parameters=False) for k, m in student.items()})
-    student_unwrapped = nn.ModuleDict({k: accelerator.unwrap_model(m) for k, m in student.items()})
+    # Meta calls student.backbone / dino_head / ibot_head separately, so each is its own DDP module, and so is each dataset's head under --heads
+    # per_dataset (a step runs only its batch's pair: the others see no forward); every parameter of a module that runs gets a gradient (docstring)
+    def wrap(m):
+        return nn.ModuleDict({k: wrap(v) for k, v in m.items()}) if isinstance(m, nn.ModuleDict) else accelerator.wrap_model(m, find_unused_parameters=False)
+
+    def unwrap(m):
+        return nn.ModuleDict({k: unwrap(v) for k, v in m.items()}) if isinstance(m, nn.ModuleDict) else accelerator.unwrap_model(m)
+
+    student = wrap(student)
+    student_unwrapped = unwrap(student)
     meta = SSLMetaArch(student, teacher, gram_teacher, n_local_crops=args.local_crops_number,
                        gram_loss_weight=args.gram_weight,
                        autocast_dtype=torch.bfloat16 if args.bf16 else None).to(device)
@@ -409,7 +503,7 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
 
     transform = DataAugmentationCXR(local_crops_number=args.local_crops_number, global_crops_size=args.global_crops_size,
                                     local_crops_size=args.local_crops_size, gram_teacher_crops_size=args.gram_teacher_size,
-                                    emit_gram_teacher_crops=not args.no_gram)
+                                    emit_gram_teacher_crops=not args.no_gram, teacher_no_distortions=args.teacher_clean_view)
     decode_side = transform.decode_min_side  # follows the crop sizes: 1024 for 224 / 96 / 448 (as before), 2368 for 512 / 224 / 1024
     gram_crops_note = (f"no Gram teacher (global crops cut at {args.gram_teacher_size} and resized to {args.global_crops_size}, as in the "
                        "Gram runs)" if args.no_gram else f"Gram teacher {args.gram_teacher_size}")
@@ -418,12 +512,35 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     if datasets_config is None:
         datasets_config = get_config(args.datasets_config)
     dataset = build_dataset(args.data_set, datasets_config, transform, check_exists=check_exists and main, decode_side=decode_side)
+    collate_fn = make_collate_fn(global_crops_size=args.global_crops_size, teacher_crops=args.teacher_clean_view)
     loader, sampler = build_data_loader(dataset, args.batch_size_per_gpu, args.workers, rank, world_size, args.seed,
-                                        accelerator.pin_memory, make_collate_fn(global_crops_size=args.global_crops_size))
+                                        accelerator.pin_memory, collate_fn)  # --cyclic_ark_teacher: built, never iterated
     epoch_length = len(loader)
     data_fingerprint = hashlib.sha256("\n".join(dataset.paths).encode()).hexdigest()  # resume guard
     if epoch_length == 0:
         raise ValueError(f"{len(dataset)} images give no full batch of {args.batch_size_per_gpu} x {world_size} ranks")
+    if args.cyclic_ark_teacher:  # one loader (its own DistributedSampler) per dataset, largest first; the cycle is the epoch
+        parts = {name: SSLImageDataset(image_paths(name, datasets_config[name]["data_dir"], datasets_config[name]["train_list"]), transform, decode_side)
+                 for name in args.data_set}
+        assert [path for name in args.data_set for path in parts[name].paths] == dataset.paths  # the same images, so the same fingerprint
+        order = sorted(args.data_set, key=lambda name: -len(parts[name]))  # by image count, largest first; a tie keeps the --data_set order
+        loaders = {name: build_data_loader(parts[name], args.batch_size_per_gpu, args.workers, rank, world_size, args.seed, accelerator.pin_memory,
+                                           collate_fn) for name in order}
+        lengths = {name: len(loaders[name][0]) for name in order}
+        empty = [name for name in order if lengths[name] == 0]
+        if empty:
+            raise ValueError(f"--cyclic_ark_teacher: {', '.join(f'{name} ({len(parts[name])} images)' for name in empty)} give no full batch of "
+                             f"{args.batch_size_per_gpu} x {world_size} ranks")
+        starts = dict(zip(order, np.cumsum([0] + [lengths[name] for name in order[:-1]]).tolist()))  # each dataset epoch's first step within a cycle
+        epoch_length = sum(lengths.values())
+        say(f"cycle (--cyclic_ark_teacher): each dataset in turn, largest first by image count, every batch from one dataset: "
+            + ", ".join(f"{name} {len(parts[name])} images / {lengths[name]} steps" for name in order) + f"; {epoch_length} steps a cycle (= one epoch)")
+        say(f"teacher (--cyclic_ark_teacher): no per-step EMA; after the last step of every dataset epoch teacher <- {args.ark_teacher_momentum:g} x teacher + "
+            f"{1 - args.ark_teacher_momentum:g} x student (backbone and all heads); backbone LR 0 for the first {args.switch_lock_steps} steps of every dataset epoch")
+        for name in order:
+            if 0 < lengths[name] <= args.switch_lock_steps:
+                say(f"NOTE: {name}'s dataset epoch is {lengths[name]} steps, not more than --switch_lock_steps {args.switch_lock_steps}: its backbone stays at LR 0 "
+                    "for the whole of it (its heads train)")
 
     global_batch = args.batch_size_per_gpu * world_size
     sch = build_schedules(lr=args.lr, min_lr=args.min_lr, epochs=args.epochs, warmup_epochs=args.warmup_epochs,
@@ -493,9 +610,10 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     csv_path = os.path.join(out, "ssl_losses.csv")
     if main:  # fresh: overwrite. Resume: keep the rows of finished steps, drop those of the interrupted epoch
         kept = []
-        if step and os.path.exists(csv_path):
+        if step and os.path.exists(csv_path):  # a row written before the dataset column (15 columns, a mixed-batch run) keeps its place with "-" there
             with open(csv_path, newline="") as f:
-                kept = [r for r in list(csv.reader(f))[1:] if len(r) == len(CSV_HEADER) and r[0].isdigit() and int(r[0]) < step]
+                kept = [r + ["-"] * (len(CSV_HEADER) - len(r)) for r in list(csv.reader(f))[1:]
+                        if len(r) in (len(CSV_HEADER) - 1, len(CSV_HEADER)) and r[0].isdigit() and int(r[0]) < step]
         with open(csv_path, "w", newline="") as f:
             csv.writer(f).writerows([CSV_HEADER] + kept)
 
@@ -531,17 +649,40 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
         return (f"Gram refresh {k}/{len(args.gram_refresh_steps)} after step {s}: Gram teacher <- EMA teacher backbone; "
                 f"gram loss before (step {s - 1} row) {before:.6f}, {tail}")
 
+    def cycle_batches(cycle):  # --cyclic_ark_teacher: each dataset's batches in cycle order, each tagged with its dataset (SSLMetaArch picks the heads by it)
+        for j, name in enumerate(order):
+            # each dataset epoch gets its own set_epoch index, so no two share a sampler permutation seed or a worker base seed (per rank, as before)
+            set_epoch(*loaders[name], cycle * len(order) + j, args.seed, rank)
+            for data in loaders[name][0]:
+                data["dataset"] = name
+                yield data
+
     t_start = time.time()
     for epoch in range(epochs_done, stop_epoch):
-        set_epoch(loader, sampler, epoch, args.seed, rank)
+        if args.cyclic_ark_teacher:
+            batches = cycle_batches(epoch)  # set_epoch per dataset, as each one starts
+        else:
+            set_epoch(loader, sampler, epoch, args.seed, rank)
+            batches = loader
         freeze = epoch < args.freeze_backbone_epochs  # ours: backbone LR 0 while the heads warm up
         t_epoch = t_mark = t_data = time.time()
         n_mark, data_wait = 0, 0.0
-        for data in loader:
+        for data in batches:
             data_wait += time.time() - t_data
             it = step
+            name = data.get("dataset", "-")  # the CSV's dataset column
+            # --cyclic_ark_teacher: the step's place in its dataset epoch, the lock at its start, and the teacher blend after its last step
+            in_dataset = it - epoch * epoch_length - starts[name] if args.cyclic_ark_teacher else None
+            lock = args.cyclic_ark_teacher and in_dataset < args.switch_lock_steps
+            blend = args.cyclic_ark_teacher and in_dataset == lengths[name] - 1
+            if args.cyclic_ark_teacher and in_dataset == 0:
+                k = order.index(name)
+                came_from = order[k - 1] if k else order[-1] if epoch else "start"
+                say(f"dataset switch after step {it}: {came_from} -> {name} (cycle {epoch}, dataset {k + 1}/{len(order)}, {lengths[name]} steps): backbone LR 0 "
+                    f"for its first {min(args.switch_lock_steps, lengths[name])} steps (--switch_lock_steps {args.switch_lock_steps}"
+                    + ("; a no-op in this frozen cycle)" if freeze else ")"))
             lr, temp = float(sch["lr"][it]), float(sch["teacher_temp"][it])
-            apply_optim_scheduler(optimizer, lr, args.weight_decay, float(sch["last_layer_lr"][it]), freeze_backbone=freeze)
+            apply_optim_scheduler(optimizer, lr, args.weight_decay, float(sch["last_layer_lr"][it]), freeze_backbone=freeze or lock)
             optimizer.zero_grad(set_to_none=True)
             loss, loss_dict = meta.forward_backward(data, teacher_temp=temp)
             accelerator.mark_step()
@@ -549,8 +690,14 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                 torch.nn.utils.clip_grad_norm_(module.parameters(), max_norm=CLIP_GRAD)
             optimizer.step()
             accelerator.mark_step()
-            meta.update_ema(args.momentum_teacher)
-            accelerator.mark_step()
+            if not args.cyclic_ark_teacher:
+                meta.update_ema(args.momentum_teacher)
+                accelerator.mark_step()
+            elif blend:  # Ark+ / FX: the teacher moves once per dataset epoch, frozen in between (update_ema's foreach blend over every student parameter)
+                meta.update_ema(args.ark_teacher_momentum)
+                accelerator.mark_step()
+                say(f"teacher blend after step {it + 1} (end of {name}'s epoch, cycle {epoch}, dataset {order.index(name) + 1}/{len(order)}): teacher <- "
+                    f"{args.ark_teacher_momentum:g} x teacher + {1 - args.ark_teacher_momentum:g} x student, backbone and all heads")
             step += 1
             n_mark += 1
             refreshed = step in refresh_steps and step not in gram_refreshes
@@ -561,7 +708,7 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
             # no host sync outside these steps: every print_freq, around a Gram refresh, the first step of the run
             # (compile time), the last step of every epoch (so a NaN is caught before a checkpoint) and of the run
             if (step % args.print_freq == 0 or refreshed or (step - 1) in gram_refreshes or step == first_step + 1
-                    or step % epoch_length == 0 or step == end_step):
+                    or step % epoch_length == 0 or step == end_step or blend):  # blend: the last step of a dataset epoch (a NaN is caught there too)
                 # Ark's trainer.py pattern: host reads (.item(), one per scalar) of tensors the mark_step() calls above already
                 # materialized, then a tensor built from those Python floats is all-reduced and divided by world_size on the
                 # host. Never a torch.stack of the lazy loss tensors: all_reduce(stack(...)) died on Gaudi in HPU lazy mode
@@ -576,13 +723,16 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                 # under HPU lazy mode one step can't be timed without a sync, so these are per-step means over the
                 # steps since the previous row (this sync closes the window)
                 step_time, data_time = (now - t_mark) / n_mark, data_wait / n_mark
+                # momentum: the teacher momentum this step applied; --cyclic_ark_teacher: 1.0 (the teacher is frozen) but at a dataset epoch's last step
+                momentum = args.momentum_teacher if not args.cyclic_ark_teacher else args.ark_teacher_momentum if blend else 1.0
                 if main:
                     with open(csv_path, "a", newline="") as f:
                         csv.writer(f).writerow([it, epoch, dg, dl, ko, ib, gr, total, lr, args.weight_decay,
-                                                args.momentum_teacher, temp, args.gram_weight, step_time, data_time])
+                                                momentum, temp, args.gram_weight, step_time, data_time, name])
                     print(f"step {step}/{total_steps} epoch {epoch} | dino_g {dg:.4f} dino_l {dl:.4f} koleo {ko:.4f} "
                           f"ibot {ib:.4f} gram {gr:.5f} total {total:.4f} | lr {lr:.3e} temp {temp:.4f} | "
-                          f"{step_time:.3f}s/step data {data_time:.3f}s | elapsed {now - t_start:.0f}s", flush=True)
+                          f"{step_time:.3f}s/step data {data_time:.3f}s | elapsed {now - t_start:.0f}s"
+                          + (f" | {name}" if args.cyclic_ark_teacher else ""), flush=True)
                 if pending and step - 1 == pending[1]:
                     say(gram_line(*pending, gr))
                     pending = None
@@ -600,7 +750,7 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
             epochs_done = epoch + 1
             save_state(os.path.join(ckpt_dir, "epoch_%04d.pth" % epochs_done),
                        os.path.join(export_dir, "teacher_backbone_epoch_%04d.pth" % epochs_done))
-            if main:
+            if main and not args.keep_all_checkpoints:
                 prune_checkpoints(ckpt_dir)
             say(f"epoch {epochs_done}/{args.epochs} done in {epoch_time:.0f}s ({epoch_time / epoch_length:.3f} s/step); "
                 f"projected remaining: {(stop_epoch - epochs_done) * epoch_time / 3600:.2f} h to epoch {stop_epoch} "

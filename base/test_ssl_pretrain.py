@@ -40,7 +40,7 @@ WEIGHTS = next((p for p in (os.environ.get("DINOV3_VITB16_WEIGHTS", ""), os.path
 TINY_VIT = dict(DINOV3_VITB16_KWARGS, embed_dim=64, depth=2, num_heads=2, ffn_ratio=2)
 TINY_HEADS = dict(out_dim=128, hidden_dim=64, bottleneck_dim=32, nlayers=3)
 LOSS_KEYS = {"dino_local_crops_loss", "dino_global_crops_loss", "koleo_loss", "ibot_loss", "gram_loss"}
-CSV_HEADER = "step,epoch,dino_global,dino_local,koleo,ibot,gram,total,lr,wd,momentum,teacher_temp,gram_weight,step_time,data_time"
+CSV_HEADER = "step,epoch,dino_global,dino_local,koleo,ibot,gram,total,lr,wd,momentum,teacher_temp,gram_weight,step_time,data_time,dataset"
 
 TMP = tempfile.mkdtemp()
 atexit.register(shutil.rmtree, TMP, ignore_errors=True)
@@ -274,7 +274,7 @@ rows_a, rows_b = read_csv(DIR_A), read_csv(DIR_B)
 for rows in (rows_a, rows_b):
     assert ",".join(rows[0]) == CSV_HEADER
     steps = [int(r[0]) for r in rows[1:]]
-    assert steps == sorted(set(steps)) and steps[0] == 0 and steps[-1] == 17 and len(rows[1]) == 15  # 0-based, no duplicates
+    assert steps == sorted(set(steps)) and steps[0] == 0 and steps[-1] == 17 and len(rows[1]) == 16  # 0-based, no duplicates
     assert all(int(r[1]) == int(r[0]) // 6 for r in rows[1:])  # epoch = step // epoch_length, 0-based
     assert {3, 4, 7, 8} <= set(steps)  # the rows either side of each Gram refresh
 assert open(os.path.join(DIR_A, "ssl_losses.csv")).read().startswith(csv_a1)  # the resume kept the finished rows as written
@@ -863,7 +863,7 @@ for out in (NG_A, NG_B):
     rows = read_csv(out)
     assert ",".join(rows[0]) == CSV_HEADER and len(rows) > 3
     for row in rows[1:]:
-        assert len(row) == 15 and row[ng_gram] == "0.0" and row[ng_gram_weight] == "0.0", row  # both columns present and numeric, never blank
+        assert len(row) == 16 and row[ng_gram] == "0.0" and row[ng_gram_weight] == "0.0", row  # both columns present and numeric, never blank
         dg, dl, ko, ib, total = (float(row[ng_cols.index(c)]) for c in ("dino_global", "dino_local", "koleo", "ibot", "total"))
         assert all(map(math.isfinite, (dg, dl, ko, ib, total))) and math.isclose(total, 16 / 18 * dl + 2 / 18 * dg + 0.2 * ko + ib, rel_tol=1e-5), row
 print("OK (s) end to end: A (1 epoch, then --resume to 2) and B (2 epochs) with --no_gram: SSLMetaArch got gram_teacher None in all 3 runs, none of the %d "

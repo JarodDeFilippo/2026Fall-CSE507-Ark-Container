@@ -111,7 +111,10 @@ class DataAugmentationCXR:
     gram_teacher_crops_size=None drops the gram crops; 224 makes them the same size as the global crops.
     emit_gram_teacher_crops=False (--no_gram) leaves "gram_teacher_crops" out of the output and changes nothing else: the global crop is
     still cut at max(global, Gram size) and resized to the global size, same decode side, same RNG draws, so the student / teacher crops are
-    bitwise those of the Gram run with the same sizes."""
+    bitwise those of the Gram run with the same sizes.
+    teacher_no_distortions=True (--teacher_clean_view) is Meta's teacher_no_color_jitter for every photometric step: "global_crops_teacher" holds the
+    two global crops' geometry only (the student's RandomResizedCrop + flip, i.e. the undistorted base the Gram crops are cut from, resized to the
+    global size), with no color jitter and no blur; it draws no RNG, so every other crop is bitwise the same as with False."""
 
     def __init__(
         self,
@@ -125,9 +128,11 @@ class DataAugmentationCXR:
         mean=IMAGENET_MEAN,
         std=IMAGENET_STD,
         emit_gram_teacher_crops=True,
+        teacher_no_distortions=False,
     ):
         self.local_crops_number = local_crops_number
         self.emit_gram_teacher_crops = emit_gram_teacher_crops
+        self.teacher_no_distortions = teacher_no_distortions
         bicubic = v2.InterpolationMode.BICUBIC
         flip = 0.5 if horizontal_flips else 0.0
 
@@ -160,6 +165,7 @@ class DataAugmentationCXR:
         if gram_teacher_crops_size is not None:
             resize_global = v2.Resize(global_crops_size, interpolation=bicubic)
             self.resize_gram_teacher = v2.Resize(gram_teacher_crops_size, interpolation=bicubic)
+        self.resize_global = resize_global  # also cuts the clean teacher crops (teacher_no_distortions) at the global size
 
         # CXR (RAD-DINO-style) value; DINOv3 default ColorJitter(0.4, 0.4, 0.2, 0.1) + RandomGrayscale(p=0.2).
         # No saturation/hue/grayscale here: the images are already grayscale.
@@ -188,7 +194,10 @@ class DataAugmentationCXR:
         im2_base = self.geometric_augmentation_global(image)
         global_crop_2 = self.global_transfo2(im2_base)
         output["global_crops"] = [global_crop_1, global_crop_2]
-        output["global_crops_teacher"] = [global_crop_1, global_crop_2]
+        if self.teacher_no_distortions:  # the same crop + flip, resized as the student's is before its distortions, and none of them
+            output["global_crops_teacher"] = [self.normalize(self.resize_global(im1_base)), self.normalize(self.resize_global(im2_base))]
+        else:
+            output["global_crops_teacher"] = [global_crop_1, global_crop_2]
 
         # gram teacher crops: same crop as the global ones, no distortions
         if self.resize_gram_teacher is not None and self.emit_gram_teacher_crops:
@@ -204,7 +213,7 @@ class DataAugmentationCXR:
         return output
 
 
-def _collate_checked(samples, collate):
+def _collate_checked(samples, collate, teacher_crops=False):
     out = collate(samples)
     # The vendored collate draws exactly int(N*p) patches per masked sample (MaskingGenerator.complete_mask_randomly),
     # so the masked-patch count equals `upperbound` every step: the static shape HPU lazy mode needs. If it ever
@@ -215,6 +224,11 @@ def _collate_checked(samples, collate):
         f"masked-patch count {n_masked} != upperbound {out['upperbound']}: iBOT tensor shapes would change "
         "from step to step and HPU lazy mode would recompile the graph"
     )
+    if teacher_crops:  # --teacher_clean_view: the EMA teacher's own global crops, stacked as collate stacks the student's (crop 1 of every image, then crop 2)
+        n_global_crops = len(samples[0][0]["global_crops"])
+        out["collated_global_crops_teacher"] = torch.stack(
+            [s[0]["global_crops_teacher"][i] for i in range(n_global_crops) for s in samples]
+        ).to(out["collated_global_crops"].dtype)
     return out
 
 
@@ -224,9 +238,11 @@ def make_collate_fn(
     mask_ratio_min_max=(0.1, 0.5),
     mask_sample_probability=0.5,
     dtype=torch.float32,
+    teacher_crops=False,
 ):
     """collate_data_and_cast + MaskingGenerator built as build_data_loader_from_cfg does (no multidistillation).
-    Picklable (a partial of top-level functions), so DataLoader workers may use spawn."""
+    Picklable (a partial of top-level functions), so DataLoader workers may use spawn. teacher_crops=True (--teacher_clean_view) also stacks
+    the samples' "global_crops_teacher" into "collated_global_crops_teacher" (the vendored collate, like Meta's, never reads them)."""
     img_size = global_crops_size
     n_tokens = (img_size // patch_size) ** 2
     mask_generator = MaskingGenerator(
@@ -243,7 +259,7 @@ def make_collate_fn(
         random_circular_shift=False,
         local_batch_size=None,
     )
-    return functools.partial(_collate_checked, collate=collate)
+    return functools.partial(_collate_checked, collate=collate, teacher_crops=teacher_crops)
 
 
 def build_data_loader(dataset, batch_size_per_gpu, num_workers, rank, world_size, seed, pin_memory, collate_fn):

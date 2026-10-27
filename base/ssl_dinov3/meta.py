@@ -3,7 +3,10 @@ get_student_output, get_gram_teacher_output, compute_losses, update_ema, update_
 sinkhorn_knopp centering, separate iBOT head, global_ignore_diagonal, non-distributed KoLeo (weight 0.1), no local-loss
 reweighting, Gram from a separate teacher (ema_teacher false) on all tokens, normalized, img_level, remove_neg false,
 bicubic resize without antialias, constant Gram weight. Method bodies follow Meta's line for line; differences are marked.
-gram_teacher=None is the no-Gram mode (--no_gram): no Gram teacher forward, no Gram loss term, no gram_loss key."""
+gram_teacher=None is the no-Gram mode (--no_gram): no Gram teacher forward, no Gram loss term, no gram_loss key.
+Ours, from the batch (ssl_pretrain.py puts them there; a batch without them runs exactly as before): "collated_global_crops_teacher"
+(--teacher_clean_view) are the global crops the EMA teacher scores instead of the student's, and "dataset" (--cyclic_ark_teacher) picks the
+head pair when dino_head / ibot_head are nn.ModuleDicts keyed by dataset name (--heads per_dataset; teacher and student alike)."""
 import contextlib
 
 import torch
@@ -30,9 +33,9 @@ class SSLMetaArch(nn.Module):
         self.ema_params_lists = None
         self.gram_params_lists = None
 
-        n_prototypes = teacher.dino_head.last_layer.out_features
+        n_prototypes = self._heads(teacher, None)[0].last_layer.out_features  # --heads per_dataset: every head is built alike (HEAD_KWARGS)
         self.dino_loss = DINOLoss(n_prototypes)
-        self.ibot_patch_loss = iBOTPatchLoss(teacher.ibot_head.last_layer.out_features)
+        self.ibot_patch_loss = iBOTPatchLoss(self._heads(teacher, None)[1].last_layer.out_features)
         self.koleo_loss = KoLeoLoss()
         self.gram_loss = (GramLoss(apply_norm=True, remove_only_teacher_neg=False, remove_neg=False)
                           if self.gram_teacher is not None else None)
@@ -51,6 +54,14 @@ class SSLMetaArch(nn.Module):
         self.gram_global_teacher_resize_antialias = False
         # ours: optional bf16 autocast around the forward passes only (Meta uses FSDP mixed precision instead)
         self.autocast_dtype = autocast_dtype
+
+    @staticmethod
+    def _heads(model, dataset):
+        """(dino_head, ibot_head) of model: the shared pair, or under --heads per_dataset that dataset's (None: the first, for the sizes)."""
+        if not isinstance(model.dino_head, nn.ModuleDict):
+            return model.dino_head, model.ibot_head
+        name = next(iter(model.dino_head)) if dataset is None else dataset
+        return model.dino_head[name], model.ibot_head[name]
 
     def _autocast(self, device):
         if self.autocast_dtype is None:
@@ -74,14 +85,19 @@ class SSLMetaArch(nn.Module):
         n_masked_patches_tensor = data["n_masked_patches"].to(device=device, dtype=torch.float32, non_blocking=True)
         if self.gram_teacher is not None:  # no-Gram mode: the batch has no Gram crops
             gram_teacher_crops = data["collated_gram_teacher_crops"].to(device, non_blocking=True)
+        # ours: --teacher_clean_view gives the EMA teacher its own undistorted global crops; without them it scores the student's (Meta's default)
+        teacher_crops = data.get("collated_global_crops_teacher")
+        teacher_crops = global_crops if teacher_crops is None else teacher_crops.to(device, non_blocking=True)
+        dataset = data.get("dataset")  # ours: --cyclic_ark_teacher's one dataset per batch, which picks the head pair under --heads per_dataset
 
         with self._autocast(device):
             teacher_global = self.get_teacher_output(
-                global_crops.unflatten(0, (n_global_crops, B)),
+                teacher_crops.unflatten(0, (n_global_crops, B)),
                 teacher_temp=teacher_temp,
                 n_masked_patches_tensor=n_masked_patches_tensor,
                 mask_indices_list=mask_indices_list,
                 upperbound=data["upperbound"],
+                dataset=dataset,
             )
             student_global, student_local = self.get_student_output(
                 global_crops=global_crops.unflatten(0, (n_global_crops, B)),
@@ -89,6 +105,7 @@ class SSLMetaArch(nn.Module):
                 upperbound=data["upperbound"],
                 masks=masks,
                 mask_indices_list=mask_indices_list,
+                dataset=dataset,
             )
             if self.gram_teacher is None:  # no-Gram mode: no Gram forward, compute_losses skips the Gram loss
                 gram_global = None
@@ -114,7 +131,8 @@ class SSLMetaArch(nn.Module):
         return loss_accumulator, loss_dict
 
     @torch.no_grad()
-    def get_teacher_output(self, images, *, upperbound, mask_indices_list, teacher_temp, n_masked_patches_tensor):
+    def get_teacher_output(self, images, *, upperbound, mask_indices_list, teacher_temp, n_masked_patches_tensor, dataset=None):
+        dino_head, ibot_head = self._heads(self.teacher, dataset)  # ours: the batch's pair under --heads per_dataset
         n_crops, B, rgb, H, W = images.shape
         images = images.flatten(0, 1)
 
@@ -125,10 +143,10 @@ class SSLMetaArch(nn.Module):
 
         # IBOT head only on patches that are masked for the student
         buffer = torch.index_select(ibot_patch.flatten(0, 1), dim=0, index=mask_indices_list)
-        masked_patch_after_head = self.teacher.ibot_head(buffer)
+        masked_patch_after_head = ibot_head(buffer)
 
         # DINO head on CLS tokens
-        cls_after_head = self.teacher.dino_head(cls)  # [n_crops * B, K]
+        cls_after_head = dino_head(cls)  # [n_crops * B, K]
 
         # Center with sinkhorn-knopp
         cls_centered = self.dino_loss.sinkhorn_knopp_teacher(cls_after_head, teacher_temp=teacher_temp)
@@ -179,7 +197,8 @@ class SSLMetaArch(nn.Module):
         # gram.tokens_used == "all": every patch, masked or not
         return {"student_patches": student_patches, "teacher_patches": teacher_patches}
 
-    def get_student_output(self, *, global_crops, local_crops, upperbound, masks, mask_indices_list):
+    def get_student_output(self, *, global_crops, local_crops, upperbound, masks, mask_indices_list, dataset=None):
+        dino_head, ibot_head = self._heads(self.student, dataset)  # ours: the batch's pair under --heads per_dataset
         n_global_crops, B, rgb, H, W = global_crops.shape
         n_local_crops, B, rgb, H, W = local_crops.shape
 
@@ -197,13 +216,13 @@ class SSLMetaArch(nn.Module):
 
         # IBOT head only on masked patches
         masked_patches_pre_head = torch.index_select(g_patch.flatten(0, 1), dim=0, index=mask_indices_list)
-        global_masked_patch_after_head = self.student.ibot_head(masked_patches_pre_head)
+        global_masked_patch_after_head = ibot_head(masked_patches_pre_head)
 
         # DINO head on CLS tokens (all in one pass)
         buffer = [g_cls, l_cls]
         sizes = [x.shape[0] for x in buffer]
         buffer = torch.cat(buffer, dim=0)
-        buffer = self.student.dino_head(buffer)
+        buffer = dino_head(buffer)
         buffer = torch.split_with_sizes(buffer, sizes, dim=0)
 
         global_out = {
@@ -256,7 +275,7 @@ class SSLMetaArch(nn.Module):
         loss_dict["dino_global_crops_loss"] = dino_global_crops_loss
         loss_accumulator += self.dino_loss_weight * dino_global_scale * dino_global_crops_loss
 
-        # Koleo: regularize pre-head CLS tokens of student(global crops)
+        # Koleo: regularize pre-head CLS tokens of student(global crops) (the backbone's CLS: no head, so --heads per_dataset leaves it alone)
         koleo_loss = sum(self.koleo_loss(x) for x in student_global["cls_pre_head"]) / n_global_crops
         loss_dict["koleo_loss"] = koleo_loss
         loss_accumulator += self.dino_koleo_loss_weight * koleo_scale * koleo_loss
