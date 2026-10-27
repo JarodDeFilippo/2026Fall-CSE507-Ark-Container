@@ -2561,9 +2561,9 @@ assert nogram_parsed.output_dir == NOGRAM_RUN != default_parsed.output_dir
 # the wrapper: bash -n and the executable bit are checked with the other scripts above; here its sbatch header, its guards and its last line
 nogram_lines = open(os.path.join(REPO, "run_d1_8_constlr_nogram_gaudi.sh")).read().splitlines()
 assert [line[len("#SBATCH "):] for line in nogram_lines if line.startswith("#SBATCH ")] == [
-    "--job-name=d1-8-nogram", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"], nogram_lines
+    "--job-name=d1-8-nogram", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=128G"], nogram_lines
 nogram_code = [line for line in nogram_lines if line and not line.startswith("#")]
-assert nogram_code[-1] == "CONSTLR_NOGRAM=1 exec ./chain/constlr.sh", nogram_code
+assert nogram_code[-1] == "CONSTLR_ABLATE= CONSTLR_NOGRAM=1 exec ./chain/constlr.sh", nogram_code  # clears an inherited CONSTLR_ABLATE (checked by running it, with the ablation block below)
 for needle in ("export PT_HPU_LAZY_MODE=1", "CONSTLR_NOGRAM=1", "exec ./chain/constlr.sh", "./gaudi_check_cards.sh || exit 1", "[[ -x ./gaudi_verify_busy.sh ]]", "./gaudi_verify_busy.sh 900 &"):
     assert any(needle in line for line in nogram_code), needle  # in a command, not only in a comment
 assert all(line.startswith("#") for line in nogram_lines if "phases.txt" in line), nogram_lines  # not a chain phase: phases.txt is named in comments only
@@ -2747,7 +2747,7 @@ assert bres.stdout.splitlines() == ["run: ssl_dinov3_cxr_constlr_nogram_seed_100
 assert stat.S_IMODE(os.stat(BRANCH_SCRIPT).st_mode) == 0o755
 branch_lines = open(BRANCH_SCRIPT).read().splitlines()
 assert [line[len("#SBATCH "):] for line in branch_lines if line.startswith("#SBATCH ")] == [
-    "--job-name=d1-8-branch", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"], branch_lines
+    "--job-name=d1-8-branch", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=128G"], branch_lines
 branch_code = [line for line in branch_lines if line and not line.startswith("#")]
 assert branch_code[-1] == "CONSTLR_BRANCH_EPOCH=$1 CONSTLR_BRANCH_STOP=$2 CONSTLR_BRANCH_EVERY=${3:-10000} CONSTLR_BRANCH_COUNT=${4:-3} exec ./chain/constlr.sh", branch_code
 branch_needles = ("export PT_HPU_LAZY_MODE=1", "[[ $# -ge 2 && $# -le 4 ]]", BRANCH_CD, "./gaudi_check_cards.sh || exit 1", "[[ -x ./gaudi_verify_busy.sh ]]", "./gaudi_verify_busy.sh 900 &")
@@ -2857,7 +2857,7 @@ assert stat.S_IMODE(os.stat(PLAIN_SCRIPT).st_mode) == 0o755
 plain_text = open(PLAIN_SCRIPT).read()
 plain_lines = plain_text.splitlines()
 assert [line[len("#SBATCH "):] for line in plain_lines if line.startswith("#SBATCH ")] == [
-    "--job-name=d1-8-nogram-plain", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"], plain_lines
+    "--job-name=d1-8-nogram-plain", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=128G"], plain_lines
 plain_code = [line for line in plain_lines if line and not line.startswith("#")]
 assert plain_code[-1] == "CONSTLR_NOGRAM=1 CONSTLR_PLAIN=1 exec ./chain/constlr.sh" and plain_code[:-1] == nogram_code[:-1], plain_code
 for needle in ("export PT_HPU_LAZY_MODE=1", "CONSTLR_NOGRAM=1", "CONSTLR_PLAIN=1", "exec ./chain/constlr.sh", "./gaudi_check_cards.sh || exit 1", "[[ -x ./gaudi_verify_busy.sh ]]", "./gaudi_verify_busy.sh 900 &"):
@@ -3041,7 +3041,7 @@ for script in (ARK_SCRIPT, ARK_SMOKE):
 ark_text = open(ARK_SCRIPT).read()
 ark_lines = ark_text.splitlines()
 assert [line[len("#SBATCH "):] for line in ark_lines if line.startswith("#SBATCH ")] == [
-    "--job-name=d1-8-arkteacher", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"], ark_lines
+    "--job-name=d1-8-arkteacher", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=128G"], ark_lines
 ark_code = [line for line in ark_lines if line and not line.startswith("#")]
 assert ark_code[-1] == "CONSTLR_NOGRAM=1 CONSTLR_ARK=1 exec ./chain/constlr.sh" and ark_code[:-1] == nogram_code[:-1], ark_code
 assert all(line.startswith("#") for line in ark_lines if "phases.txt" in line), ark_lines
@@ -3062,7 +3062,7 @@ for lock, env, stop in (("0", ALLOC4, "70"), ("1", dict(ALLOC4, CONSTLR_ARK_LOCK
 assert os.path.exists(os.path.join(ark_wrap_root, "cards_checked"))
 smoke_text = open(ARK_SMOKE).read()
 assert [line[len("#SBATCH "):] for line in smoke_text.splitlines() if line.startswith("#SBATCH ")] == [
-    "--job-name=d1-8-arkteacher-smoke", "-A grp_jliang12", "-p gaudi", "-q public", "-t 01:15:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"]
+    "--job-name=d1-8-arkteacher-smoke", "-A grp_jliang12", "-p gaudi", "-q public", "-t 01:15:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=128G"]
 smoke_root = sandbox(timing=True)
 shutil.copy(ARK_SMOKE, smoke_root)
 for lock, smoke_env, smoke_dir in (("0", dict(ALLOC4, ARK_ROOT=smoke_root), "ssl_dinov3_cxr_arkteacher_smoke_seed_100"),
@@ -3222,9 +3222,9 @@ assert stat.S_IMODE(os.stat(ABLATE_SCRIPT).st_mode) == 0o755
 ablate_text = open(ABLATE_SCRIPT).read()
 ablate_lines = ablate_text.splitlines()
 assert [line[len("#SBATCH "):] for line in ablate_lines if line.startswith("#SBATCH ")] == [
-    "--job-name=d1-8-nogram-no", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"], ablate_lines  # the job name is completed on the sbatch line
+    "--job-name=d1-8-nogram-no", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=128G"], ablate_lines  # the job name is completed on the sbatch line
 ablate_code = [line for line in ablate_lines if line and not line.startswith("#")]
-assert ablate_code[-1] == "CONSTLR_NOGRAM=1 exec ./chain/constlr.sh" and ablate_code == nogram_code[:1] + ablate_code[1:2] + nogram_code[1:], ablate_code
+assert ablate_code[-1] == "CONSTLR_NOGRAM=1 exec ./chain/constlr.sh" and ablate_code[:-1] == nogram_code[:1] + ablate_code[1:2] + nogram_code[1:-1], ablate_code  # its last line keeps the CONSTLR_ABLATE the no-Gram trunk's clears
 assert ablate_code[1].startswith("[[ -n ${CONSTLR_ABLATE:-} ]] || {") and ablate_code[1].endswith("exit 1; }") and all(arm in ablate_code[1] for arm in ABLATE_ARMS), ablate_code[1]  # names the three
 assert all(line.startswith("#") for line in ablate_lines if "phases.txt" in line), ablate_lines  # not a chain phase: phases.txt is named in comments only
 for arm, (off, kept, _, _) in ABLATE_ARMS.items():  # the comments: each arm's submit line (its stop file first, its own job name) and the note and trainer line its log must show
@@ -3278,6 +3278,52 @@ print("OK (k) ablation arms: constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_ABLATE=dro
       "files in all, none shared), printing the arm and the flag removed in its run: line; the argv parses to the no-Gram trunk's settings but for the run dir and that one recipe setting at its default; CONSTLR_ABLATE "
       "other than empty or the three values, without CONSTLR_NOGRAM=1, or with CONSTLR_PLAIN, CONSTLR_ARK or any CONSTLR_BRANCH_* is refused with its exact text before anything is read; the phase, the no-Gram trunk, "
       "the plain trunk, both Ark-teacher arms and the no-Gram trunk's branches launch and print exactly as before with CONSTLR_ABLATE unset or empty and the arms' stop files present or absent")
+
+# an exported CONSTLR_ABLATE reaches every launcher (sbatch hands a job the submitting shell's environment): the no-Gram trunk's launcher clears it on its last line and launches the trunk, never an arm; the plain and
+# the Ark-teacher launchers refuse it (constlr.sh above: CONSTLR_PLAIN / CONSTLR_ARK set), as does the branch wrapper (checked above) and the chain's constlr phase (no CONSTLR_NOGRAM), so none of them turns into an arm;
+# the two smoke launchers call ssl_launch with their own flags, not chain/constlr.sh
+NOGRAM_SCRIPT = os.path.join(REPO, "run_d1_8_constlr_nogram_gaudi.sh")
+
+
+def inherited_run(script, files, env):  # a copy of the launcher with its cd pointed at a sandbox holding main_lr.txt and these stop files, started from elsewhere: (result, argv or None)
+    root = sandbox(timing=True)
+    open(os.path.join(root, "chain", "main_lr.txt"), "w").write("0.002\n")
+    for name, content in files.items():
+        open(os.path.join(root, "chain", name), "w").write(content)
+    text = open(script).read()
+    assert text.count(BRANCH_CD) == 1, (script, BRANCH_CD)
+    open(os.path.join(root, "launcher.sh"), "w").write(text.replace(BRANCH_CD, "cd %s || exit 1" % shlex.quote(root)))
+    return subprocess.run(["bash", os.path.join(root, "launcher.sh")], cwd=branch_elsewhere, env=env, capture_output=True, text=True), launched(root)
+
+
+every_stop_file = {"constlr_stop_after.txt": "30\n", "constlr_nogram_stop_after.txt": "100\n", PLAIN_STOP_FILE: "60\n", ARK_STOP_FILE: "70\n", ARK_LOCK_STOP_FILE: "80\n",
+                   **{ABLATE_FILES[arm]: ABLATE_STOPS[arm] + "\n" for arm in ABLATE_ARMS}}  # every stop file there is, so that a launch of the wrong run would show in the argv
+for env in (ALLOC4, *(dict(ALLOC4, CONSTLR_ABLATE=value) for value in (*ABLATE_ARMS, "", "bogus"))):  # exported or not, an arm, empty or not even a value: the no-Gram trunk, always
+    result, wrapped_argv = inherited_run(NOGRAM_SCRIPT, every_stop_file, env)
+    assert result.returncode == 0 and result.stderr == "" and wrapped_argv == nogram_argv_for("100") and result.stdout.splitlines() == [NOGRAM_RUN_LINE % "100"], (constlr_vars(env), result.stderr, wrapped_argv)
+for script, env, expected_error, expected_argv in ((PLAIN_SCRIPT, ALLOC4, ABLATE_NO_PLAIN, plain_argv_for("60")), (ARK_SCRIPT, ALLOC4, ABLATE_NO_ARK, ark_argv_for("70", "0")),
+                                                   (ARK_SCRIPT, dict(ALLOC4, CONSTLR_ARK_LOCK="1"), ABLATE_NO_ARK, ark_argv_for("80", "1"))):
+    result, wrapped_argv = inherited_run(script, every_stop_file, dict(env, CONSTLR_ABLATE="rope"))
+    assert result.returncode == 1 and result.stdout == "" and result.stderr == expected_error and wrapped_argv is None, (script, result.stderr)
+    result, wrapped_argv = inherited_run(script, every_stop_file, env)  # without it, the same launcher launches its own run
+    assert result.returncode == 0 and result.stderr == "" and wrapped_argv == expected_argv, (script, result.stderr, wrapped_argv)
+for script in (os.path.join(REPO, "run_d1_8_nogram_smoke_gaudi.sh"), ARK_SMOKE):
+    assert not any("constlr.sh" in line or "CONSTLR_ABLATE" in line for line in open(script).read().splitlines() if line and not line.startswith("#")), script
+# the memory request of the SSL launchers below: 128G with one comment line right after it (the same wording in each: what was measured, and why not 256G), the last directive and before any command. The others (the chain driver,
+# the Gram-512 twin, the timing and sweep jobs, the older arms) keep their own
+MEM_NOTE = ("# 128G: measured 2026-10-26 on the running no-Gram trunk (4 cards, 72 CPUs, job 66633863): proportional set size of all its processes 53.3 GB; sstat MaxRSS reports the request itself because page cache is "
+            "charged to the job cgroup; 256G could not share a Gaudi node with another lab's 1-card jobs that allocate 511 of 515 GB; Sol's own floor is 2 GB per CPU, it accepts a lower request with a notice.")
+MEM_LAUNCHERS = ("run_d1_8_constlr_arkteacher_gaudi.sh", "run_d1_8_arkteacher_smoke_gaudi.sh", "run_d1_8_constlr_nogram_gaudi.sh", "run_d1_8_constlr_nogram_plain_gaudi.sh", "run_d1_8_nogram_smoke_gaudi.sh",
+                 "run_d1_8_branch_gram_gaudi.sh", "run_d1_8_constlr_nogram_ablate_gaudi.sh")
+for name in MEM_LAUNCHERS:
+    mem_lines = open(os.path.join(REPO, name)).read().splitlines()
+    mem_at = mem_lines.index("#SBATCH --mem=128G")
+    assert mem_lines.count("#SBATCH --mem=128G") == 1 and mem_lines[mem_at + 1] == MEM_NOTE and mem_lines.count(MEM_NOTE) == 1, name
+    assert [line for line in mem_lines if line.startswith("#SBATCH ")][-1] == "#SBATCH --mem=128G" and mem_at < min(i for i, line in enumerate(mem_lines) if line and not line.startswith("#")), name
+    assert not any("--mem=256G" in line for line in mem_lines if line.startswith("#SBATCH ")), name
+print("OK (k) launchers: an exported CONSTLR_ABLATE (an arm, empty or not a value) leaves run_d1_8_constlr_nogram_gaudi.sh launching the no-Gram trunk (its last line clears it), while the plain and the Ark-teacher "
+      "launchers (both arms) refuse it with the exact CONSTLR_ABLATE text and launch their own run without it; the two smoke launchers never reach chain/constlr.sh; the no-Gram trunk, plain, Ark-teacher, branch, "
+      "ablation and both smoke launchers ask for --mem=128G with the same measured-memory comment line right after it (the last directive, before any command)")
 
 # hires.sh ("DINO-X ConstLR 512 px"): a separate run from the stock weights, constlr.sh with only the crops and the batch changed. Four setting files,
 # each missing or invalid one refused naming it before gaudi.sh is reached (the LR file is constlr's own main_lr.txt)

@@ -7,7 +7,8 @@
 #SBATCH -N 1
 #SBATCH --gres=gpu:hl225:4
 #SBATCH -c 72
-#SBATCH --mem=256G
+#SBATCH --mem=128G
+# 128G: measured 2026-10-26 on the running no-Gram trunk (4 cards, 72 CPUs, job 66633863): proportional set size of all its processes 53.3 GB; sstat MaxRSS reports the request itself because page cache is charged to the job cgroup; 256G could not share a Gaudi node with another lab's 1-card jobs that allocate 511 of 515 GB; Sol's own floor is 2 GB per CPU, it accepts a lower request with a notice.
 # DINO-X ConstLR 224, no Gram: the trunk of the Gram-anchored runs (decided 2026-10-23 by Jarod, with his professor's input). It is the `constlr` chain phase (chain/constlr.sh, run dir
 # ssl_dinov3_cxr_constlr_seed_100) with the Gram teacher off: the same launch line (ssl_launch's stock DINOv3 ViT-B/16 init, chain/main_lr.txt as the absolute peak LR, --min_lr = --lr, --no_lr_scaling, the
 # --epochs 1000 ceiling, 64 per card on 4 cards = global batch 256, seed 100, 224 / 96 crops still cut at 448 and resized to 224 exactly as in the Gram run) with --no_gram in place of --gram_refresh_steps
@@ -29,4 +30,6 @@ cd /scratch/$USER/2026Fall-CSE507-Ark-Container || exit 1
 # report-only: at 15 min, log whether every allocated card is busy (gaudi_verify_busy.sh)
 [[ -x ./gaudi_verify_busy.sh ]] || { echo "ERROR: gaudi_verify_busy.sh missing or not executable; refusing to train unverified" >&2; exit 1; }
 ./gaudi_verify_busy.sh 900 &
-CONSTLR_NOGRAM=1 exec ./chain/constlr.sh
+# CONSTLR_ABLATE= clears the variable: sbatch hands a job the submitting shell's environment, and an exported CONSTLR_ABLATE would make chain/constlr.sh launch that ablation arm
+# (run_d1_8_constlr_nogram_ablate_gaudi.sh, which takes it from its sbatch line on purpose) in place of this trunk
+CONSTLR_ABLATE= CONSTLR_NOGRAM=1 exec ./chain/constlr.sh

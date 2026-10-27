@@ -7,7 +7,8 @@
 #SBATCH -N 1
 #SBATCH --gres=gpu:hl225:4
 #SBATCH -c 72
-#SBATCH --mem=256G
+#SBATCH --mem=128G
+# 128G: measured 2026-10-26 on the running no-Gram trunk (4 cards, 72 CPUs, job 66633863): proportional set size of all its processes 53.3 GB; sstat MaxRSS reports the request itself because page cache is charged to the job cgroup; 256G could not share a Gaudi node with another lab's 1-card jobs that allocate 511 of 515 GB; Sol's own floor is 2 GB per CPU, it accepts a lower request with a notice.
 # Standalone timing job for the Stage A SSL trainer (optional; the chain's phases run inside their own allocation).
 # Submit from the repo root, or set ARK_ROOT to it.
 cd "${ARK_ROOT:-${SLURM_SUBMIT_DIR:?sbatch from the repo root or set ARK_ROOT}}" || exit 1

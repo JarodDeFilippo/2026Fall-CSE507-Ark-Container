@@ -7,7 +7,8 @@
 #SBATCH -N 1
 #SBATCH --gres=gpu:hl225:4
 #SBATCH -c 72
-#SBATCH --mem=256G
+#SBATCH --mem=128G
+# 128G: measured 2026-10-26 on the running no-Gram trunk (4 cards, 72 CPUs, job 66633863): proportional set size of all its processes 53.3 GB; sstat MaxRSS reports the request itself because page cache is charged to the job cgroup; 256G could not share a Gaudi node with another lab's 1-card jobs that allocate 511 of 515 GB; Sol's own floor is 2 GB per CPU, it accepts a lower request with a notice.
 # DINO-X ConstLR 224, no Gram, one recipe flag off: the one-flag-off ablations of the no-Gram trunk, for group members to submit, one arm each (Jarod, 2026-10-26). The no-Gram trunk (run_d1_8_constlr_nogram_gaudi.sh, run dir
 # ssl_dinov3_cxr_constlr_nogram_seed_100) passes all three settings of DINOv3's training recipe, --drop_path_rate 0.3 --rope_rescale_coords 2 --untie_local_cls_norm; the plain trunk (run_d1_8_constlr_nogram_plain_gaudi.sh, run dir
 # ssl_dinov3_cxr_constlr_nogram_plain_seed_100) passes none. Each arm here is the no-Gram trunk's launch line with exactly ONE of the three removed and nothing else changed (ssl_launch's stock DINOv3 ViT-B/16 init, chain/main_lr.txt as
@@ -22,7 +23,7 @@
 # drop_path removes --drop_path_rate 0.3, rope removes --rope_rescale_coords 2, local_norm removes --untie_local_cls_norm; the other two stay. Arm <value> runs in ssl_dinov3_cxr_constlr_nogram_no_<value>_seed_100 and reads only
 # chain/constlr_nogram_no_<value>_stop_after.txt, so the arms share no run dir or stop file with each other or with the trunks and can run side by side. CONSTLR_ABLATE is required: without it chain/constlr.sh would take CONSTLR_NOGRAM=1 alone
 # for the no-Gram trunk and launch its run dir, so this script refuses to start (an ERROR naming the three values), and chain/constlr.sh refuses any value but those three. Pass it on the sbatch line only, never export it in the shell: sbatch hands
-# the submitting shell's environment to every job, so the no-Gram trunk's launcher would start that arm in place of the trunk.
+# the submitting shell's environment to every job (the no-Gram trunk's launcher clears it; the plain, Ark-teacher and branch launchers and the chain's constlr phase refuse to start with it set).
 # Re-submit (to continue or extend an arm): pass the SAME CONSTLR_ABLATE, the sbatch part of the arm's line only (the echo would put the stop epoch back to 100). The value picks the run dir and the stop file, so another value launches a
 # different run, in a different run dir. To extend an arm: raise its own stop file and re-submit; it resumes from its last epoch checkpoint (--resume locks no_gram, the LR, the ceiling and the three recipe settings, not the stop epoch).
 # 4 cards, not 8: the global batch (Sinkhorn-Knopp centering and the DINO / iBOT statistics are computed over all ranks) and the per-card batch (KoLeo is computed per card) both match the no-Gram trunk.
