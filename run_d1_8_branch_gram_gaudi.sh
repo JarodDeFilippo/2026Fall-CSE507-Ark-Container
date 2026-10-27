@@ -24,8 +24,8 @@
 # appended to the line) instead of the branch point's, and the run dir gets _gt<J %04d> right after _e<K %04d>. DINOv3's rule (Sec. 4.2; App. C p. 58): the Gram teacher is an early iteration of the
 # teacher, whose dense features are better, switched on late with w_Gram 2 and refreshed from the EMA teacher every 10k steps, at most three times. The planned run (Jarod, 2026-10-27):
 #   sbatch run_d1_8_branch_gram_gaudi.sh 100 130 2666 3 10  -> ssl_dinov3_cxr_constlr_nogram_e0100_gt0010_gram_every2666x3_seed_100, the Gram teacher from trunk epoch 10 (ckpt/epoch_0010.pth, which the
-#                                                              trunk keeps), refreshed after steps 269266,271932,274598: one epoch apart, three of them (100 x the trunk's epoch_length, read from its
-#                                                              args.json as above, + 2666 i)
+#                                                              trunk keeps), refreshed after steps 269266,271932,274598 = 100 x the trunk's epoch_length 2666 (read from its args.json as above)
+#                                                              + 2666 i: one epoch apart, three of them
 # Pass the same five arguments on every re-submit of such a branch: without the fifth the same K / STOP / EVERY / COUNT name the branch without it, another run dir, which would start over from
 # the source. Without the fifth argument nothing changes: the line, the run dir and the printed lines are the four-argument ones (an inherited CONSTLR_BRANCH_GRAM_EPOCH is cleared on the last line).
 # chain/constlr.sh owns the recipe (the LR file, --min_lr = --lr, --no_lr_scaling, the 1000 ceiling, ssl_launch); the setting on the last line is its CONSTLR_BRANCH_* override. It validates everything and prints

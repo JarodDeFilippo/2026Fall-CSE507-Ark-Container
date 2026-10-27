@@ -923,7 +923,7 @@ print("OK (s) --no_gram --init_from_checkpoint: a Gram run's full checkpoint loa
 # parse: --branch_from stands in for --pretrained_weights, needs --gram_refresh_steps (none allowed: an anchor that never refreshes) and refuses --no_gram / --init_from_checkpoint
 PB = lambda *extra: ssl_pretrain.parse_args(["--data_set", "MIMIC", "--output_dir", "o", "--branch_from", "x.pth"] + list(extra))
 assert P().branch_from is None and ssl_pretrain.ARG_DEFAULTS["branch_from"] is None and "branch_from" in ssl_pretrain.RESUME_MATCH
-assert set(ssl_pretrain.BRANCH_FREE) == {"no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from", "init_from_checkpoint"}
+assert set(ssl_pretrain.BRANCH_FREE) == {"no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from", "init_from_checkpoint", "gram_teacher_from"}
 branch_parsed = PB("--gram_refresh_steps", "5")  # no --pretrained_weights
 assert (branch_parsed.branch_from, branch_parsed.pretrained_weights, branch_parsed.no_gram, branch_parsed.gram_weight, branch_parsed.gram_teacher_size,
         branch_parsed.gram_refresh_steps) == ("x.pth", None, False, 2.0, 448, [5])
@@ -1122,6 +1122,85 @@ print("OK (t) refusals: a missing source (FileNotFoundError), an export/teacher_
       "another --lr / --seed (naming the difference, the Gram keys and branch_from skipped), a different image list, world size 4 and epoch length 5 (through load_branch_source), "
       "a refresh step at (6) or before (3) the branch step, and a stop epoch not after the source's: each ValueError (or FileNotFoundError) names its cause and leaves the "
       "output dir uncreated")
+
+# --gram_teacher_from (DINOv3's early-teacher rule, Sec. 4.2; App. C p. 58): a branch whose Gram teacher is an EARLIER epoch checkpoint's EMA teacher backbone, of the source's own run; the student,
+# EMA teacher, optimizer, step and RNG are still the source's. parse: --branch_from only, never with --no_gram / --init_from_checkpoint (each refused with its own text, before anything is read), an
+# empty path refused; None by default and in an old checkpoint (ARG_DEFAULTS); locked on --resume; branch-free against the source (a no-Gram trunk never has one)
+assert P().gram_teacher_from is None and ssl_pretrain.ARG_DEFAULTS["gram_teacher_from"] is None and "gram_teacher_from" in ssl_pretrain.RESUME_MATCH
+assert PB("--gram_refresh_steps", "5", "--gram_teacher_from", "g.pth").gram_teacher_from == "g.pth" and PB("--gram_refresh_steps", "5").gram_teacher_from is None
+GT_NEEDS_BRANCH = "--gram_teacher_from needs --branch_from: it replaces the Gram teacher a branch takes from its source with an earlier checkpoint's"
+GT_NO_NOGRAM = "--gram_teacher_from cannot be combined with --no_gram (there is no Gram teacher to anchor)"
+GT_NO_INIT = "--gram_teacher_from cannot be combined with --init_from_checkpoint (an --init_from_checkpoint run anchors its Gram teacher to that checkpoint's EMA teacher)"
+for argv, complaint in (([], GT_NEEDS_BRANCH), (["--no_gram"], GT_NO_NOGRAM), (["--init_from_checkpoint", "c.pth"], GT_NO_INIT),
+                        (["--branch_from", "x.pth", "--no_gram"], GT_NO_NOGRAM), (["--branch_from", "x.pth", "--gram_refresh_steps", "5", "--init_from_checkpoint", "c.pth"], GT_NO_INIT)):
+    with contextlib.redirect_stderr(io.StringIO()) as err:  # P passes --pretrained_weights, so the only fault is the Gram teacher's (with --branch_from, its refusal comes first)
+        assert raises(SystemExit, P, "--gram_teacher_from", "g.pth", *argv) == "2"
+    assert err.getvalue().split("error: ", 1)[1] == complaint + "\n", (argv, err.getvalue())
+with contextlib.redirect_stderr(io.StringIO()) as err:
+    assert raises(SystemExit, PB, "--gram_refresh_steps", "5", "--gram_teacher_from", "") == "2"
+assert err.getvalue().split("error: ", 1)[1] == "--gram_teacher_from is empty: pass a checkpoint path, or leave the flag out\n", err.getvalue()
+print("OK (t) --gram_teacher_from parse: None by default (= ARG_DEFAULTS, locked on --resume, branch-free); with --branch_from it is recorded as given; without --branch_from, with --no_gram or "
+      "--init_from_checkpoint (with --branch_from as well) or empty it exits 2 with its own text")
+
+# a real branch on CPU: GT_T, a tiny no-Gram trunk saving epochs 1 and 2, then a branch of its epoch 2 with --gram_teacher_from its epoch 1. Before the first step the Gram teacher is epoch 1's EMA teacher
+# backbone, tensor-equal (and not epoch 2's, which the default would load: epoch 2 trained the backbone), while the student, the EMA teacher and the step are epoch 2's
+GT_T, GT_BR = os.path.join(TMP, "GT_T"), os.path.join(TMP, "GT_BR")
+go(GT_T, "--no_gram", "--stop_after_epochs", "2")
+GT_E1, GT_E2 = (os.path.join(GT_T, "ckpt", "epoch_%04d.pth" % epoch) for epoch in (1, 2))
+gt_e1, gt_e2 = (torch.load(path, map_location="cpu", weights_only=False) for path in (GT_E1, GT_E2))
+assert (gt_e1["epoch"], gt_e2["epoch"], gt_e2["step"]) == (1, 2, 12) and gt_e1["args"]["output_dir"] == gt_e2["args"]["output_dir"] == GT_T
+gt_anchor = {k: v for k, v in gt_e1["teacher"].items() if k.startswith("backbone.")}
+assert not same_state(gt_anchor, {k: v for k, v in gt_e2["teacher"].items() if k.startswith("backbone.")})  # the check below tells the two apart
+GT_ARGS = ["--branch_from", GT_E2, "--gram_refresh_steps", "100", "--resume", "--stop_after_epochs", "3"]  # no refresh in the run: the anchor stays to the end
+br_first.clear()
+SSLMetaArch.forward_backward = br_forward_backward  # (t)'s first-step spy: the models as the first step sees them
+try:
+    summary_gt, text_gt = go(GT_BR, *GT_ARGS, "--gram_teacher_from", GT_E1)
+finally:
+    SSLMetaArch.forward_backward = real_forward_backward
+assert same_state(br_first[0]["gram_teacher"], gt_anchor), "the Gram teacher is not epoch 1's EMA teacher backbone"
+assert same_state(br_first[0]["teacher"], gt_e2["teacher"]) and same_state(br_first[0]["student"], gt_e2["student"])  # the rest is the branch point's, as without the flag
+assert (f"branched from {GT_E2}: its step 12, epoch 2; student/teacher/optimizer/RNG restored; Gram teacher <- EMA teacher backbone of {GT_E1} (its epoch 1); Gram ON, weight 2, "
+        "refreshes after steps [100]") in text_gt.splitlines(), text_gt
+assert (summary_gt["step"], summary_gt["epoch"], summary_gt["gram_refreshes"]) == (18, 3, []) and read_csv(GT_BR)[1][0] == "12"  # the branch continues at epoch 2's step
+ck_gt = load_ckpt(GT_BR, "epoch_0003.pth")
+assert same_state(ck_gt["gram_teacher"], gt_anchor) and (ck_gt["args"]["gram_teacher_from"], ck_gt["args"]["branch_from"]) == (GT_E1, GT_E2)  # the checkpoint carries it
+info_gt = json.load(open(os.path.join(GT_BR, "args.json")))
+assert (info_gt["gram_teacher_from"], info_gt["branch_from"]) == (GT_E1, GT_E2) and json.load(open(os.path.join(GT_T, "args.json")))["gram_teacher_from"] is None
+# --resume of the branch: the flag is locked (omitted, another checkpoint of the run, or a path that does not exist: refused naming it, args.json untouched); the same one resumes, its file not read
+gt_record = open(os.path.join(GT_BR, "args.json")).read()
+for extra, now in (([], None), (["--gram_teacher_from", GT_E2], GT_E2), (["--gram_teacher_from", os.path.join(TMP, "elsewhere_gt.pth")], os.path.join(TMP, "elsewhere_gt.pth"))):
+    message = raises(ValueError, go, GT_BR, *GT_ARGS, *extra)
+    assert "cannot --resume" in message and ("gram_teacher_from: checkpoint %r, now %r" % (GT_E1, now)) in message, message
+    assert open(os.path.join(GT_BR, "args.json")).read() == gt_record
+os.rename(GT_E1, GT_E1 + ".away")  # read only at the branch's start, as the source
+try:
+    summary_gtr, text_gtr = go(GT_BR, *GT_ARGS, "--gram_teacher_from", GT_E1)
+finally:
+    os.rename(GT_E1 + ".away", GT_E1)
+assert "resumed from" in text_gtr and "nothing to do: 3 epochs done" in text_gtr and summary_gtr["epoch"] == 3, text_gtr
+# refusals at the branch's start, each in a fresh dir (br_refused: nothing created), the source checks passed: a missing file, an export, the same epoch, a later one, another run's checkpoint
+# (BR_T's epoch 1: the same settings, another run dir), each naming both files
+GTX = ["--branch_from", GT_E2, "--stop_after_epochs", "3", "--gram_teacher_from"]
+gt_missing = os.path.join(TMP, "no_such_gt.pth")
+assert br_refused("gt_missing", FileNotFoundError, *GTX, gt_missing) == "--gram_teacher_from %s is not a file" % gt_missing
+gt_export = os.path.join(GT_T, "export", "teacher_backbone_epoch_0001.pth")
+assert br_refused("gt_export", ValueError, *GTX, gt_export) == ("--gram_teacher_from %s is not a full epoch checkpoint (student, teacher, optimizer, step, epoch, rng, args, world_size); an "
+                                                                 "export/teacher_backbone_*.pth holds the backbone only" % gt_export)
+GT_LATE = "--gram_teacher_from %s is from epoch %d, not before the epoch %d of --branch_from %s: the Gram teacher is an earlier iteration of the teacher (DINOv3 Sec. 4.2)"
+assert br_refused("gt_same", ValueError, *GTX, GT_E2) == GT_LATE % (GT_E2, 2, 2, GT_E2)
+assert br_refused("gt_later", ValueError, *GTX, GT_E2, "--branch_from", GT_E1) == GT_LATE % (GT_E2, 2, 1, GT_E1)  # the later flag wins: a branch of epoch 1
+assert br_refused("gt_other_run", ValueError, *GTX, SRC1) == ("--gram_teacher_from %s is not of the run of --branch_from %s: its output_dir is %r, the source's %r" % (SRC1, GT_E2, BR_T, GT_T))
+# the run is the output_dir both checkpoints record, not the file's path: a copy of epoch 1 elsewhere is the same run (through the helper, as load_branch_source above)
+GT_COPY = os.path.join(TMP, "gt_epoch_0001_copy.pth")
+shutil.copy(GT_E1, GT_COPY)
+copy_anchor, copy_epoch = ssl_pretrain.load_gram_teacher_source(make_args(os.path.join(TMP, "gtx_helper"), *GT_ARGS, "--gram_teacher_from", GT_COPY), gt_e2)
+assert copy_epoch == 1 and same_state(copy_anchor, gt_anchor) and not os.path.exists(os.path.join(TMP, "gtx_helper"))
+print("OK (t) --gram_teacher_from: a branch of the no-Gram trunk's epoch 2 with the Gram teacher from its epoch 1: before the first step the Gram teacher is epoch 1's EMA teacher backbone, tensor-equal "
+      "(not epoch 2's), and the student / EMA teacher are epoch 2's, the step 12; the 'branched from' line names the file and its epoch; without a refresh it is still epoch 1's at epoch 3; the "
+      "checkpoint and args.json record it (the trunk's None); a --resume without it, with another checkpoint or a missing path is refused naming it (args.json untouched), the same one resumes "
+      "with the file gone; at the start a missing file (FileNotFoundError), an export, the same epoch, a later epoch and another run dir's checkpoint are refused with nothing created, and the "
+      "same-run test reads the recorded output_dir (a copy of epoch 1 elsewhere passes)")
 
 # (u) DINOv3 recipe: --drop_path_rate, --rope_rescale_coords, --untie_local_cls_norm (the student's; train mode only) ------------------------------------------
 from dinov3.models.vision_transformer import DinoVisionTransformer
@@ -2675,7 +2754,7 @@ assert all(getattr(bparsed, k) == getattr(tparsed, k) for k in branch_locked_ali
 assert bparsed.pretrained_weights == tparsed.pretrained_weights and bparsed.stop_after_epochs == tparsed.stop_after_epochs == 40
 # refusals, each before anything is launched: exit 1, an ERROR naming the culprit, nothing on stdout, gaudi.sh never reached
 usage_dir = branch_root()
-for args in ((), ("10",), ("10", "40", "10000", "3", "x")):
+for args in ((), ("10",), ("10", "40", "10000", "3", "5", "x")):
     branch_refused(usage_dir, args, "usage", "got %d arguments" % len(args))
 assert not os.path.exists(os.path.join(usage_dir, "cards_checked")), "the card check ran before the usage guard"  # not even the card check ran, so the argument count is the wrapper's first guard
 for value in ("abc", "0", "-1", "1.5", "010"):  # 010: printf %04d would read it as octal
@@ -2749,15 +2828,16 @@ branch_lines = open(BRANCH_SCRIPT).read().splitlines()
 assert [line[len("#SBATCH "):] for line in branch_lines if line.startswith("#SBATCH ")] == [
     "--job-name=d1-8-branch", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=128G"], branch_lines
 branch_code = [line for line in branch_lines if line and not line.startswith("#")]
-assert branch_code[-1] == "CONSTLR_BRANCH_EPOCH=$1 CONSTLR_BRANCH_STOP=$2 CONSTLR_BRANCH_EVERY=${3:-10000} CONSTLR_BRANCH_COUNT=${4:-3} exec ./chain/constlr.sh", branch_code
-branch_needles = ("export PT_HPU_LAZY_MODE=1", "[[ $# -ge 2 && $# -le 4 ]]", BRANCH_CD, "./gaudi_check_cards.sh || exit 1", "[[ -x ./gaudi_verify_busy.sh ]]", "./gaudi_verify_busy.sh 900 &")
+assert branch_code[-1] == ("CONSTLR_BRANCH_EPOCH=$1 CONSTLR_BRANCH_STOP=$2 CONSTLR_BRANCH_EVERY=${3:-10000} CONSTLR_BRANCH_COUNT=${4:-3} CONSTLR_BRANCH_GRAM_EPOCH=${5:-} "
+                            "exec ./chain/constlr.sh"), branch_code
+branch_needles = ("export PT_HPU_LAZY_MODE=1", "[[ $# -ge 2 && $# -le 5 ]]", BRANCH_CD, "./gaudi_check_cards.sh || exit 1", "[[ -x ./gaudi_verify_busy.sh ]]", "./gaudi_verify_busy.sh 900 &")
 for needle in branch_needles:
     assert any(needle in line for line in branch_code), needle  # in a command, not only in a comment
 positions = [min(i for i, line in enumerate(branch_code) if needle in line) for needle in branch_needles]
 assert all(a < b for a, b in zip(positions, positions[1:])), positions  # in this order: the usage guard comes before the cd and the card check
 assert all(line.startswith("#") for line in branch_lines if "phases.txt" in line), branch_lines  # not a chain phase: phases.txt is named in comments only
 print("OK (k) branch launcher: run_d1_8_branch_gram_gaudi.sh (mode 755, 4 cards, the usage guard first, ends in CONSTLR_BRANCH_EPOCH=$1 CONSTLR_BRANCH_STOP=$2 CONSTLR_BRANCH_EVERY=${3:-10000} "
-      "CONSTLR_BRANCH_COUNT=${4:-3} exec ./chain/constlr.sh, names phases.txt only in comments) makes constlr.sh launch the no-Gram trunk's line with only --no_gram replaced by --branch_from "
+      "CONSTLR_BRANCH_COUNT=${4:-3} CONSTLR_BRANCH_GRAM_EPOCH=${5:-} exec ./chain/constlr.sh, names phases.txt only in comments) makes constlr.sh launch the no-Gram trunk's line with only --no_gram replaced by --branch_from "
       "<trunk>/ckpt/epoch_<K>.pth --gram_refresh_steps <list> and no stop file read: `10 40` -> " + BRANCH_E10 + " refreshing after 36660,46660,56660 (10 x the epoch_length 2666 read from the "
       "trunk's args.json, 36650,... at 2665, then every 10000 steps, 3 times), `10 40 2666 30` -> ..._every2666x30_ (one refresh per epoch for 30 epochs), `7 12 500 2` -> ..._e0007_ 19162,19662; "
       "a refresh list must end inside the 1000-epoch schedule, whose last step is 1000 x the trunk's own epoch_length: `10 40 2666 990` (26660 + 990 x 2666 = 1000 x 2666) launches, 991 refreshes or a "
@@ -3099,6 +3179,118 @@ print("OK (k) Ark-teacher trunk: constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_ARK=1 
       "branch dir, every --branch_from-checked setting = the trunk's, and a trunk args.json with the other lock_half_pass or none is refused; the phase, the no-Gram trunk, the plain trunk and the no-Gram "
       "branches launch and print exactly as before with the three variables empty and the Ark stop files present or absent; run_d1_8_arkteacher_smoke_gaudi.sh (75 min) launches the arm's flags for 2300 "
       "steps (past MIMIC's release, 1441, or lock + release, 2161) into ssl_dinov3_cxr_arkteacher[_lock]_smoke_seed_100 and refuses another CONSTLR_ARK_LOCK")
+
+# the Gram teacher from an earlier trunk epoch (DINOv3's early-teacher rule): CONSTLR_BRANCH_GRAM_EPOCH=J, the branch wrapper's fifth argument GRAM_EPOCH. The line is the four-argument one plus
+# --gram_teacher_from <trunk>/ckpt/epoch_<J %04d>.pth (last), the run dir gets _gt<J %04d> right after _e<K %04d>, the run: line names it; the no-Gram trunk and both Ark-teacher arms alike
+gt_dir = branch_root()  # holds the trunk's epoch_0010.pth; the planned branch point epoch_0100.pth is added
+open(os.path.join(gt_dir, BRANCH_TRUNK, "ckpt", "epoch_0100.pth"), "w").close()
+GT_RUN4, GT_RUN5 = "ssl_dinov3_cxr_constlr_nogram_e0100_gram_every2666x3_seed_100", "ssl_dinov3_cxr_constlr_nogram_e0100_gt0010_gram_every2666x3_seed_100"
+GT_SRC100 = NOGRAM_RUN + "/ckpt/epoch_0100.pth"
+GT_REFRESH_LINE = ("gram refresh steps: 269266,271932,274598 (branch step 266600 = epoch 100 x epoch_length 2666 from ssl_dinov3_cxr_constlr_nogram_seed_100/args.json, then every 2666 steps, "
+                   "3 times)")
+gres4, gargv4 = branch_run(gt_dir, "100", "130", "2666", "3")
+gres5, gargv5 = branch_run(gt_dir, "100", "130", "2666", "3", "10")
+assert gres4.returncode == 0 == gres5.returncode and gres4.stderr == "" == gres5.stderr, (gres4.stderr, gres5.stderr)
+assert gargv4 == branch_argv_for("130", GT_RUN4, GT_SRC100, "269266,271932,274598") and gargv4.count("/workspace/" + GT_RUN4) == 1, gargv4  # the four-argument line, as before
+assert gargv5 == [("/workspace/" + GT_RUN5) if arg == "/workspace/" + GT_RUN4 else arg for arg in gargv4] + ["--gram_teacher_from", BRANCH_SRC10], gargv5
+assert gres4.stdout.splitlines() == [
+    "run: ssl_dinov3_cxr_constlr_nogram_e0100_gram_every2666x3_seed_100 (Gram-anchored branch of ssl_dinov3_cxr_constlr_nogram_seed_100 from its epoch 100: --branch_from "
+    "/workspace/ssl_dinov3_cxr_constlr_nogram_seed_100/ckpt/epoch_0100.pth --gram_refresh_steps in place of --no_gram; stop after epoch 130)", GT_REFRESH_LINE], gres4.stdout
+assert gres5.stdout.splitlines() == [
+    "run: ssl_dinov3_cxr_constlr_nogram_e0100_gt0010_gram_every2666x3_seed_100 (Gram-anchored branch of ssl_dinov3_cxr_constlr_nogram_seed_100 from its epoch 100: --branch_from "
+    "/workspace/ssl_dinov3_cxr_constlr_nogram_seed_100/ckpt/epoch_0100.pth --gram_refresh_steps in place of --no_gram; Gram teacher from trunk epoch 10 (ckpt/epoch_0010.pth), DINOv3's "
+    "early-teacher rule; stop after epoch 130)", GT_REFRESH_LINE], gres5.stdout
+expanded["run_d1_8_branch_gram_gaudi.sh 100 130 2666 3"] = "./gaudi.sh " + " ".join(gargv4)
+expanded["run_d1_8_branch_gram_gaudi.sh 100 130 2666 3 10"] = "./gaudi.sh " + " ".join(gargv5)
+# the trainer reads the two lines alike but for the run dir and the Gram teacher's file
+gparsed4, gparsed5 = (ssl_pretrain.parse_args(argv[argv.index("ssl_pretrain.py") + 1:]) for argv in (gargv4, gargv5))
+assert (gparsed5.gram_teacher_from, gparsed5.branch_from, gparsed4.gram_teacher_from) == (BRANCH_SRC10, GT_SRC100, None)
+assert {k for k in vars(gparsed5) if getattr(gparsed5, k) != getattr(gparsed4, k)} == {"output_dir", "gram_teacher_from"}
+# without a fifth argument nothing changes: an empty one, an inherited CONSTLR_BRANCH_GRAM_EPOCH (the wrapper's last line clears it) and constlr.sh with the variable empty launch and print the
+# four-argument line; so does the planned `10 40`
+for args, env in (((), dict(ALLOC4, CONSTLR_BRANCH_GRAM_EPOCH="")), (("",), ALLOC4), ((), dict(ALLOC4, CONSTLR_BRANCH_GRAM_EPOCH="10"))):
+    gres, gargv = branch_run(gt_dir, "100", "130", "2666", "3", *args, env=env)
+    assert gres.returncode == 0 and gargv == gargv4 and (gres.stdout, gres.stderr) == (gres4.stdout, ""), (args, gres.stderr, gargv)
+gres, gargv = branch_run(branch_root(), "10", "40", env=dict(ALLOC4, CONSTLR_BRANCH_GRAM_EPOCH="5"))
+assert gres.returncode == 0 and gargv == branch_argv_for("40", BRANCH_E10, BRANCH_SRC10, "36660,46660,56660") and "_gt" not in gres.stdout, (gres.stderr, gargv)
+gt_env4 = dict(ALLOC4, CONSTLR_BRANCH_EPOCH="100", CONSTLR_BRANCH_STOP="130", CONSTLR_BRANCH_EVERY="2666", CONSTLR_BRANCH_COUNT="3")
+for env, expected in ((dict(gt_env4, CONSTLR_BRANCH_GRAM_EPOCH=""), gargv4), (dict(gt_env4, CONSTLR_BRANCH_GRAM_EPOCH="10"), gargv5)):  # constlr.sh itself, without the wrapper
+    if os.path.exists(os.path.join(gt_dir, "argv.txt")):
+        os.remove(os.path.join(gt_dir, "argv.txt"))
+    gres = run_script(gt_dir, "chain/constlr.sh", env=env)
+    assert gres.returncode == 0 and launched(gt_dir) == expected, (gres.stderr, launched(gt_dir))
+# both Ark-teacher arms (CONSTLR_BRANCH_ARK=1; every epoch checkpoint kept): `5 40 <epoch_length> 3 2` is `5 40 <epoch_length> 3` plus --gram_teacher_from <arm trunk>/ckpt/epoch_0002.pth, after
+# ARK_FLAGS, with the same _gt0002 token
+gt_ark_dir = ark_branch_root()
+for lock, env, length in (("0", dict(ALLOC4, CONSTLR_BRANCH_ARK="1"), 2665), ("1", dict(ALLOC4, CONSTLR_BRANCH_ARK="1", CONSTLR_ARK_LOCK="1"), 3997)):
+    trunk = ARK_TRUNKS[lock]
+    for epoch in (2, 5):
+        open(os.path.join(gt_ark_dir, trunk, "ckpt", "epoch_%04d.pth" % epoch), "w").close()
+    ark_run4, ark_run5 = ("%s_e0005%s_gram_every%dx3_seed_100" % (trunk[:-len("_seed_100")], token, length) for token in ("", "_gt0002"))
+    ark_src5, ark_src2 = ARK_RUNS[lock] + "/ckpt/epoch_0005.pth", ARK_RUNS[lock] + "/ckpt/epoch_0002.pth"
+    ark_steps = ",".join(str(5 * length + length * i) for i in range(1, 4))
+    ares4, aargv4 = branch_run(gt_ark_dir, "5", "40", str(length), "3", env=env)
+    ares5, aargv5 = branch_run(gt_ark_dir, "5", "40", str(length), "3", "2", env=env)
+    assert ares4.returncode == 0 == ares5.returncode and ares4.stderr == "" == ares5.stderr, (lock, ares4.stderr, ares5.stderr)
+    assert aargv4 == [("/workspace/" + ark_run4) if arg == ARK_RUNS[lock] else arg for arg in ark_argv_for("40", lock)[:-6]] + [
+        "--branch_from", ark_src5, "--gram_refresh_steps", ark_steps] + ARK_FLAGS_OF[lock], (lock, aargv4)  # the four-argument line, as before
+    assert aargv5 == [("/workspace/" + ark_run5) if arg == "/workspace/" + ark_run4 else arg for arg in aargv4] + ["--gram_teacher_from", ark_src2], (lock, aargv5)
+    assert ("_lock_e0005_gt0002_" in ark_run5) == (lock == "1") and ares5.stdout.splitlines() == [
+        "run: %s (Gram-anchored branch of %s from its epoch 5: --branch_from %s --gram_refresh_steps in place of --no_gram; Gram teacher from trunk epoch 2 (ckpt/epoch_0002.pth), DINOv3's "
+        "early-teacher rule; stop after epoch 40)" % (ark_run5, trunk, ark_src5), ares4.stdout.splitlines()[1]], ares5.stdout
+    aparsed4, aparsed5 = (ssl_pretrain.parse_args(argv[argv.index("ssl_pretrain.py") + 1:]) for argv in (aargv4, aargv5))
+    assert aparsed5.gram_teacher_from == ark_src2 and {k for k in vars(aparsed5) if getattr(aparsed5, k) != getattr(aparsed4, k)} == {"output_dir", "gram_teacher_from"}
+    expanded["CONSTLR_BRANCH_ARK=1 CONSTLR_ARK_LOCK=%s run_d1_8_branch_gram_gaudi.sh 5 40 %d 3 2" % (lock, length)] = "./gaudi.sh " + " ".join(aargv5)
+# refusals with their exact text, before anything is launched: the variable without the four (before anything is read: the bare sandbox has no setting file to miss; gt_dir has them all)
+GT_ALONE = ("ERROR: CONSTLR_BRANCH_GRAM_EPOCH is set without the CONSTLR_BRANCH_* variables: it picks the trunk epoch a branch's Gram teacher is taken from (run_d1_8_branch_gram_gaudi.sh sets it from "
+            "its fifth argument)\n")
+gt_bare = sandbox()
+for env in (dict(ALLOC4, CONSTLR_BRANCH_GRAM_EPOCH="10"), dict(ALLOC4, CONSTLR_BRANCH_GRAM_EPOCH="x"), dict(NOGRAM_ENV, CONSTLR_BRANCH_GRAM_EPOCH="10"),
+            dict(ARK_ENV, CONSTLR_BRANCH_GRAM_EPOCH="10"), dict(ALLOC4, CONSTLR_BRANCH_ARK="", CONSTLR_BRANCH_GRAM_EPOCH="1")):
+    gres = run_script(gt_bare, "chain/constlr.sh", env=env)
+    assert gres.returncode == 1 and gres.stderr == GT_ALONE and gres.stdout == "" and launched(gt_bare) is None, (env, gres.stderr)
+    gres, gargv = ark_run(ark_root, env=env)  # every stop file there: it would have launched
+    assert gres.returncode == 1 and gres.stderr == GT_ALONE and gres.stdout == "" and gargv is None, (env, gres.stderr)
+
+
+def gt_refused(root, args, expected_error, env=ALLOC4):  # the wrapper copy refuses: exit 1, exactly this stderr, nothing printed, gaudi.sh never reached
+    gres, gargv = branch_run(root, *args, env=env)
+    assert gres.returncode == 1 and gres.stderr == expected_error and gres.stdout == "" and gargv is None, (args, gres.returncode, gres.stdout, gres.stderr)
+
+
+for value in ("abc", "0", "-1", "1.5", "010", " 10", "1e1"):  # 010: printf %04d would read it as octal
+    gt_refused(gt_dir, ("100", "130", "2666", "3", value), "ERROR: J (CONSTLR_BRANCH_GRAM_EPOCH) holds '%s', which is not a positive integer without a leading zero (the trunk epoch the Gram teacher "
+                                                           "is taken from)\n" % value)
+for value in ("100", "101", "1000", "18446744073709551617"):  # J = K, after it, and 2**64 + 1 (bash arithmetic would read it as 1)
+    gt_refused(gt_dir, ("100", "130", "2666", "3", value), "ERROR: J (CONSTLR_BRANCH_GRAM_EPOCH) holds '%s', which is not before K (CONSTLR_BRANCH_EPOCH) '100': the Gram teacher is taken from an "
+                                                           "earlier trunk epoch than the branch point (DINOv3's early-teacher rule)\n" % value)
+gt_refused(gt_dir, ("100", "130", "2666", "3", "10", "x"), "ERROR: usage: sbatch run_d1_8_branch_gram_gaudi.sh <K> <STOP> [EVERY=10000] [COUNT=3] [GRAM_EPOCH]; got 6 arguments\n")
+# a missing ckpt/epoch_<J %04d>.pth, as a missing source: refused while the branch's own dir (the _gt one: the dir without the token is another run) has no epoch checkpoint; with one it launches
+GT_MISSING = ("ERROR: ssl_dinov3_cxr_constlr_nogram_seed_100/ckpt/epoch_0020.pth not found and ssl_dinov3_cxr_constlr_nogram_e0100_gt0020_gram_every2666x3_seed_100 has no epoch checkpoint of its "
+              "own yet: no Gram teacher to take from trunk epoch 20 (the trunk keeps every 10th epoch and its last 3)\n")
+gt_refused(gt_dir, ("100", "130", "2666", "3", "20"), GT_MISSING)
+os.makedirs(os.path.join(gt_dir, GT_RUN4, "ckpt"))
+open(os.path.join(gt_dir, GT_RUN4, "ckpt", "epoch_0101.pth"), "w").close()
+gt_refused(gt_dir, ("100", "130", "2666", "3", "20"), GT_MISSING)
+os.makedirs(os.path.join(gt_dir, "ssl_dinov3_cxr_constlr_nogram_e0100_gt0020_gram_every2666x3_seed_100", "ckpt"))
+open(os.path.join(gt_dir, "ssl_dinov3_cxr_constlr_nogram_e0100_gt0020_gram_every2666x3_seed_100", "ckpt", "epoch_0101.pth"), "w").close()
+gres, gargv = branch_run(gt_dir, "100", "130", "2666", "3", "20")
+assert gres.returncode == 0 and gargv[-2:] == ["--gram_teacher_from", NOGRAM_RUN + "/ckpt/epoch_0020.pth"] and "_gt0020_" in gargv[gargv.index("--output_dir") + 1], (gres.stderr, gargv)
+gt_refused(gt_ark_dir, ("5", "40", "2665", "3", "3"), "ERROR: ssl_dinov3_cxr_constlr_arkteacher_seed_100/ckpt/epoch_0003.pth not found and ssl_dinov3_cxr_constlr_arkteacher_e0005_gt0003_gram_every2665x3"
+           "_seed_100 has no epoch checkpoint of its own yet: no Gram teacher to take from trunk epoch 3 (the trunk keeps every 10th epoch and its last 3)\n", env=dict(ALLOC4, CONSTLR_BRANCH_ARK="1"))
+# the wrapper's comments: the usage line, the paper's rule, the planned line, the resubmit hazard, and that without the fifth argument nothing changes
+branch_text = open(BRANCH_SCRIPT).read()
+for needle in ("# Usage: sbatch run_d1_8_branch_gram_gaudi.sh <K> <STOP> [EVERY] [COUNT] [GRAM_EPOCH]", "DINOv3's rule (Sec. 4.2; App. C p. 58)", "w_Gram 2", "every 10k steps, at most three times",
+               "sbatch run_d1_8_branch_gram_gaudi.sh 100 130 2666 3 10  -> ssl_dinov3_cxr_constlr_nogram_e0100_gt0010_gram_every2666x3_seed_100", "269266,271932,274598",
+               "Pass the same five arguments on every re-submit", "Without the fifth argument nothing changes"):
+    assert any(needle in line for line in branch_text.splitlines() if line.startswith("#")), needle
+print("OK (k) Gram teacher from an earlier trunk epoch: run_d1_8_branch_gram_gaudi.sh's fifth argument J (CONSTLR_BRANCH_GRAM_EPOCH) launches the four-argument line plus --gram_teacher_from "
+      "<trunk>/ckpt/epoch_<J %04d>.pth, last, in the run dir with _gt<J %04d> after _e<K %04d> (`100 130 2666 3 10` -> " + GT_RUN5 + ", refreshes 269266,271932,274598), the run: line naming J "
+      "and the file, the argv parsing to the four-argument one's but for output_dir and gram_teacher_from; the same for both Ark-teacher arms (`5 40 <epoch_length> 3 2`, after ARK_FLAGS, _gt0002 "
+      "after _lock_e0005 in the lock arm); without a fifth argument (none, an empty one, an inherited variable, constlr.sh with it empty) the four-argument line and lines, byte for byte; refused with "
+      "their exact text before launching: the variable without the four (before anything is read), J not a positive integer without a leading zero, J not below K, six arguments, and a missing "
+      "ckpt/epoch_<J %04d>.pth while the _gt branch dir has no epoch checkpoint (the token-less dir's does not count; the _gt dir's own lets it launch); the wrapper's comments carry the usage, the "
+      "rule, the planned line and the resubmit hazard")
 
 # the one-flag-off recipe ablations ("DINO-X ConstLR 224, no Gram, one recipe flag off"): CONSTLR_NOGRAM=1 CONSTLR_ABLATE=drop_path | rope | local_norm (what run_d1_8_constlr_nogram_ablate_gaudi.sh sets, the arm
 # coming from its sbatch line) launches the no-Gram trunk's line (RECIPE, --no_gram) with exactly that one RECIPE flag and its value removed, into the arm's own run dir with the arm's own cluster-only stop file (no
