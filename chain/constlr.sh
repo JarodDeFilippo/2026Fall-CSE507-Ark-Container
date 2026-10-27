@@ -40,17 +40,22 @@
 # yet (a regular file named epoch_<digits>.pth, the names the trainer's epoch_checkpoints() takes; once it has one, the trainer resumes from it and never reads the source again, so the
 # trunk may have pruned it). `run:` and `gram refresh steps:` lines are printed before the launch.
 # CONSTLR_ARK=1, only together with CONSTLR_NOGRAM=1, makes the no-Gram trunk the Ark-teacher trunk, "DINO-X ConstLR 224, no Gram, Ark teacher" (Jarod, 2026-10-26): the no-Gram trunk's launch line
-# (RECIPE included) with ARK_FLAGS below appended, --cyclic_ark_teacher --heads per_dataset --switch_lock_steps 100 --keep_all_checkpoints (the trainer's cyclic Ark+ / FX teacher: one dataset per
-# batch, the datasets in turn largest first, a cycle per epoch, the teacher blended 0.8 / 0.2 with the student at every dataset-epoch end on clean views, per-dataset heads, 100 backbone-locked steps
-# after every switch, every epoch checkpoint kept; the clean views and the 0.8 are the mode's own defaults, so the line does not pass them), into its own run dir ssl_dinov3_cxr_constlr_arkteacher_seed_100,
-# with the stop epoch (= cycle) read from chain/constlr_arkteacher_stop_after.txt (the same rules, cluster-only too; none of the other three stop files is read then) and its own `run:` line. Refused before
-# anything is read: any other non-empty value, CONSTLR_NOGRAM unset or empty, CONSTLR_PLAIN set (the Ark-teacher trunk keeps the recipe) and any CONSTLR_BRANCH_* set (its branches are
-# CONSTLR_BRANCH_ARK=1). run_d1_8_constlr_arkteacher_gaudi.sh sets CONSTLR_NOGRAM and CONSTLR_ARK: its own 4-card job outside the chain, never a phase.
-# CONSTLR_BRANCH_ARK=1, only together with the four CONSTLR_BRANCH_* (sbatch --export=ALL,CONSTLR_BRANCH_ARK=1 run_d1_8_branch_gram_gaudi.sh <K> <STOP> [EVERY] [COUNT]), makes the branch one of the
-# Ark-teacher trunk instead: TRUNK is ssl_dinov3_cxr_constlr_arkteacher_seed_100 (its args.json, its ckpt/epoch_<K %04d>.pth, the run dir ssl_dinov3_cxr_constlr_arkteacher_e<K %04d>_gram_every<EVERY>x<COUNT>_seed_100)
-# and the line is that trunk's with --no_gram replaced by the branch pair, ARK_FLAGS kept after it, so a branch launches its trunk's line plus --branch_from as before (--branch_from requires every
-# mode flag to match the source). Its epoch_length is the cycle's (2665 at global batch 256), so `1 40 2665 30` refreshes the Gram teacher at the next 30 cycle boundaries. Refused before anything is
-# read: any other non-empty value, and CONSTLR_BRANCH_ARK=1 without the CONSTLR_BRANCH_* variables.
+# (RECIPE included) with ARK_FLAGS below appended, --cyclic_ark_teacher --heads per_dataset <lock flag> --keep_all_checkpoints (the trainer's cyclic Ark+ / FX teacher: one dataset per batch, the
+# datasets in turn largest first, a cycle per epoch, the teacher frozen through every pass and blended 0.8 / 0.2 with the student after each dataset's release pass, on clean views, per-dataset heads,
+# every epoch checkpoint kept; the clean views and the 0.8 are the mode's own defaults, so the line does not pass them). CONSTLR_ARK_LOCK (0 or 1; empty or unset = 0) is the lock arm, a per-run
+# ablation (Jarod, 2026-10-26): 1 passes --lock_half_pass (Foundation X's lock-release: per dataset per cycle a lock pass over a random half with the backbone at LR 0, then the full release pass; about
+# 3997 steps a cycle at global batch 256), 0 passes --no_lock_half_pass (the release passes alone, 2665 steps a cycle). The arm is in the run dir and the stop file, so the two never share either and a
+# resume never flips it: ssl_dinov3_cxr_constlr_arkteacher_seed_100 with chain/constlr_arkteacher_stop_after.txt for 0, ssl_dinov3_cxr_constlr_arkteacher_lock_seed_100 with
+# chain/constlr_arkteacher_lock_stop_after.txt for 1 (the same rules as the other stop files, cluster-only too; no other stop file is read then), and its own `run:` line says which. Refused before
+# anything is read: any other non-empty CONSTLR_ARK, CONSTLR_NOGRAM unset or empty, CONSTLR_PLAIN set (the Ark-teacher trunk keeps the recipe) and any CONSTLR_BRANCH_* set (its branches are
+# CONSTLR_BRANCH_ARK=1); a CONSTLR_ARK_LOCK other than empty, 0 or 1, and one set without CONSTLR_ARK=1 or CONSTLR_BRANCH_ARK=1. run_d1_8_constlr_arkteacher_gaudi.sh sets CONSTLR_NOGRAM and
+# CONSTLR_ARK (sbatch --export=ALL,CONSTLR_ARK_LOCK=1 for the lock arm): its own 4-card job outside the chain, never a phase.
+# CONSTLR_BRANCH_ARK=1, only together with the four CONSTLR_BRANCH_* (sbatch --export=ALL,CONSTLR_BRANCH_ARK=1[,CONSTLR_ARK_LOCK=1] run_d1_8_branch_gram_gaudi.sh <K> <STOP> [EVERY] [COUNT]), makes
+# the branch one of an Ark-teacher trunk instead: TRUNK is the CONSTLR_ARK_LOCK arm's run dir (its args.json, its ckpt/epoch_<K %04d>.pth; the branch's run dir ${TRUNK%_seed_100}_e<K %04d>_gram_every
+# <EVERY>x<COUNT>_seed_100 carries its _lock token), whose args.json must record that lock_half_pass (the branch inherits it: refused if it is missing or the other one), and the line is that trunk's
+# with --no_gram replaced by the branch pair, ARK_FLAGS kept after it, so a branch launches its trunk's line plus --branch_from as before (--branch_from requires every mode flag to match the source).
+# Its epoch_length is the cycle's, read from that args.json (2665, or 3997 with the lock, at global batch 256), so `1 40 <epoch_length> 30` refreshes the Gram teacher at the next 30 cycle
+# boundaries. Refused before anything is read: any other non-empty value, and CONSTLR_BRANCH_ARK=1 without the CONSTLR_BRANCH_* variables.
 set -euo pipefail
 NOGRAM=${CONSTLR_NOGRAM:-}  # first, before anything is read or launched
 [[ -z $NOGRAM || $NOGRAM == 1 ]] || { echo "ERROR: CONSTLR_NOGRAM holds '$NOGRAM', which is not empty or 1" >&2; exit 1; }
@@ -68,6 +73,9 @@ BRANCH_ARK=${CONSTLR_BRANCH_ARK:-}
 [[ -z $ARK || -z $BRANCH ]] || { echo "ERROR: CONSTLR_ARK and CONSTLR_BRANCH_* are both set: a branch of the Ark-teacher trunk is CONSTLR_BRANCH_ARK=1 with the CONSTLR_BRANCH_* variables, so unset CONSTLR_ARK" >&2; exit 1; }
 [[ -z $ARK || -n $NOGRAM ]] || { echo "ERROR: CONSTLR_ARK=1 is set without CONSTLR_NOGRAM=1: the Ark-teacher trunk is the no-Gram trunk with the cyclic Ark+ teacher, so set both" >&2; exit 1; }
 [[ -z $BRANCH_ARK || -n $BRANCH ]] || { echo "ERROR: CONSTLR_BRANCH_ARK=1 is set without the CONSTLR_BRANCH_* variables: it picks the Ark-teacher trunk for a branch (run_d1_8_branch_gram_gaudi.sh sets the four)" >&2; exit 1; }
+ARK_LOCK=${CONSTLR_ARK_LOCK:-}
+[[ -z $ARK_LOCK || $ARK_LOCK == 0 || $ARK_LOCK == 1 ]] || { echo "ERROR: CONSTLR_ARK_LOCK holds '$ARK_LOCK', which is not empty, 0 or 1" >&2; exit 1; }
+[[ -z $ARK_LOCK || -n $ARK || -n $BRANCH_ARK ]] || { echo "ERROR: CONSTLR_ARK_LOCK is set without CONSTLR_ARK=1 or CONSTLR_BRANCH_ARK=1: it picks the Ark-teacher trunk's lock arm, so set one of them" >&2; exit 1; }
 source "$(dirname "${BASH_SOURCE[0]}")/ssl_common.sh"
 
 EPOCHS=1000  # the --epochs ceiling (never reached): the stop epoch's upper limit and the launch line both use it, so they cannot drift
@@ -77,8 +85,12 @@ STOP_FILE=chain/constlr_stop_after.txt
 GRAM_ARGS=(--gram_refresh_steps 10000,20000,30000)
 RECIPE=(--drop_path_rate 0.3 --rope_rescale_coords 2 --untie_local_cls_norm)  # the trunk's and its branches' (DINOv3's training recipe), never the phase's
 RECIPE_NOTE="DINOv3 recipe: ${RECIPE[*]}"  # what the trunk's run: line says about it
-ARK_TRUNK=ssl_dinov3_cxr_constlr_arkteacher_seed_100  # the Ark-teacher trunk's run dir (CONSTLR_NOGRAM=1 CONSTLR_ARK=1), which every CONSTLR_BRANCH_ARK=1 branch starts from
-ARK_FLAGS=(--cyclic_ark_teacher --heads per_dataset --switch_lock_steps 100 --keep_all_checkpoints)  # the Ark-teacher trunk's and its branches', after --no_gram / the branch pair
+ARK_TOKEN=  ARK_LOCK_FLAG=--no_lock_half_pass  ARK_LOCK_JSON=false  ARK_LOCK_NOTE="no lock passes: the full-pass release per dataset alone (CONSTLR_ARK_LOCK=0)"
+if [[ ${ARK_LOCK:-0} == 1 ]]; then  # the lock arm: its own run dir, stop file and line
+  ARK_TOKEN=_lock  ARK_LOCK_FLAG=--lock_half_pass  ARK_LOCK_JSON=true  ARK_LOCK_NOTE="FX lock-release: half-pass lock + full-pass release per dataset (CONSTLR_ARK_LOCK=1)"
+fi
+ARK_TRUNK=ssl_dinov3_cxr_constlr_arkteacher${ARK_TOKEN}_seed_100  # the Ark-teacher trunk's run dir (CONSTLR_NOGRAM=1 CONSTLR_ARK=1), which every CONSTLR_BRANCH_ARK=1 branch of that arm starts from
+ARK_FLAGS=(--cyclic_ark_teacher --heads per_dataset "$ARK_LOCK_FLAG" --keep_all_checkpoints)  # the Ark-teacher trunk's and its branches', after --no_gram / the branch pair
 [[ -z $BRANCH_ARK ]] || TRUNK=$ARK_TRUNK
 if [[ -n $NOGRAM ]]; then
   RUN=$TRUNK
@@ -92,9 +104,9 @@ if [[ -n $NOGRAM ]]; then
   fi
   if [[ -n $ARK ]]; then
     RUN=$ARK_TRUNK
-    STOP_FILE=chain/constlr_arkteacher_stop_after.txt
+    STOP_FILE=chain/constlr_arkteacher${ARK_TOKEN}_stop_after.txt
     GRAM_ARGS=("${RECIPE[@]}" --no_gram "${ARK_FLAGS[@]}")
-    RECIPE_NOTE="DINOv3 recipe: ${RECIPE[*]}; Ark teacher: ${ARK_FLAGS[*]} after --no_gram (clean teacher views implied, --ark_teacher_momentum 0.8 by default; an epoch is a cycle over the four datasets)"
+    RECIPE_NOTE="DINOv3 recipe: ${RECIPE[*]}; Ark teacher: ${ARK_FLAGS[*]} after --no_gram ($ARK_LOCK_NOTE; clean teacher views implied, --ark_teacher_momentum 0.8 by default; an epoch is a cycle over the four datasets)"
   fi
 fi
 LR=$(read_setting chain/main_lr.txt '^([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$' 'a positive number such as 2e-3 or 0.0003')
@@ -118,6 +130,10 @@ if [[ -n $BRANCH ]]; then
   TRUNK_ARGS=$TRUNK/args.json
   EPOCH_LENGTH=$(sed -n 's/^ *"epoch_length": *\([0-9][0-9]*\),\{0,1\} *$/\1/p' "$TRUNK_ARGS" 2>/dev/null || true)
   [[ $EPOCH_LENGTH =~ ^[1-9][0-9]{0,8}$ ]] || { echo "ERROR: $TRUNK_ARGS is missing or holds no positive epoch_length (the trainer writes it when the trunk starts); refusing to guess the branch step" >&2; exit 1; }
+  if [[ -n $BRANCH_ARK ]]; then  # the branch inherits its trunk's lock arm: its args.json must record the lock_half_pass this arm's run dir stands for
+    TRUNK_LOCK=$(sed -nE 's/^ *"lock_half_pass": *(true|false),? *$/\1/p' "$TRUNK_ARGS" 2>/dev/null || true)
+    [[ $TRUNK_LOCK == "$ARK_LOCK_JSON" ]] || { echo "ERROR: $TRUNK_ARGS holds lock_half_pass '$TRUNK_LOCK', not the $ARK_LOCK_JSON of CONSTLR_ARK_LOCK=${ARK_LOCK:-0} (whose run dir it is): refusing to branch with another lock arm than the trunk's" >&2; exit 1; }
+  fi
   EK=$(printf %04d "$K")
   SOURCE=$TRUNK/ckpt/epoch_$EK.pth
   RUN=${TRUNK%_seed_100}_e${EK}_gram_every${EVERY}x${COUNT}_seed_100

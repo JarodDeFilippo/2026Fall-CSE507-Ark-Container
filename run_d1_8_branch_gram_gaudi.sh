@@ -23,11 +23,15 @@
 # the `run:` and `gram refresh steps:` lines before launching (see its header).
 # Extend a branch: re-submit with a larger STOP and the SAME K / EVERY / COUNT (they name the run dir and fix the refresh list, which --resume locks); it resumes from its last epoch checkpoint, and the source
 # checkpoint is no longer needed then.
-# Branches of the Ark-teacher trunk (run_d1_8_constlr_arkteacher_gaudi.sh, run dir ssl_dinov3_cxr_constlr_arkteacher_seed_100, an epoch = a cycle of 2665 steps, every epoch checkpoint kept):
-#   sbatch --export=ALL,CONSTLR_BRANCH_ARK=1 run_d1_8_branch_gram_gaudi.sh 1 40 2665 30  -> run dir ssl_dinov3_cxr_constlr_arkteacher_e0001_gram_every2665x30_seed_100, refreshes at the next 30 cycle boundaries
-# CONSTLR_BRANCH_ARK=1 reaches chain/constlr.sh through the job's environment, which picks that trunk (its args.json, its ckpt/epoch_<K %04d>.pth) and keeps its mode flags (--cyclic_ark_teacher --heads per_dataset
-# --switch_lock_steps 100 --keep_all_checkpoints) on the branch's line: the trunk's line with --no_gram replaced by the branch pair, as for the no-Gram trunk. Pass it on every re-submit of such a branch (without it
-# the same arguments name the no-Gram trunk's branch, a different run dir).
+# Branches of an Ark-teacher trunk (run_d1_8_constlr_arkteacher_gaudi.sh: an epoch = a cycle, every epoch checkpoint kept; CONSTLR_ARK_LOCK picks the arm, 0 when unset):
+#   sbatch --export=ALL,CONSTLR_BRANCH_ARK=1 run_d1_8_branch_gram_gaudi.sh 1 40 2665 30                   -> from ssl_dinov3_cxr_constlr_arkteacher_seed_100 (no lock passes, 2665 steps a cycle) into
+#                                                                                                         ssl_dinov3_cxr_constlr_arkteacher_e0001_gram_every2665x30_seed_100
+#   sbatch --export=ALL,CONSTLR_BRANCH_ARK=1,CONSTLR_ARK_LOCK=1 run_d1_8_branch_gram_gaudi.sh 1 40 3997 30 -> from ssl_dinov3_cxr_constlr_arkteacher_lock_seed_100 (lock-release, 3997 steps a cycle) into
+#                                                                                                         ssl_dinov3_cxr_constlr_arkteacher_lock_e0001_gram_every3997x30_seed_100
+# (EVERY = the trunk's epoch_length, read from its args.json: the refreshes fall on the next COUNT cycle boundaries.) The two variables reach chain/constlr.sh through the job's environment; it checks that
+# the trunk's args.json records the lock arm its run dir stands for (the branch inherits it) and keeps the trunk's mode flags (--cyclic_ark_teacher --heads per_dataset, the lock flag,
+# --keep_all_checkpoints) on the branch's line: the trunk's line with --no_gram replaced by the branch pair, as for the no-Gram trunk. Pass the same variables on every re-submit of such a branch (without
+# them the same arguments name another trunk's branch, a different run dir).
 # NOT a chain phase: it is submitted on its own and must never be added to chain/phases.txt. The log is the Slurm .out (no chain/log file, no chain/done marker); its first lines must show the `run:` line, the
 # `gram refresh steps:` line, the trainer's `Gram refresh scheduled after step ...` lines and its `branched from ...` line (a re-submit: `resumed from ...`).
 export PT_HPU_LAZY_MODE=1
