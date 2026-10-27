@@ -43,7 +43,7 @@
 # (RECIPE included) with ARK_FLAGS below appended, --cyclic_ark_teacher --heads per_dataset <lock flag> --keep_all_checkpoints (the trainer's cyclic Ark+ / FX teacher: one dataset per batch, the
 # datasets in turn largest first, a cycle per epoch, the teacher frozen through every pass and blended 0.8 / 0.2 with the student after each dataset's release pass, on clean views, per-dataset heads,
 # every epoch checkpoint kept; the clean views and the 0.8 are the mode's own defaults, so the line does not pass them). CONSTLR_ARK_LOCK (0 or 1; empty or unset = 0) is the lock arm, a per-run
-# ablation (Jarod, 2026-10-26): 1 passes --lock_half_pass (Foundation X's lock-release: per dataset per cycle a lock pass over a random half with the backbone at LR 0, then the full release pass; about
+# ablation (Jarod, 2026-10-26): 1 passes --lock_half_pass (Foundation X's lock-release: per dataset per cycle a lock pass over a random half with the backbone frozen (LR 0, no optimizer step), then the full release pass; about
 # 3997 steps a cycle at global batch 256), 0 passes --no_lock_half_pass (the release passes alone, 2665 steps a cycle). The arm is in the run dir and the stop file, so the two never share either and a
 # resume never flips it: ssl_dinov3_cxr_constlr_arkteacher_seed_100 with chain/constlr_arkteacher_stop_after.txt for 0, ssl_dinov3_cxr_constlr_arkteacher_lock_seed_100 with
 # chain/constlr_arkteacher_lock_stop_after.txt for 1 (the same rules as the other stop files, cluster-only too; no other stop file is read then), and its own `run:` line says which. Refused before
