@@ -2563,7 +2563,7 @@ nogram_lines = open(os.path.join(REPO, "run_d1_8_constlr_nogram_gaudi.sh")).read
 assert [line[len("#SBATCH "):] for line in nogram_lines if line.startswith("#SBATCH ")] == [
     "--job-name=d1-8-nogram", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=128G"], nogram_lines
 nogram_code = [line for line in nogram_lines if line and not line.startswith("#")]
-assert nogram_code[-1] == "CONSTLR_ABLATE= CONSTLR_NOGRAM=1 exec ./chain/constlr.sh", nogram_code  # clears an inherited CONSTLR_ABLATE (checked by running it, with the ablation block below)
+assert nogram_code[-1] == "CONSTLR_ABLATE= CONSTLR_PLAIN= CONSTLR_ARK= CONSTLR_NOGRAM=1 exec ./chain/constlr.sh", nogram_code  # clears an inherited CONSTLR_ABLATE, CONSTLR_PLAIN and CONSTLR_ARK (checked by running it, with the ablation block below)
 for needle in ("export PT_HPU_LAZY_MODE=1", "CONSTLR_NOGRAM=1", "exec ./chain/constlr.sh", "./gaudi_check_cards.sh || exit 1", "[[ -x ./gaudi_verify_busy.sh ]]", "./gaudi_verify_busy.sh 900 &"):
     assert any(needle in line for line in nogram_code), needle  # in a command, not only in a comment
 assert all(line.startswith("#") for line in nogram_lines if "phases.txt" in line), nogram_lines  # not a chain phase: phases.txt is named in comments only
@@ -3279,9 +3279,10 @@ print("OK (k) ablation arms: constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_ABLATE=dro
       "other than empty or the three values, without CONSTLR_NOGRAM=1, or with CONSTLR_PLAIN, CONSTLR_ARK or any CONSTLR_BRANCH_* is refused with its exact text before anything is read; the phase, the no-Gram trunk, "
       "the plain trunk, both Ark-teacher arms and the no-Gram trunk's branches launch and print exactly as before with CONSTLR_ABLATE unset or empty and the arms' stop files present or absent")
 
-# an exported CONSTLR_ABLATE reaches every launcher (sbatch hands a job the submitting shell's environment): the no-Gram trunk's launcher clears it on its last line and launches the trunk, never an arm; the plain and
-# the Ark-teacher launchers refuse it (constlr.sh above: CONSTLR_PLAIN / CONSTLR_ARK set), as does the branch wrapper (checked above) and the chain's constlr phase (no CONSTLR_NOGRAM), so none of them turns into an arm;
-# the two smoke launchers call ssl_launch with their own flags, not chain/constlr.sh
+# an exported CONSTLR_ABLATE, CONSTLR_PLAIN or CONSTLR_ARK reaches every launcher (sbatch hands a job the submitting shell's environment): the no-Gram trunk's launcher clears all three on its last line and launches the trunk,
+# never the arm, the plain trunk or the Ark-teacher trunk (every stop file is there, so a wrong launch would show in the argv); the plain and the Ark-teacher launchers refuse an exported CONSTLR_ABLATE (constlr.sh above:
+# CONSTLR_PLAIN / CONSTLR_ARK set), as does the branch wrapper (checked above) and the chain's constlr phase (no CONSTLR_NOGRAM), so none of them turns into an arm; the two smoke launchers call ssl_launch with their own
+# flags, not chain/constlr.sh
 NOGRAM_SCRIPT = os.path.join(REPO, "run_d1_8_constlr_nogram_gaudi.sh")
 
 
@@ -3298,7 +3299,8 @@ def inherited_run(script, files, env):  # a copy of the launcher with its cd poi
 
 every_stop_file = {"constlr_stop_after.txt": "30\n", "constlr_nogram_stop_after.txt": "100\n", PLAIN_STOP_FILE: "60\n", ARK_STOP_FILE: "70\n", ARK_LOCK_STOP_FILE: "80\n",
                    **{ABLATE_FILES[arm]: ABLATE_STOPS[arm] + "\n" for arm in ABLATE_ARMS}}  # every stop file there is, so that a launch of the wrong run would show in the argv
-for env in (ALLOC4, *(dict(ALLOC4, CONSTLR_ABLATE=value) for value in (*ABLATE_ARMS, "", "bogus"))):  # exported or not, an arm, empty or not even a value: the no-Gram trunk, always
+for env in (ALLOC4, *(dict(ALLOC4, CONSTLR_ABLATE=value) for value in (*ABLATE_ARMS, "", "bogus")),  # exported or not, an arm, empty or not even a value: the no-Gram trunk, always
+            dict(ALLOC4, CONSTLR_PLAIN="1"), dict(ALLOC4, CONSTLR_ARK="1"), dict(ALLOC4, CONSTLR_PLAIN="1", CONSTLR_ARK="1", CONSTLR_ABLATE="rope")):  # likewise the plain and the Ark-teacher switches, alone and all three
     result, wrapped_argv = inherited_run(NOGRAM_SCRIPT, every_stop_file, env)
     assert result.returncode == 0 and result.stderr == "" and wrapped_argv == nogram_argv_for("100") and result.stdout.splitlines() == [NOGRAM_RUN_LINE % "100"], (constlr_vars(env), result.stderr, wrapped_argv)
 for script, env, expected_error, expected_argv in ((PLAIN_SCRIPT, ALLOC4, ABLATE_NO_PLAIN, plain_argv_for("60")), (ARK_SCRIPT, ALLOC4, ABLATE_NO_ARK, ark_argv_for("70", "0")),
@@ -3321,7 +3323,7 @@ for name in MEM_LAUNCHERS:
     assert mem_lines.count("#SBATCH --mem=128G") == 1 and mem_lines[mem_at + 1] == MEM_NOTE and mem_lines.count(MEM_NOTE) == 1, name
     assert [line for line in mem_lines if line.startswith("#SBATCH ")][-1] == "#SBATCH --mem=128G" and mem_at < min(i for i, line in enumerate(mem_lines) if line and not line.startswith("#")), name
     assert not any("--mem=256G" in line for line in mem_lines if line.startswith("#SBATCH ")), name
-print("OK (k) launchers: an exported CONSTLR_ABLATE (an arm, empty or not a value) leaves run_d1_8_constlr_nogram_gaudi.sh launching the no-Gram trunk (its last line clears it), while the plain and the Ark-teacher "
+print("OK (k) launchers: an exported CONSTLR_ABLATE (an arm, empty or not a value), CONSTLR_PLAIN=1 or CONSTLR_ARK=1 leaves run_d1_8_constlr_nogram_gaudi.sh launching the no-Gram trunk (its last line clears all three), while the plain and the Ark-teacher "
       "launchers (both arms) refuse it with the exact CONSTLR_ABLATE text and launch their own run without it; the two smoke launchers never reach chain/constlr.sh; the no-Gram trunk, plain, Ark-teacher, branch, "
       "ablation and both smoke launchers ask for --mem=128G with the same measured-memory comment line right after it (the last directive, before any command)")
 
