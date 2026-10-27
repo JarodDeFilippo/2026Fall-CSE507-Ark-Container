@@ -30,6 +30,6 @@ cd /scratch/$USER/2026Fall-CSE507-Ark-Container || exit 1
 # report-only: at 15 min, log whether every allocated card is busy (gaudi_verify_busy.sh)
 [[ -x ./gaudi_verify_busy.sh ]] || { echo "ERROR: gaudi_verify_busy.sh missing or not executable; refusing to train unverified" >&2; exit 1; }
 ./gaudi_verify_busy.sh 900 &
-# CONSTLR_ABLATE= clears the variable: sbatch hands a job the submitting shell's environment, and an exported CONSTLR_ABLATE would make chain/constlr.sh launch that ablation arm
-# (run_d1_8_constlr_nogram_ablate_gaudi.sh, which takes it from its sbatch line on purpose) in place of this trunk
-CONSTLR_ABLATE= CONSTLR_NOGRAM=1 exec ./chain/constlr.sh
+# CONSTLR_ABLATE= CONSTLR_PLAIN= CONSTLR_ARK= clear the three switches: sbatch hands a job the submitting shell's environment, and an exported one would make chain/constlr.sh launch another trunk (the ablation arm, the
+# plain trunk, the Ark-teacher trunk) in place of this one; their own launchers set theirs on purpose (the ablation launcher takes CONSTLR_ABLATE from its sbatch line, the other two set CONSTLR_PLAIN / CONSTLR_ARK)
+CONSTLR_ABLATE= CONSTLR_PLAIN= CONSTLR_ARK= CONSTLR_NOGRAM=1 exec ./chain/constlr.sh
