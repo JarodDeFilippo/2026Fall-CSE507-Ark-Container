@@ -23,6 +23,11 @@
 # the `run:` and `gram refresh steps:` lines before launching (see its header).
 # Extend a branch: re-submit with a larger STOP and the SAME K / EVERY / COUNT (they name the run dir and fix the refresh list, which --resume locks); it resumes from its last epoch checkpoint, and the source
 # checkpoint is no longer needed then.
+# Branches of the Ark-teacher trunk (run_d1_8_constlr_arkteacher_gaudi.sh, run dir ssl_dinov3_cxr_constlr_arkteacher_seed_100, an epoch = a cycle of 2665 steps, every epoch checkpoint kept):
+#   sbatch --export=ALL,CONSTLR_BRANCH_ARK=1 run_d1_8_branch_gram_gaudi.sh 1 40 2665 30  -> run dir ssl_dinov3_cxr_constlr_arkteacher_e0001_gram_every2665x30_seed_100, refreshes at the next 30 cycle boundaries
+# CONSTLR_BRANCH_ARK=1 reaches chain/constlr.sh through the job's environment, which picks that trunk (its args.json, its ckpt/epoch_<K %04d>.pth) and keeps its mode flags (--cyclic_ark_teacher --heads per_dataset
+# --switch_lock_steps 100 --keep_all_checkpoints) on the branch's line: the trunk's line with --no_gram replaced by the branch pair, as for the no-Gram trunk. Pass it on every re-submit of such a branch (without it
+# the same arguments name the no-Gram trunk's branch, a different run dir).
 # NOT a chain phase: it is submitted on its own and must never be added to chain/phases.txt. The log is the Slurm .out (no chain/log file, no chain/done marker); its first lines must show the `run:` line, the
 # `gram refresh steps:` line, the trainer's `Gram refresh scheduled after step ...` lines and its `branched from ...` line (a re-submit: `resumed from ...`).
 export PT_HPU_LAZY_MODE=1

@@ -2745,6 +2745,167 @@ print("OK (k) plain no-Gram trunk: constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_PLAI
       "the recipe at the trainer's defaults; CONSTLR_PLAIN other than empty or 1, 1 without CONSTLR_NOGRAM=1 or 1 with any CONSTLR_BRANCH_* is refused before anything is read; the phase, the no-Gram trunk "
       "and its branches launch and print exactly as before, the plain stop file present or absent and CONSTLR_PLAIN empty")
 
+# the Ark-teacher trunk ("DINO-X ConstLR 224, no Gram, Ark teacher"): CONSTLR_NOGRAM=1 CONSTLR_ARK=1 (what run_d1_8_constlr_arkteacher_gaudi.sh sets) launches the no-Gram trunk's line with ARK_FLAGS appended
+# (--cyclic_ark_teacher --heads per_dataset --switch_lock_steps 100 --keep_all_checkpoints), into its own run dir, with the stop epoch from its own cluster-only file (none of the other three is read); its Gram
+# branches are CONSTLR_BRANCH_ARK=1 with the four CONSTLR_BRANCH_*, through the branch wrapper: that trunk's line with --no_gram replaced by the branch pair, ARK_FLAGS kept. The phase, the no-Gram trunk,
+# the plain trunk and the no-Gram trunk's branches launch and print exactly as before
+ARK_ENV, ARK_RUN, ARK_STOP_FILE = dict(NOGRAM_ENV, CONSTLR_ARK="1"), "/workspace/ssl_dinov3_cxr_constlr_arkteacher_seed_100", "constlr_arkteacher_stop_after.txt"
+ARK_TRUNK = "ssl_dinov3_cxr_constlr_arkteacher_seed_100"
+ARK_FLAGS = ["--cyclic_ark_teacher", "--heads", "per_dataset", "--switch_lock_steps", "100", "--keep_all_checkpoints"]
+ARK_RUN_LINE = ("run: ssl_dinov3_cxr_constlr_arkteacher_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; DINOv3 recipe: --drop_path_rate 0.3 --rope_rescale_coords 2 "
+                "--untie_local_cls_norm; Ark teacher: --cyclic_ark_teacher --heads per_dataset --switch_lock_steps 100 --keep_all_checkpoints after --no_gram (clean teacher views implied, --ark_teacher_momentum "
+                "0.8 by default; an epoch is a cycle over the four datasets); stop after epoch %s from chain/constlr_arkteacher_stop_after.txt)")
+NOGRAM_RUN_LINE = ("run: ssl_dinov3_cxr_constlr_nogram_seed_100 (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; DINOv3 recipe: --drop_path_rate 0.3 --rope_rescale_coords 2 "
+                   "--untie_local_cls_norm; stop after epoch %s from chain/constlr_nogram_stop_after.txt)")
+
+
+def ark_run(root, env=ARK_ENV, **override):  # constlr_run with all four stop files written (the phase's 30, the no-Gram trunk's 100, the plain 60, the Ark " 70 "; None: absent)
+    return constlr_run(root, env=env, **dict({PLAIN_STOP_FILE: "60\n", ARK_STOP_FILE: " 70 \n"}, **override))
+
+
+def ark_argv_for(stop):  # nogram_argv_for(stop) with the run dir swapped and ARK_FLAGS appended
+    argv = nogram_argv_for(stop)
+    assert argv[-1:] == ["--no_gram"] and argv.count(NOGRAM_RUN) == 1
+    return [ARK_RUN if arg == NOGRAM_RUN else arg for arg in argv] + ARK_FLAGS
+
+
+ark_root = sandbox()
+result, ark_argv = ark_run(ark_root)
+assert result.returncode == 0 and result.stderr == "" and ark_argv == ark_argv_for("70"), (result.stderr, ark_argv)
+assert result.stdout.splitlines() == [ARK_RUN_LINE % "70"], result.stdout
+expanded["constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_ARK=1"] = "./gaudi.sh " + " ".join(ark_argv)
+result, trunk_70 = constlr_run(ark_root, env=NOGRAM_ENV, **{"constlr_nogram_stop_after.txt": "70\n"})  # the no-Gram trunk at the same stop epoch: this line minus ARK_FLAGS, its own run dir
+assert result.returncode == 0 and trunk_70 == nogram_argv_for("70") and ark_argv == [ARK_RUN if arg == NOGRAM_RUN else arg for arg in trunk_70] + ARK_FLAGS, (trunk_70, ark_argv)
+# the trainer reads it as meant: stop after cycle 70 of the 1000-epoch ceiling, the mode with its resolved settings (clean views, momentum 0.8, no per-step momentum), and every other parsed setting the
+# no-Gram trunk's: only the run dir and the six mode settings (with --momentum_teacher, which the mode leaves None) differ
+ark_parsed = ssl_pretrain.parse_args(ark_argv[ark_argv.index("ssl_pretrain.py") + 1:])
+trunk_parsed_70 = ssl_pretrain.parse_args(trunk_70[trunk_70.index("ssl_pretrain.py") + 1:])
+assert ssl_pretrain.check_args(ark_parsed) == 70 and ark_parsed.epochs == 1000 and ark_parsed.no_gram and ark_parsed.resume
+assert tuple(getattr(ark_parsed, k) for k in X_ARK_KEYS) == (True, 0.8, True, "per_dataset", 100, True) and ark_parsed.momentum_teacher is None
+assert tuple(getattr(ark_parsed, k) for k in RECIPE_KEYS) == (0.3, 2.0, True)
+assert {k for k in vars(ark_parsed) if getattr(ark_parsed, k) != getattr(trunk_parsed_70, k)} == {"output_dir", "momentum_teacher", *X_ARK_KEYS}
+# a missing or invalid Ark stop file is refused naming itself (none of the other three, which stay valid) before gaudi.sh is reached, and before any run: line
+for stop in (None, "", "0", "2.5", "thirty", "-3", "1001", "18446744073709551617"):
+    result, refused_argv = ark_run(ark_root, **{ARK_STOP_FILE: stop})
+    assert result.returncode == 1 and "ERROR" in result.stderr and ARK_STOP_FILE in result.stderr and refused_argv is None and result.stdout == "", (stop, result.stderr)
+    assert not any(other in result.stderr for other in ("constlr_stop_after.txt", "constlr_nogram_stop_after.txt", PLAIN_STOP_FILE)), (stop, result.stderr)
+assert "ceiling of 1000" in result.stderr, result.stderr
+result, solo_argv = ark_run(ark_root, **{"constlr_stop_after.txt": None, "constlr_nogram_stop_after.txt": None, PLAIN_STOP_FILE: None})  # it needs none of the other three
+assert result.returncode == 0 and solo_argv == ark_argv, (result.stderr, solo_argv)
+# the others are byte-unchanged: the phase, the no-Gram trunk and the plain trunk with the Ark stop file present (not read) or absent and CONSTLR_ARK / CONSTLR_BRANCH_ARK empty, and the no-Gram trunk's branch
+ark_empties = ({}, dict(CONSTLR_ARK=""), dict(CONSTLR_BRANCH_ARK=""), dict(CONSTLR_ARK="", CONSTLR_BRANCH_ARK=""))
+for ark_file in (" 70 \n", None):
+    for empty in ark_empties:
+        result, kept_argv = ark_run(ark_root, env=dict(ALLOC4, **empty), **{ARK_STOP_FILE: ark_file})
+        assert result.returncode == 0 and kept_argv == constlr_argv("30") and (result.stdout, result.stderr) == ("", ""), (ark_file, empty, result.stderr, kept_argv)
+        result, kept_argv = ark_run(ark_root, env=dict(NOGRAM_ENV, **empty), **{ARK_STOP_FILE: ark_file})
+        assert result.returncode == 0 and kept_argv == nogram_argv_for("100") and result.stderr == "" and result.stdout.splitlines() == [NOGRAM_RUN_LINE % "100"], (ark_file, empty, result.stdout)
+        result, kept_argv = ark_run(ark_root, env=dict(PLAIN_ENV, **empty), **{ARK_STOP_FILE: ark_file})
+        assert result.returncode == 0 and kept_argv == plain_argv_for("60") and result.stderr == "" and result.stdout.startswith("run: ssl_dinov3_cxr_constlr_nogram_plain_seed_100 ("), (ark_file, empty)
+for empty in ark_empties:
+    bres_ark, kept_bargv = branch_run(branch_dir, "10", "40", env=dict(ALLOC4, **empty))
+    assert bres_ark.returncode == 0 and kept_bargv == bargv and (bres_ark.stdout, bres_ark.stderr) == (bres.stdout, bres.stderr), (empty, bres_ark.stderr)
+# the refusals, each before anything is read (ark_bare has no setting file to miss) and so before anything is launched (ark_root has them all), with its exact text
+ark_bare = sandbox()
+ARK_NEEDS_NOGRAM = "ERROR: CONSTLR_ARK=1 is set without CONSTLR_NOGRAM=1: the Ark-teacher trunk is the no-Gram trunk with the cyclic Ark+ teacher, so set both\n"
+ARK_NO_PLAIN = "ERROR: CONSTLR_ARK and CONSTLR_PLAIN are both set: the Ark-teacher trunk is the no-Gram trunk with the DINOv3 recipe, so unset CONSTLR_PLAIN\n"
+ARK_NO_BRANCH = ("ERROR: CONSTLR_ARK and CONSTLR_BRANCH_* are both set: a branch of the Ark-teacher trunk is CONSTLR_BRANCH_ARK=1 with the CONSTLR_BRANCH_* variables, so unset CONSTLR_ARK\n")
+BRANCH_ARK_NEEDS_BRANCH = ("ERROR: CONSTLR_BRANCH_ARK=1 is set without the CONSTLR_BRANCH_* variables: it picks the Ark-teacher trunk for a branch (run_d1_8_branch_gram_gaudi.sh sets the four)\n")
+ark_refusals = [(dict(NOGRAM_ENV, CONSTLR_ARK=value), "ERROR: CONSTLR_ARK holds '%s', which is not empty or 1\n" % value) for value in ("0", "yes", "2", " 1")]
+ark_refusals += [(dict(ALLOC4, CONSTLR_BRANCH_ARK=value), "ERROR: CONSTLR_BRANCH_ARK holds '%s', which is not empty or 1\n" % value) for value in ("0", "yes", " 1")]
+ark_refusals += [(dict(ALLOC4, CONSTLR_ARK="1"), ARK_NEEDS_NOGRAM), (dict(ALLOC4, CONSTLR_ARK="1", CONSTLR_NOGRAM=""), ARK_NEEDS_NOGRAM), (dict(PLAIN_ENV, CONSTLR_ARK="1"), ARK_NO_PLAIN),
+                 (dict(ALLOC4, CONSTLR_BRANCH_ARK="1"), BRANCH_ARK_NEEDS_BRANCH), (dict(ARK_ENV, CONSTLR_BRANCH_ARK="1"), BRANCH_ARK_NEEDS_BRANCH)]
+ark_refusals += [(dict(ALLOC4, CONSTLR_ARK="1", **branch_vars), ARK_NO_BRANCH) for branch_vars in (dict(CONSTLR_BRANCH_EPOCH="10"), branch_all, dict(branch_all, CONSTLR_BRANCH_ARK="1"))]
+for env, expected_error in ark_refusals:
+    result = run_script(ark_bare, "chain/constlr.sh", env=env)
+    assert result.returncode == 1 and result.stderr == expected_error and result.stdout == "" and launched(ark_bare) is None, (env, result.stderr)
+    result, refused_argv = ark_run(ark_root, env=env)
+    assert result.returncode == 1 and result.stderr == expected_error and result.stdout == "" and refused_argv is None, (env, result.stderr)
+branch_refused(branch_root(), ("10", "40"), "CONSTLR_ARK", "CONSTLR_BRANCH_*", env=dict(ALLOC4, CONSTLR_ARK="1"))  # the branch wrapper sets all four: refused naming both
+# a branch of the Ark-teacher trunk: CONSTLR_BRANCH_ARK=1 through the wrapper reads that trunk's args.json (the cycle's epoch_length) and source, and launches its line with --no_gram replaced
+# by the branch pair, ARK_FLAGS kept after it; without the variable the same arguments name the no-Gram trunk's source instead
+ARK_BRANCH_ENV = dict(ALLOC4, CONSTLR_BRANCH_ARK="1")
+
+
+def ark_branch_root(epoch_length=2665):  # branch_root() plus a stub Ark-teacher trunk with its epoch-1 checkpoint
+    root = branch_root()
+    os.makedirs(os.path.join(root, ARK_TRUNK, "ckpt"))
+    with open(os.path.join(root, ARK_TRUNK, "args.json"), "w") as f:
+        json.dump(dict(no_gram=True, cyclic_ark_teacher=True, heads="per_dataset", data_set=["VinDrCXR", "ChestXray14", "MIMIC", "CheXpert"], epoch_length=epoch_length,
+                       total_steps=1000 * epoch_length), f, indent=2)
+    open(os.path.join(root, ARK_TRUNK, "ckpt", "epoch_0001.pth"), "w").close()
+    return root
+
+
+ark_branch_dir = ark_branch_root()
+ARK_BRANCH_RUN, ARK_SRC1 = "ssl_dinov3_cxr_constlr_arkteacher_e0001_gram_every2665x30_seed_100", ARK_RUN + "/ckpt/epoch_0001.pth"
+ark_steps30 = ",".join(str(2665 + 2665 * i) for i in range(1, 31))  # the next 30 cycle boundaries
+bres_ab, ark_bargv = branch_run(ark_branch_dir, "1", "40", "2665", "30", env=ARK_BRANCH_ENV)
+assert bres_ab.returncode == 0 and bres_ab.stderr == "", bres_ab.stderr
+assert ark_bargv == [("/workspace/" + ARK_BRANCH_RUN) if arg == ARK_RUN else arg for arg in ark_argv_for("40")[:-7]] + [
+    "--branch_from", ARK_SRC1, "--gram_refresh_steps", ark_steps30] + ARK_FLAGS, ark_bargv
+assert bres_ab.stdout.splitlines() == [
+    "run: %s (Gram-anchored branch of %s from its epoch 1: --branch_from %s --gram_refresh_steps in place of --no_gram; stop after epoch 40)" % (ARK_BRANCH_RUN, ARK_TRUNK, ARK_SRC1),
+    "gram refresh steps: %s (branch step 2665 = epoch 1 x epoch_length 2665 from %s/args.json, then every 2665 steps, 30 times)" % (ark_steps30, ARK_TRUNK)], bres_ab.stdout
+expanded["CONSTLR_BRANCH_ARK=1 run_d1_8_branch_gram_gaudi.sh 1 40 2665 30"] = "./gaudi.sh " + " ".join(ark_bargv)
+result, ark_trunk_40 = ark_run(sandbox(), **{ARK_STOP_FILE: "40\n"})  # the real Ark-teacher trunk's line at stop 40: the branch's but for the run dir and the pair in place of --no_gram
+assert result.returncode == 0 and ark_trunk_40 == ark_argv_for("40")
+ark_cut = ark_trunk_40.index("--no_gram")
+assert ark_bargv[:ark_cut] == [("/workspace/" + ARK_BRANCH_RUN) if arg == ARK_RUN else arg for arg in ark_trunk_40[:ark_cut]] and ark_bargv[ark_cut + 4:] == ark_trunk_40[ark_cut + 1:] == ARK_FLAGS
+ark_bparsed = ssl_pretrain.parse_args(ark_bargv[ark_bargv.index("ssl_pretrain.py") + 1:])
+ark_tparsed = ssl_pretrain.parse_args(ark_trunk_40[ark_trunk_40.index("ssl_pretrain.py") + 1:])
+assert (ark_bparsed.branch_from, ark_bparsed.gram_refresh_steps, ark_bparsed.no_gram) == (ARK_SRC1, [2665 * i for i in range(2, 32)], False)
+assert all(getattr(ark_bparsed, k) == getattr(ark_tparsed, k) for k in branch_locked_alike), \
+    {k: (getattr(ark_bparsed, k), getattr(ark_tparsed, k)) for k in branch_locked_alike if getattr(ark_bparsed, k) != getattr(ark_tparsed, k)}  # what --branch_from checks against the source
+branch_refused(ark_branch_dir, ("5", "40"), ARK_TRUNK + "/ckpt/epoch_0005.pth", "nothing to branch from", env=ARK_BRANCH_ENV)
+branch_refused(ark_branch_dir, ("1", "40"), BRANCH_TRUNK + "/ckpt/epoch_0001.pth", "nothing to branch from")  # without CONSTLR_BRANCH_ARK=1: the no-Gram trunk's source
+# the wrappers: bash -n, the executable bit, the sbatch headers, the code (the trunk's: the no-Gram trunk's wrapper but for its last line), the comments' recipe, reasons and stop file, and a copy with its
+# cd pointed at a sandbox launching the Ark line from outside the repo; the smoke job launches the trunk's flags for 1500 steps (past MIMIC's 1441-step dataset epoch at 64 x 4) into a throwaway run dir
+ARK_SCRIPT, ARK_SMOKE = os.path.join(REPO, "run_d1_8_constlr_arkteacher_gaudi.sh"), os.path.join(REPO, "run_d1_8_arkteacher_smoke_gaudi.sh")
+for script in (ARK_SCRIPT, ARK_SMOKE):
+    assert os.access(script, os.X_OK) and stat.S_IMODE(os.stat(script).st_mode) == 0o755, script
+    subprocess.run(["bash", "-n", script], check=True)
+ark_text = open(ARK_SCRIPT).read()
+ark_lines = ark_text.splitlines()
+assert [line[len("#SBATCH "):] for line in ark_lines if line.startswith("#SBATCH ")] == [
+    "--job-name=d1-8-arkteacher", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"], ark_lines
+ark_code = [line for line in ark_lines if line and not line.startswith("#")]
+assert ark_code[-1] == "CONSTLR_NOGRAM=1 CONSTLR_ARK=1 exec ./chain/constlr.sh" and ark_code[:-1] == nogram_code[:-1], ark_code
+assert all(line.startswith("#") for line in ark_lines if "phases.txt" in line), ark_lines
+for needle in ("chain/constlr_arkteacher_stop_after.txt", "largest", "0.80 x teacher + 0.20 x student", "clean views", "per dataset", "first 100 steps", "Gram off", "cycle 1", "4.3 GB"):
+    assert needle in ark_text, needle
+ark_wrap_root = sandbox(timing=True)
+open(os.path.join(ark_wrap_root, "chain", "main_lr.txt"), "w").write("0.002\n")
+open(os.path.join(ark_wrap_root, "chain", ARK_STOP_FILE), "w").write("70\n")  # the only stop file
+assert ark_text.count(BRANCH_CD) == 1, BRANCH_CD
+open(os.path.join(ark_wrap_root, "ark_wrapper.sh"), "w").write(ark_text.replace(BRANCH_CD, "cd %s || exit 1" % shlex.quote(ark_wrap_root)))
+result = subprocess.run(["bash", os.path.join(ark_wrap_root, "ark_wrapper.sh")], cwd=branch_elsewhere, env=ALLOC4, capture_output=True, text=True)
+assert result.returncode == 0 and result.stderr == "" and launched(ark_wrap_root) == ark_argv_for("70") and result.stdout.splitlines() == [ARK_RUN_LINE % "70"], (result.stderr, launched(ark_wrap_root))
+assert os.path.exists(os.path.join(ark_wrap_root, "cards_checked"))
+smoke_text = open(ARK_SMOKE).read()
+assert [line[len("#SBATCH "):] for line in smoke_text.splitlines() if line.startswith("#SBATCH ")] == [
+    "--job-name=d1-8-arkteacher-smoke", "-A grp_jliang12", "-p gaudi", "-q public", "-t 01:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"]
+smoke_root = sandbox(timing=True)
+shutil.copy(ARK_SMOKE, smoke_root)
+result = run_script(smoke_root, os.path.join(smoke_root, "run_d1_8_arkteacher_smoke_gaudi.sh"), cwd=branch_elsewhere, env=dict(ALLOC4, ARK_ROOT=smoke_root))
+smoke_argv = launched(smoke_root)
+assert result.returncode == 0 and smoke_argv == COMMON + ["/workspace/ssl_dinov3_cxr_arkteacher_smoke_seed_100", "--resume", *RECIPE, "--no_gram", *ARK_FLAGS, "--lr", "0.002", "--min_lr", "0.002",
+                                                         "--no_lr_scaling", "--epochs", "1000", "--max_steps", "1500"], (result.stderr, smoke_argv)
+smoke_parsed = ssl_pretrain.parse_args(smoke_argv[smoke_argv.index("ssl_pretrain.py") + 1:])
+assert smoke_parsed.max_steps == 1500 > 368960 // 4 // 64 == 1441 and {k for k in vars(smoke_parsed) if getattr(smoke_parsed, k) != getattr(ark_parsed, k)} == {"output_dir", "max_steps", "stop_after_epochs"}
+for needle in ("cycle (--cyclic_ark_teacher)", "dataset switch after step 1441: MIMIC -> CheXpert", "teacher blend after step 1441", "--max_steps 1500 reached at step 1500"):
+    assert needle in smoke_text, needle  # the expected log lines it documents
+expanded["run_d1_8_arkteacher_smoke_gaudi.sh"] = "./gaudi.sh " + " ".join(smoke_argv)
+print("OK (k) Ark-teacher trunk: constlr.sh with CONSTLR_NOGRAM=1 CONSTLR_ARK=1 (run_d1_8_constlr_arkteacher_gaudi.sh: mode 755, 4 cards, the no-Gram trunk's wrapper but for the job name, the comments and "
+      "CONSTLR_ARK=1, names phases.txt only in comments, launches from outside the repo) launches the no-Gram trunk's line with --cyclic_ark_teacher --heads per_dataset --switch_lock_steps 100 "
+      "--keep_all_checkpoints appended, into ssl_dinov3_cxr_constlr_arkteacher_seed_100, stop epoch from constlr_arkteacher_stop_after.txt only (refused naming itself), and prints the flags in its run: line; "
+      "the argv parses to the trunk's settings but the run dir and the mode (clean views, momentum 0.8, no per-step momentum); CONSTLR_ARK other than empty or 1, without CONSTLR_NOGRAM=1, with CONSTLR_PLAIN "
+      "or any CONSTLR_BRANCH_*, and CONSTLR_BRANCH_ARK other than empty or 1 or without the CONSTLR_BRANCH_* are refused with their exact text before anything is read; CONSTLR_BRANCH_ARK=1 through the "
+      "branch wrapper (`1 40 2665 30`) launches that trunk's line with --no_gram replaced by --branch_from its epoch_0001 --gram_refresh_steps at the next 30 cycle boundaries (its args.json's "
+      "epoch_length), ARK_FLAGS kept, every --branch_from-checked setting = the trunk's; the phase, the no-Gram trunk, the plain trunk and the no-Gram branches launch and print exactly as before with "
+      "CONSTLR_ARK / CONSTLR_BRANCH_ARK empty and the Ark stop file present or absent; run_d1_8_arkteacher_smoke_gaudi.sh (1 hour) launches the trunk's flags for 1500 steps (> MIMIC's 1441) into "
+      "ssl_dinov3_cxr_arkteacher_smoke_seed_100")
+
 # hires.sh ("DINO-X ConstLR 512 px"): a separate run from the stock weights, constlr.sh with only the crops and the batch changed. Four setting files,
 # each missing or invalid one refused naming it before gaudi.sh is reached (the LR file is constlr's own main_lr.txt)
 HIRES_FILES = {"main_lr.txt": "0.002\n", "hires_stop_after.txt": "30\n", "hires_gram_size.txt": "1024\n", "hires_batch_per_gpu.txt": "8\n"}
