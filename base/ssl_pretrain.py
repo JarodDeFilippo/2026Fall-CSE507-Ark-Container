@@ -52,7 +52,9 @@ student, EMA teacher, optimizer, step, epoch, RNG and data order are still the -
 Like the source it is read only when the branch starts; it is recorded in args.json, skipped when the source is compared (the source never has one)
 and locked on --resume (a resume without it, or with another path, is refused). Refused before anything on disk is touched: without --branch_from,
 with --no_gram or --init_from_checkpoint (parse_args); a file that is not a full epoch checkpoint, not of the source's run (the args.output_dir it
-records differs from the source's: the run dir the trunk was launched with, whatever path the file is read from) or not from an epoch before the
+records differs from the source's: the run dir the trunk was launched with, whatever path the file is read from), not saved at an epoch boundary
+(its step is not its epoch x the run's epoch_length, as in a mid-epoch maxsteps_*.pth, whose epoch counts only the completed ones; the checkpoints do
+not record epoch_length, so the branch's is used, which the source's step and epoch have already had to match) or not from an epoch before the
 source's. Without it the anchor is the source's EMA teacher backbone, as above.
 
 --drop_path_rate R, --rope_rescale_coords S and --untie_local_cls_norm are three settings of Meta's DINOv3 training recipe (ssl_default_config's
@@ -442,9 +444,10 @@ def load_branch_source(args, stop_epoch, world_size, epoch_length, data_fingerpr
     return src
 
 
-def load_gram_teacher_source(args, src):
+def load_gram_teacher_source(args, src, epoch_length):
     """The --gram_teacher_from checkpoint, loaded and checked against the --branch_from source src: a full epoch checkpoint of the same run (the args.output_dir
-    both record) from an earlier epoch. Returns (its EMA teacher backbone, mapped as the branch maps the source's, and its epoch); raises otherwise."""
+    both record), saved at an epoch boundary (step = epoch x epoch_length, the branch's: load_branch_source has checked the source against it, and a checkpoint
+    does not record its own), from an earlier epoch. Returns (its EMA teacher backbone, mapped as the branch maps the source's, and its epoch); raises otherwise."""
     gram_src = torch.load(args.gram_teacher_from, map_location="cpu", weights_only=False)
     if not isinstance(gram_src, dict) or not set(BRANCH_SOURCE_KEYS) <= set(gram_src):
         raise ValueError(f"--gram_teacher_from {args.gram_teacher_from} is not a full epoch checkpoint ({', '.join(BRANCH_SOURCE_KEYS)}); "
@@ -453,6 +456,9 @@ def load_gram_teacher_source(args, src):
     if its_run != src_run:
         raise ValueError(f"--gram_teacher_from {args.gram_teacher_from} is not of the run of --branch_from {args.branch_from}: its output_dir is {its_run!r}, "
                          f"the source's {src_run!r}")
+    if gram_src["step"] != gram_src["epoch"] * epoch_length:  # a maxsteps_*.pth: a mid-epoch (or abandoned) state, its epoch the completed ones only
+        raise ValueError(f"--gram_teacher_from {args.gram_teacher_from} is not saved at an epoch boundary: its step {gram_src['step']}, its epoch {gram_src['epoch']}, "
+                         f"so step {gram_src['epoch'] * epoch_length} expected (epoch x epoch_length {epoch_length}); a maxsteps_*.pth is saved mid-epoch")
     if gram_src["epoch"] >= src["epoch"]:
         raise ValueError(f"--gram_teacher_from {args.gram_teacher_from} is from epoch {gram_src['epoch']}, not before the epoch {src['epoch']} of --branch_from "
                          f"{args.branch_from}: the Gram teacher is an earlier iteration of the teacher (DINOv3 Sec. 4.2)")
@@ -638,7 +644,7 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     if branching:  # its every refusal raises here, before anything on disk is touched
         ckpt = load_branch_source(args, stop_epoch, world_size, epoch_length, data_fingerprint)
         if args.gram_teacher_from:
-            gram_from = load_gram_teacher_source(args, ckpt)
+            gram_from = load_gram_teacher_source(args, ckpt, epoch_length)
     if main:  # after the resume / branch checks: a rejected run creates nothing and must not overwrite the record of the real run
         os.makedirs(ckpt_dir, exist_ok=True)
         os.makedirs(export_dir, exist_ok=True)

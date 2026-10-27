@@ -1199,13 +1199,30 @@ assert br_refused("gt_other_run", ValueError, *GTX, SRC1) == ("--gram_teacher_fr
 # the run is the output_dir both checkpoints record, not the file's path: a copy of epoch 1 elsewhere is the same run (through the helper, as load_branch_source above)
 GT_COPY = os.path.join(TMP, "gt_epoch_0001_copy.pth")
 shutil.copy(GT_E1, GT_COPY)
-copy_anchor, copy_epoch = ssl_pretrain.load_gram_teacher_source(make_args(os.path.join(TMP, "gtx_helper"), *GT_ARGS, "--gram_teacher_from", GT_COPY), gt_e2)
+copy_anchor, copy_epoch = ssl_pretrain.load_gram_teacher_source(make_args(os.path.join(TMP, "gtx_helper"), *GT_ARGS, "--gram_teacher_from", GT_COPY), gt_e2, 6)
 assert copy_epoch == 1 and same_state(copy_anchor, gt_anchor) and not os.path.exists(os.path.join(TMP, "gtx_helper"))
+# only an epoch-boundary state (Codex r1 P2 on 4c613a0): GT_M, a no-Gram trunk stopped by --max_steps 9 mid-epoch 2 (ckpt/maxsteps_0000009.pth: step 9, epoch 1, every BRANCH_SOURCE_KEYS key,
+# its run's output_dir) and resumed from its epoch 1 to epoch 2. A branch of its epoch 2 refuses the maxsteps file as its Gram teacher (step 9, not epoch 1 x epoch_length 6 = 6; its epoch 1 is
+# below 2 and it is of the same run, so only this check stands between them) with nothing created, and takes its epoch_0001.pth (step 6 = 1 x 6)
+GT_M = os.path.join(TMP, "GT_M")
+go(GT_M, "--no_gram", "--max_steps", "9", "--stop_after_epochs", "2")
+go(GT_M, "--no_gram", "--resume", "--stop_after_epochs", "2")
+GT_M_MAX, GT_M_E1, GT_M_E2 = (os.path.join(GT_M, "ckpt", name) for name in ("maxsteps_0000009.pth", "epoch_0001.pth", "epoch_0002.pth"))
+gt_m_max, gt_m_e2 = (torch.load(path, map_location="cpu", weights_only=False) for path in (GT_M_MAX, GT_M_E2))
+assert (gt_m_max["step"], gt_m_max["epoch"], gt_m_e2["step"], gt_m_e2["epoch"]) == (9, 1, 12, 2) and set(ssl_pretrain.BRANCH_SOURCE_KEYS) <= set(gt_m_max)
+assert gt_m_max["args"]["output_dir"] == gt_m_e2["args"]["output_dir"] == GT_M
+assert br_refused("gt_maxsteps", ValueError, "--branch_from", GT_M_E2, "--stop_after_epochs", "3", "--gram_teacher_from", GT_M_MAX) == (
+    "--gram_teacher_from %s is not saved at an epoch boundary: its step 9, its epoch 1, so step 6 expected (epoch x epoch_length 6); a maxsteps_*.pth is saved mid-epoch" % GT_M_MAX)
+gt_m_args = make_args(os.path.join(TMP, "gtx_helper"), "--branch_from", GT_M_E2, "--gram_refresh_steps", "100", "--gram_teacher_from", GT_M_E1)
+assert ssl_pretrain.load_gram_teacher_source(gt_m_args, gt_m_e2, 6)[1] == 1  # the epoch-boundary checkpoint of the same run passes
+assert "its step 6, its epoch 1, so step 7 expected" in raises(ValueError, ssl_pretrain.load_gram_teacher_source, gt_m_args, gt_m_e2, 7)  # the epoch_length is the one passed in
+assert not os.path.exists(os.path.join(TMP, "gtx_helper"))
 print("OK (t) --gram_teacher_from: a branch of the no-Gram trunk's epoch 2 with the Gram teacher from its epoch 1: before the first step the Gram teacher is epoch 1's EMA teacher backbone, tensor-equal "
       "(not epoch 2's), and the student / EMA teacher are epoch 2's, the step 12; the 'branched from' line names the file and its epoch; without a refresh it is still epoch 1's at epoch 3; the "
       "checkpoint and args.json record it (the trunk's None); a refresh (after step 18) copies the EMA teacher, not the earlier checkpoint; a --resume without it, with another checkpoint or a missing path is refused naming it (args.json untouched), the same one resumes "
       "with the file gone; at the start a missing file (FileNotFoundError), an export, the same epoch, a later epoch and another run dir's checkpoint are refused with nothing created, and the "
-      "same-run test reads the recorded output_dir (a copy of epoch 1 elsewhere passes)")
+      "same-run test reads the recorded output_dir (a copy of epoch 1 elsewhere passes); a mid-epoch maxsteps_0000009.pth of the source's run (step 9, epoch 1) is refused naming its step, "
+      "epoch and the expected step 6, its epoch_0001.pth passes")
 
 # (u) DINOv3 recipe: --drop_path_rate, --rope_rescale_coords, --untie_local_cls_norm (the student's; train mode only) ------------------------------------------
 from dinov3.models.vision_transformer import DinoVisionTransformer
