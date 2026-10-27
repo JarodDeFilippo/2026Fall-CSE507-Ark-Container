@@ -1773,10 +1773,12 @@ def x_spying():
     """Per step (rec.steps): the batch's dataset and phase tags, the image paths fetched for it, the optimizer groups' (is_backbone, lr, is_last_layer) as the step set them, the teacher's /
     student's / Gram teacher's state before the step, which student parameters have a grad after its backward, and the global crops / the teacher's input;
     per update_ema call (rec.emas): the steps done, m, the teacher before and after, the student it blends in; prune_checkpoints calls (rec.prunes); per set_epoch call
-    (rec.set_epochs): its epoch index and the loader's image count (the set_epoch in place on entry runs, so (g)'s --workers > 0 stand-in still acts)."""
-    rec = SimpleNamespace(steps=[], emas=[], prunes=[], fetched=[], lrs=None, teacher_in=[], set_epochs=[])
+    (rec.set_epochs): its epoch index and the loader's image count (the set_epoch in place on entry runs, so (g)'s --workers > 0 stand-in still acts); per AdamW step
+    (rec.opt): the backbone's and the heads' optimizer state after it (per parameter its exp_avg / exp_avg_sq / step, None before its first update)."""
+    rec = SimpleNamespace(steps=[], emas=[], prunes=[], fetched=[], lrs=None, teacher_in=[], set_epochs=[], opt=[])
     real_getitem, real_update_ema, real_apply = ssl_data.SSLImageDataset.__getitem__, SSLMetaArch.update_ema, ssl_pretrain.apply_optim_scheduler
     real_teacher_output, real_prune, entry_set_epoch = SSLMetaArch.get_teacher_output, ssl_pretrain.prune_checkpoints, ssl_pretrain.set_epoch
+    real_opt_step = torch.optim.AdamW.step
     state = lambda module: {k: v.detach().clone() for k, v in module.state_dict().items()}
 
     def getitem(self, i):
@@ -1815,13 +1817,22 @@ def x_spying():
         rec.set_epochs.append((epoch, len(loader.dataset)))
         return entry_set_epoch(loader, sampler, epoch, seed, rank)
 
+    def opt_step(self, *args, **kwargs):
+        result = real_opt_step(self, *args, **kwargs)
+        snap = lambda backbone: [None if p not in self.state else {k: v.clone() if torch.is_tensor(v) else v for k, v in self.state[p].items()}
+                                 for g in self.param_groups if g["is_backbone"] == backbone for p in g["params"]]
+        rec.opt.append(dict(backbone=snap(True), heads=snap(False)))
+        return result
+
     ssl_data.SSLImageDataset.__getitem__, SSLMetaArch.update_ema, ssl_pretrain.apply_optim_scheduler = getitem, update_ema, apply
     SSLMetaArch.forward_backward, SSLMetaArch.get_teacher_output, ssl_pretrain.prune_checkpoints, ssl_pretrain.set_epoch = forward_backward, get_teacher_output, prune, set_epoch
+    torch.optim.AdamW.step = opt_step
     try:
         yield rec
     finally:
         ssl_data.SSLImageDataset.__getitem__, SSLMetaArch.update_ema, ssl_pretrain.apply_optim_scheduler = real_getitem, real_update_ema, real_apply
         SSLMetaArch.forward_backward, SSLMetaArch.get_teacher_output, ssl_pretrain.prune_checkpoints, ssl_pretrain.set_epoch = real_forward_backward, real_teacher_output, real_prune, entry_set_epoch
+        torch.optim.AdamW.step = real_opt_step
 
 
 # parse: the six settings' defaults are the mixed-batch run (and what a checkpoint without the keys reads as); the mode resolves its own; every one is --resume-locked and none branch-free
@@ -1990,21 +2001,43 @@ for i, s in enumerate(x_steps):
 assert all(torch.equal(x_steps[X_L]["student"][k], v) for k, v in x_steps[0]["student"].items() if k.endswith("last_layer.weight"))  # 8 last layers untouched in cycle 0
 pass_lines = [line for line in x_lines if line.startswith("dataset pass after step ")]
 assert len(pass_lines) == 16 and pass_lines[:2] == [
-    "dataset pass after step 0: MIMIC lock (cycle 0, dataset 1/4, a random half, 6 of 12 images, 3 steps): backbone LR 0, heads train",
+    "dataset pass after step 0: MIMIC lock (cycle 0, dataset 1/4, a random half, 6 of 12 images, 3 steps): backbone frozen (LR 0, no optimizer step), heads train",
     "dataset pass after step 3: MIMIC release (cycle 0, dataset 1/4, all 12 images, 6 steps): backbone and heads train; the backbone at LR 0 in this frozen cycle"], pass_lines
-assert pass_lines[-2:] == ["dataset pass after step 41: VinDrCXR lock (cycle 1, dataset 4/4, a random half, 2 of 4 images, 1 steps): backbone LR 0, heads train",
+assert pass_lines[-2:] == ["dataset pass after step 41: VinDrCXR lock (cycle 1, dataset 4/4, a random half, 2 of 4 images, 1 steps): backbone frozen (LR 0, no optimizer step), heads train",
                            "dataset pass after step 42: VinDrCXR release (cycle 1, dataset 4/4, all 4 images, 2 steps): backbone and heads train"], pass_lines
 assert not any(line.startswith("NOTE: ") or "switch_lock" in line for line in x_lines)
+# the lock is heads-only all the way through the optimizer (Codex r2 P2): across every lock pass, frozen cycle included, the backbone's AdamW state (exp_avg, exp_avg_sq, step) is bitwise what it was
+# before the pass, and so are its weights (above), while the heads' state moves; over each release pass both move, except that in the frozen cycle 0 the release passes are the old LR-0 freeze: weights still,
+# moments advancing (as on db2e33a, and in the lock-off arm below)
+assert len(x_rec.opt) == 2 * X_L
+x_pass_start = 0
+for cycle in (0, 1):
+    for name, phase, n in X_PASSES:
+        first, last = X_L * cycle + x_pass_start, X_L * cycle + x_pass_start + n - 1
+        before = x_rec.opt[first - 1] if first else dict(backbone=[None] * len(x_rec.opt[0]["backbone"]), heads=[None] * len(x_rec.opt[0]["heads"]))
+        if phase == "lock":
+            assert all(same_state(x_rec.opt[i]["backbone"], before["backbone"]) for i in range(first, last + 1)), (cycle, name)  # no moment, no step count moves
+            assert not same_state(x_rec.opt[last]["heads"], before["heads"]), (cycle, name)  # the heads train
+        else:
+            assert not same_state(x_rec.opt[last]["backbone"], before["backbone"]) and all(m is not None for m in x_rec.opt[last]["backbone"]), (cycle, name)  # moments and steps move
+            weights_after = backbone_of(x_steps[last + 1]["student"] if last + 1 < 2 * X_L else load_ckpt(X_A, "epoch_0002.pth")["student"])
+            assert same_state(weights_after, backbone_of(x_steps[first]["student"])) == (cycle == 0), (cycle, name)  # LR 0 in the frozen cycle only
+        x_pass_start = (x_pass_start + n) % X_L
+assert x_rec.opt[2]["backbone"] == [None] * len(x_rec.opt[0]["backbone"])  # after MIMIC's first lock pass the backbone was never updated at all
+x_lock_steps = sum(n for _, phase, n in X_PASSES if phase == "lock")
+assert all(int(m["step"]) == 2 * X_L - 2 * x_lock_steps == 30 for m in x_rec.opt[-1]["backbone"])  # the backbone's AdamW steps: the release steps alone (cycle 0's frozen ones included)
 assert "teacher blend after step 9 (end of MIMIC's release pass, cycle 0, dataset 1/4): teacher <- 0.8 x teacher + 0.2 x student, backbone and all heads" in x_lines
 with x_spying() as x_rec_open:
     open_summary, open_text = xgo(os.path.join(TMP, "X_OPEN"), *ARK_OFF, "--stop_after_epochs", "2")
 assert open_summary["epoch_length"] == 15 and [(s["dataset"], s["phase"]) for s in x_rec_open.steps] == [(name, "release") for name, phase, n in X_PASSES if phase == "release" for _ in range(n)] * 2
 assert all(x_lr(s, True) == {0.0} for s in x_rec_open.steps[:15]) and all(0.0 not in x_lr(s, True) for s in x_rec_open.steps[15:])  # no lock: only the frozen cycle
+assert all(not same_state(x_rec_open.opt[i]["backbone"], x_rec_open.opt[i - 1]["backbone"]) for i in range(1, 30))  # the old LR-0 freeze in cycle 0: the moments advance at every step
+assert same_state(backbone_of(x_rec_open.steps[14]["student"]), backbone_of(x_rec_open.steps[0]["student"])) and all(int(m["step"]) == 30 for m in x_rec_open.opt[-1]["backbone"])
 assert [e["step"] for e in x_rec_open.emas] == [15 * c + e for c in (0, 1) for e in (6, 10, 13, 15)] and len([l for l in open_text.splitlines() if l.startswith("dataset pass ")]) == 8
 assert all(r[15].endswith(":release") for r in read_csv(os.path.join(TMP, "X_OPEN"))[1:]) and "its release pass only (--no_lock_half_pass)" in open_text
 print("OK (x) lock: in cycle 1 the backbone groups are at LR 0 at every step of a lock pass and nonzero at every step of a release pass, the head groups nonzero at every step (and every head's last layer "
       "at LR 0 in cycle 0 only, untouched there); a lock step leaves the backbone bitwise, a release step moves it; in the frozen cycle 0 both passes run with the backbone at 0; 16 pass lines name the "
-      "dataset, lock / release, the images and steps; no NOTE line; without --lock_half_pass a cycle is the 4 release passes (15 steps, blends after 6, 10, 13, 15), its backbone at LR 0 in cycle 0 only")
+      "dataset, lock / release, the images and steps; no NOTE line; across every lock pass (cycle 0 included) the backbone's AdamW exp_avg / exp_avg_sq / step are bitwise unchanged while the heads' move, and over every release pass they move (the backbone's step count is the 30 release steps of the 44), with the weights still only in the frozen cycle 0; without --lock_half_pass a cycle is the 4 release passes (15 steps, blends after 6, 10, 13, 15), its backbone at LR 0 in cycle 0 only")
 
 # (e) per-dataset heads: 4 + 4 (student, teacher), only the batch's pair gets gradients, every head in the optimizer with the shared heads' multipliers; the export is the stock key set
 x_head_names = lambda sd, kind: {k.split(".")[1] for k in sd if k.startswith(kind + ".")}
