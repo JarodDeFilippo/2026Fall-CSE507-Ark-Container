@@ -7,7 +7,8 @@
 #SBATCH -N 1
 #SBATCH --gres=gpu:hl225:4
 #SBATCH -c 72
-#SBATCH --mem=256G
+#SBATCH --mem=128G
+# 128G: measured 2026-10-26 on the running no-Gram trunk (4 cards, 72 CPUs, job 66633863): proportional set size of all its processes 53.3 GB; sstat MaxRSS reports the request itself because page cache is charged to the job cgroup; 256G could not share a Gaudi node with another lab's 1-card jobs that allocate 511 of 515 GB; Sol's own floor is 2 GB per CPU, it accepts a lower request with a notice.
 # DINO-X ConstLR 224, Gram-anchored branch: the no-Gram trunk (run_d1_8_constlr_nogram_gaudi.sh, run dir ssl_dinov3_cxr_constlr_nogram_seed_100) continued EXACTLY from its epoch-K checkpoint (student, EMA
 # teacher, optimizer, step, epoch, schedule position, data order, RNG) with ONE change: the Gram teacher on, anchored to that checkpoint's EMA teacher backbone (ssl_pretrain.py --branch_from). Gram weight 2.0
 # and Gram teacher 448: the trainer's defaults, as in constlr. The trunk keeps running; the branch is a new run dir, so it never writes to the trunk's.

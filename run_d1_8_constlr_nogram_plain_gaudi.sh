@@ -7,7 +7,8 @@
 #SBATCH -N 1
 #SBATCH --gres=gpu:hl225:4
 #SBATCH -c 72
-#SBATCH --mem=256G
+#SBATCH --mem=128G
+# 128G: measured 2026-10-26 on the running no-Gram trunk (4 cards, 72 CPUs, job 66633863): proportional set size of all its processes 53.3 GB; sstat MaxRSS reports the request itself because page cache is charged to the job cgroup; 256G could not share a Gaudi node with another lab's 1-card jobs that allocate 511 of 515 GB; Sol's own floor is 2 GB per CPU, it accepts a lower request with a notice.
 # DINO-X ConstLR 224, no Gram, plain: the one-variable control for the hypothesis "Gram anchoring from step 0 capped the probe" (Jarod, 2026-10-26). It is the `constlr` chain phase (chain/constlr.sh, run dir
 # ssl_dinov3_cxr_constlr_seed_100) with ONE variable changed: the same launch line (ssl_launch's stock DINOv3 ViT-B/16 init, chain/main_lr.txt as the absolute peak LR, --min_lr = --lr, --no_lr_scaling, the
 # --epochs 1000 ceiling, 64 per card on 4 cards = global batch 256, seed 100, 224 / 96 crops still cut at 448 and resized to 224 exactly as in the Gram run) with --no_gram in place of --gram_refresh_steps
