@@ -1167,6 +1167,11 @@ ck_gt = load_ckpt(GT_BR, "epoch_0003.pth")
 assert same_state(ck_gt["gram_teacher"], gt_anchor) and (ck_gt["args"]["gram_teacher_from"], ck_gt["args"]["branch_from"]) == (GT_E1, GT_E2)  # the checkpoint carries it
 info_gt = json.load(open(os.path.join(GT_BR, "args.json")))
 assert (info_gt["gram_teacher_from"], info_gt["branch_from"]) == (GT_E1, GT_E2) and json.load(open(os.path.join(GT_T, "args.json")))["gram_teacher_from"] is None
+# the refreshes still copy the EMA teacher, not the earlier checkpoint: the same branch refreshed after its last step (18) ends with the Gram teacher = its EMA teacher backbone
+summary_gt18, _ = go(os.path.join(TMP, "GT_BR18"), *GT_ARGS, "--gram_teacher_from", GT_E1, "--gram_refresh_steps", "18")  # the later flag wins
+ck_gt18 = load_ckpt(os.path.join(TMP, "GT_BR18"), "epoch_0003.pth")
+assert summary_gt18["gram_refreshes"] == [18] and same_state(ck_gt18["gram_teacher"], {k: v for k, v in ck_gt18["teacher"].items() if k.startswith("backbone.")})
+assert not same_state(ck_gt18["gram_teacher"], gt_anchor)
 # --resume of the branch: the flag is locked (omitted, another checkpoint of the run, or a path that does not exist: refused naming it, args.json untouched); the same one resumes, its file not read
 gt_record = open(os.path.join(GT_BR, "args.json")).read()
 for extra, now in (([], None), (["--gram_teacher_from", GT_E2], GT_E2), (["--gram_teacher_from", os.path.join(TMP, "elsewhere_gt.pth")], os.path.join(TMP, "elsewhere_gt.pth"))):
@@ -1198,7 +1203,7 @@ copy_anchor, copy_epoch = ssl_pretrain.load_gram_teacher_source(make_args(os.pat
 assert copy_epoch == 1 and same_state(copy_anchor, gt_anchor) and not os.path.exists(os.path.join(TMP, "gtx_helper"))
 print("OK (t) --gram_teacher_from: a branch of the no-Gram trunk's epoch 2 with the Gram teacher from its epoch 1: before the first step the Gram teacher is epoch 1's EMA teacher backbone, tensor-equal "
       "(not epoch 2's), and the student / EMA teacher are epoch 2's, the step 12; the 'branched from' line names the file and its epoch; without a refresh it is still epoch 1's at epoch 3; the "
-      "checkpoint and args.json record it (the trunk's None); a --resume without it, with another checkpoint or a missing path is refused naming it (args.json untouched), the same one resumes "
+      "checkpoint and args.json record it (the trunk's None); a refresh (after step 18) copies the EMA teacher, not the earlier checkpoint; a --resume without it, with another checkpoint or a missing path is refused naming it (args.json untouched), the same one resumes "
       "with the file gone; at the start a missing file (FileNotFoundError), an export, the same epoch, a later epoch and another run dir's checkpoint are refused with nothing created, and the "
       "same-run test reads the recorded output_dir (a copy of epoch 1 elsewhere passes)")
 
