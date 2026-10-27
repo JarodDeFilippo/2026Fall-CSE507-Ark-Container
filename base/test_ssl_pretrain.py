@@ -1759,12 +1759,13 @@ def x_dataset_of(path):  # the dataset whose data_dir holds this image
 
 @contextlib.contextmanager
 def x_spying():
-    """Per step (rec.steps): the batch's dataset tag, the image paths fetched for it, the optimizer groups' (is_backbone, lr) as the step set them, the teacher's /
+    """Per step (rec.steps): the batch's dataset tag, the image paths fetched for it, the optimizer groups' (is_backbone, lr, is_last_layer) as the step set them, the teacher's /
     student's / Gram teacher's state before the step, which student parameters have a grad after its backward, and the global crops / the teacher's input;
-    per update_ema call (rec.emas): the steps done, m, the teacher before and after, the student it blends in; prune_checkpoints calls (rec.prunes)."""
-    rec = SimpleNamespace(steps=[], emas=[], prunes=[], fetched=[], lrs=None, teacher_in=[])
+    per update_ema call (rec.emas): the steps done, m, the teacher before and after, the student it blends in; prune_checkpoints calls (rec.prunes); per set_epoch call
+    (rec.set_epochs): its epoch index and the loader's image count (the set_epoch in place on entry runs, so (g)'s --workers > 0 stand-in still acts)."""
+    rec = SimpleNamespace(steps=[], emas=[], prunes=[], fetched=[], lrs=None, teacher_in=[], set_epochs=[])
     real_getitem, real_update_ema, real_apply = ssl_data.SSLImageDataset.__getitem__, SSLMetaArch.update_ema, ssl_pretrain.apply_optim_scheduler
-    real_teacher_output, real_prune = SSLMetaArch.get_teacher_output, ssl_pretrain.prune_checkpoints
+    real_teacher_output, real_prune, entry_set_epoch = SSLMetaArch.get_teacher_output, ssl_pretrain.prune_checkpoints, ssl_pretrain.set_epoch
     state = lambda module: {k: v.detach().clone() for k, v in module.state_dict().items()}
 
     def getitem(self, i):
@@ -1773,7 +1774,7 @@ def x_spying():
 
     def apply(optimizer, *args, **kwargs):
         real_apply(optimizer, *args, **kwargs)
-        rec.lrs = [(g["is_backbone"], g["lr"]) for g in optimizer.param_groups]
+        rec.lrs = [(g["is_backbone"], g["lr"], g["is_last_layer"]) for g in optimizer.param_groups]
 
     def forward_backward(self, data, *, teacher_temp):
         step = dict(dataset=data.get("dataset"), paths=list(rec.fetched), lrs=rec.lrs, teacher=state(self.teacher), student=v_flat(self.student),
@@ -1799,13 +1800,17 @@ def x_spying():
         rec.prunes.append(ckpt_dir)
         return real_prune(ckpt_dir, *args, **kwargs)
 
+    def set_epoch(loader, sampler, epoch, seed, rank):
+        rec.set_epochs.append((epoch, len(loader.dataset)))
+        return entry_set_epoch(loader, sampler, epoch, seed, rank)
+
     ssl_data.SSLImageDataset.__getitem__, SSLMetaArch.update_ema, ssl_pretrain.apply_optim_scheduler = getitem, update_ema, apply
-    SSLMetaArch.forward_backward, SSLMetaArch.get_teacher_output, ssl_pretrain.prune_checkpoints = forward_backward, get_teacher_output, prune
+    SSLMetaArch.forward_backward, SSLMetaArch.get_teacher_output, ssl_pretrain.prune_checkpoints, ssl_pretrain.set_epoch = forward_backward, get_teacher_output, prune, set_epoch
     try:
         yield rec
     finally:
         ssl_data.SSLImageDataset.__getitem__, SSLMetaArch.update_ema, ssl_pretrain.apply_optim_scheduler = real_getitem, real_update_ema, real_apply
-        SSLMetaArch.forward_backward, SSLMetaArch.get_teacher_output, ssl_pretrain.prune_checkpoints = real_forward_backward, real_teacher_output, real_prune
+        SSLMetaArch.forward_backward, SSLMetaArch.get_teacher_output, ssl_pretrain.prune_checkpoints, ssl_pretrain.set_epoch = real_forward_backward, real_teacher_output, real_prune, entry_set_epoch
 
 
 # parse: the six settings' defaults are the mixed-batch run (and what a checkpoint without the keys reads as); the mode resolves its own; every one is --resume-locked and none branch-free
@@ -1842,6 +1847,9 @@ x_steps, x_emas = x_rec.steps, x_rec.emas
 assert ("cycle (--cyclic_ark_teacher): each dataset in turn, largest first by image count, every batch from one dataset: MIMIC 8 images / 4 steps, CheXpert 6 images / 3 steps, "
         "ChestXray14 4 images / 2 steps, VinDrCXR 2 images / 1 steps; 10 steps a cycle (= one epoch)") in x_lines, x_text
 assert x_summary["epoch_length"] == 10 == sum(X_LENGTHS) and json.load(open(os.path.join(X_A, "args.json")))["epoch_length"] == 10 and "epoch_length 10 steps" in x_text
+x_info = json.load(open(os.path.join(X_A, "args.json")))  # args.json records the six settings as resolved (and the per-step momentum as None); a mixed-batch run's, the defaults
+assert tuple(x_info[k] for k in X_ARK_KEYS) == (True, 0.8, True, "per_dataset", 2, False) and x_info["momentum_teacher"] is None
+assert tuple(json.load(open(os.path.join(DIR_A, "args.json")))[k] for k in X_ARK_KEYS) == X_DEFAULTS
 assert [s["dataset"] for s in x_steps] == X_PATTERN * 2, [s["dataset"] for s in x_steps]
 for s in x_steps:
     assert len(s["paths"]) == 2 and {x_dataset_of(path) for path in s["paths"]} == {s["dataset"]}, s["paths"]  # the 2 images of the batch are both its dataset's
@@ -1849,6 +1857,7 @@ for cycle in (0, 1):  # a dataset epoch is a full pass (drop_last: every image o
     seen = [path for s in x_steps[10 * cycle:10 * cycle + 10] for path in s["paths"]]
     assert sorted(seen) == sorted(path for name in X_ORDER for path in ssl_data.image_paths(name, X_CFG[name]["data_dir"], X_CFG[name]["train_list"])), cycle
 assert [s["paths"] for s in x_steps[:10]] != [s["paths"] for s in x_steps[10:]]
+assert x_rec.set_epochs == [(4 * c + j, X_COUNTS[name]) for c in (0, 1) for j, name in enumerate(X_ORDER)]  # each dataset epoch its own index: no shared sampler or worker seed
 x_rows = read_csv(X_A)
 x_col = {c: i for i, c in enumerate(x_rows[0])}
 assert ",".join(x_rows[0]) == CSV_HEADER and all(len(r) == 16 for r in x_rows)
@@ -1858,8 +1867,8 @@ assert x_boundary_rows <= {int(r[0]) for r in x_rows[1:]}  # each is a log row
 assert all(r[x_col["momentum"]] == ("0.8" if int(r[0]) in x_boundary_rows else "1.0") for r in x_rows[1:])  # the momentum the step applied
 assert all(r[x_col["dataset"]] == "-" and r[x_col["momentum"]] == "0.999" for r in rows_a[1:])  # the mixed-batch run (g): "-", the per-step momentum
 print("OK (x) cycle: the logged order is MIMIC, CheXpert, ChestXray14, VinDrCXR by image count (8 / 6 / 4 / 2, not the --data_set order), 4 / 3 / 2 / 1 steps, epoch_length 10 = their sum "
-      "(summary, args.json); each of the 20 steps' batch is tagged with one dataset and both of its images come from that dataset (an image-fetch hook), the tags run in the cycle order, each "
-      "cycle passes over every image once and reshuffles; the CSV's dataset column is the step's, every dataset epoch's last step is a row, the momentum column is 0.8 there and 1.0 elsewhere "
+      "(summary, args.json, which records the six settings as resolved); each of the 20 steps' batch is tagged with one dataset and both of its images come from that dataset (an image-fetch hook), the tags run in the cycle order, each "
+      "cycle passes over every image once and reshuffles, set_epoch runs as each dataset epoch starts with that epoch's own index (0..7 over the 8); the CSV's dataset column is the step's, every dataset epoch's last step is a row, the momentum column is 0.8 there and 1.0 elsewhere "
       "(the mixed-batch run: '-' and 0.999)")
 
 # (b) the teacher: bitwise constant within a dataset epoch, 0.8 x old + 0.2 x student at every boundary (the frozen first cycle's included), backbone and every head; no per-step EMA in
@@ -1922,16 +1931,19 @@ print("OK (x) clean views: the clean teacher crops are bitwise normalize(resize 
       "run's student batches are bitwise the default run's and its losses differ")
 
 # (d) the lock: backbone LR 0 for the first 2 steps of every dataset epoch, nonzero after; the heads train throughout (outside the frozen cycle 0, where the lock is a no-op); one line per switch
-x_lr = lambda s, backbone: {lr for is_backbone, lr in s["lrs"] if is_backbone == backbone}
+x_lr = lambda s, backbone: {lr for is_backbone, lr, _ in s["lrs"] if is_backbone == backbone}
+x_last_lr = lambda s: {lr for _, lr, is_last in s["lrs"] if is_last}  # every head's last layer (the optimizer's last-layer groups hold all 8)
 for i, s in enumerate(x_steps):
     cycle, pos = divmod(i, 10)
     in_dataset = pos - [0, 4, 7, 9][X_ORDER.index(s["dataset"])]
+    assert (x_last_lr(s) == {0.0}) == (cycle == 0), i  # the last-layer freeze (FREEZE_LAST_LAYER_EPOCHS 1): cycle 0, every head
     if cycle == 0:
         assert x_lr(s, True) == {0.0}, i  # the frozen cycle
     else:
         assert (x_lr(s, True) == {0.0}) == (in_dataset < 2) and 0.0 not in x_lr(s, False), (i, s["lrs"])  # MIMIC 0 0 + +, CheXpert 0 0 +, ChestXray14 0 0, VinDrCXR 0
         moved = not same_state(backbone_of(x_steps[i + 1]["student"] if i < 19 else load_ckpt(X_A, "epoch_0002.pth")["student"]), backbone_of(s["student"]))
         assert moved == (in_dataset >= 2), i  # LR 0 leaves the backbone bitwise (AdamW, decoupled decay); an open step moves it
+assert all(torch.equal(x_steps[10]["student"][k], v) for k, v in x_steps[0]["student"].items() if k.endswith("last_layer.weight"))  # 8 last layers untouched in cycle 0
 switch_lines = [line for line in x_lines if line.startswith("dataset switch after step ")]
 assert len(switch_lines) == 8 and switch_lines[0] == ("dataset switch after step 0: start -> MIMIC (cycle 0, dataset 1/4, 4 steps): backbone LR 0 for its first 2 steps "
                                                       "(--switch_lock_steps 2; a no-op in this frozen cycle)"), switch_lines
@@ -1945,7 +1957,7 @@ with x_spying() as x_rec_open:
     xgo(os.path.join(TMP, "X_OPEN"), "--no_gram", "--cyclic_ark_teacher", "--switch_lock_steps", "0", "--stop_after_epochs", "2")
 assert all(x_lr(s, True) == {0.0} for s in x_rec_open.steps[:10]) and all(0.0 not in x_lr(s, True) for s in x_rec_open.steps[10:])  # no lock: only the frozen cycle
 print("OK (x) lock: in cycle 1 the backbone groups are at LR 0 for the first 2 steps of each dataset epoch (MIMIC 2 of 4, CheXpert 2 of 3, ChestXray14 and VinDrCXR all of theirs) and nonzero "
-      "after, the head groups nonzero at every step; a locked step leaves the backbone bitwise, an open one moves it; in the frozen cycle 0 the backbone is at 0 throughout; 8 switch lines "
+      "after, the head groups nonzero at every step (and every head's last layer at LR 0 in cycle 0 only, untouched there); a locked step leaves the backbone bitwise, an open one moves it; in the frozen cycle 0 the backbone is at 0 throughout; 8 switch lines "
       "(start -> MIMIC, ..., VinDrCXR -> MIMIC) name the step, the cycle and the lock (a no-op in cycle 0), and a NOTE names each dataset epoch the lock covers; --switch_lock_steps 0 locks nothing")
 
 # (e) per-dataset heads: 4 + 4 (student, teacher), only the batch's pair gets gradients, every head in the optimizer with the shared heads' multipliers; the export is the stock key set
@@ -1961,6 +1973,9 @@ assert set(x_export) == set(tiny_stock) and all(torch.equal(v, load_ckpt(X_A, "e
 x_models = ng_seeded(build_models, TINY_VIT, None, TINY_HEADS, heads=X_ORDER)
 shared_models = ng_seeded(build_models, TINY_VIT, None, TINY_HEADS)
 assert isinstance(x_models[0].dino_head, torch.nn.ModuleDict) and list(x_models[0].dino_head) == X_ORDER and list(x_models[1].ibot_head) == X_ORDER
+x_heads_built = [h for kind in ("dino_head", "ibot_head") for h in x_models[0][kind].values()]
+assert all(not m.bias.any() for h in x_heads_built for m in h.mlp if isinstance(m, torch.nn.Linear))  # every head through init_weights (zero biases), as the shared ones
+assert all(not torch.equal(a.last_layer.weight, b.last_layer.weight) for i, a in enumerate(x_heads_built) for b in x_heads_built[i + 1:])  # each its own random draw
 
 
 def x_group_of(student):  # parameter name -> (lr_multiplier, wd_multiplier, is_last_layer, is_backbone) of its optimizer group; every parameter in exactly one group
@@ -1985,7 +2000,7 @@ else:
     DinoVisionTransformer(**DINOV3_VITB16_KWARGS).load_state_dict(exported_x, strict=True)
     del stock_x, teacher_x, exported_x
 print("OK (x) heads: the student and the teacher (built, and in the checkpoint) hold one DINO and one iBOT head per dataset; after each of the 20 backwards exactly the backbone and the batch's dataset's "
-      "two heads have gradients; the optimizer puts every parameter in one group, %d groups as with shared heads, each head parameter with the shared head's multipliers (lr, wd, last layer); the "
+      "two heads have gradients; every head is its own random draw through init_weights; the optimizer puts every parameter in one group, %d groups as with shared heads, each head parameter with the shared head's multipliers (lr, wd, last layer); the "
       "export is the stock key set (tiny ViT; ViT-B/16: 188 keys, strict into DinoVisionTransformer)" % x_n_groups)
 
 # (f) --keep_all_checkpoints: nothing pruned over 5 cycles; without it the old policy (the last 3 and every 10th)

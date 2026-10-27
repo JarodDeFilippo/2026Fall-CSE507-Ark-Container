@@ -83,8 +83,9 @@ the frozen first cycle it is a no-op, and a dataset epoch not longer than the lo
 line says so). One line per dataset epoch names the switch, its step and lock, and one per boundary the blend. --heads per_dataset (the mode only: a mixed
 batch has no single dataset) builds one DINO and one iBOT head per dataset (nn.ModuleDicts keyed by name, HEAD_KWARGS, random init), student and teacher;
 the batch's dataset picks the pair for the DINO and iBOT losses (KoLeo acts on the backbone's CLS before any head, so no head is involved there; Sinkhorn-
-Knopp is per batch), the optimizer's groups take every head with today's multipliers, the last-layer freeze (FREEZE_LAST_LAYER_EPOCHS) reaches every head's last layer, and the
-export is the backbone, unchanged. --keep_all_checkpoints (any mode) never prunes ckpt/epoch_*.pth. ssl_losses.csv gains a last column, dataset (the
+Knopp is per batch), the optimizer's groups take every head with today's multipliers, the last-layer freeze (FREEZE_LAST_LAYER_EPOCHS) reaches every
+head's last layer, and the export is the backbone, unchanged. Each dataset's loader starts its workers when its dataset epoch begins (four starts a cycle;
+persistent_workers stays off, as before). --keep_all_checkpoints (any mode) never prunes ckpt/epoch_*.pth. ssl_losses.csv gains a last column, dataset (the
 batch's dataset; "-" outside the mode, so the 15 numeric columns before it are what they were: the DINO-X report builder, chain/gate.py and the DINO-X
 audit read the CSV by header name; a resume keeps the rows of a CSV written before the column, with "-" added), every dataset epoch's last step is a log
 row, and its momentum column is the momentum the step applied: --momentum_teacher outside the mode, 1.0 in it but --ark_teacher_momentum at a dataset
