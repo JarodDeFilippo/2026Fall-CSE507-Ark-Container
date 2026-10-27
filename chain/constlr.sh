@@ -56,6 +56,13 @@
 # with --no_gram replaced by the branch pair, ARK_FLAGS kept after it, so a branch launches its trunk's line plus --branch_from as before (--branch_from requires every mode flag to match the source).
 # Its epoch_length is the cycle's, read from that args.json (2665, or 3997 with the lock, at global batch 256), so `1 40 <epoch_length> 30` refreshes the Gram teacher at the next 30 cycle
 # boundaries. Refused before anything is read: any other non-empty value, and CONSTLR_BRANCH_ARK=1 without the CONSTLR_BRANCH_* variables.
+# CONSTLR_BRANCH_GRAM_EPOCH=J (optional, only together with the four CONSTLR_BRANCH_*; run_d1_8_branch_gram_gaudi.sh sets it from its fifth argument) takes the branch's Gram teacher from the trunk's
+# earlier epoch-J checkpoint instead of the branch point's, DINOv3's early-teacher rule (Sec. 4.2, App. C p. 58: the Gram teacher is "an early iteration of the teacher network"; Jarod, 2026-10-27):
+# --gram_teacher_from /workspace/<TRUNK>/ckpt/epoch_<J %04d>.pth is appended to the branch's line (last, after ARK_FLAGS on an Ark-teacher branch, so the line is the four-variable one plus that pair),
+# and the run dir gets _gt<J %04d> right after its _e<K %04d> token (ssl_dinov3_cxr_constlr_nogram_e0100_gt0010_gram_every2666x3_seed_100), so a branch with and one without it never share a dir;
+# the run: line names J and the file. Works for CONSTLR_BRANCH_ARK=1 branches too (the Ark-teacher trunk keeps every epoch checkpoint), the same token. Refused: set without the CONSTLR_BRANCH_*
+# variables (before anything is read), not a positive integer without a leading zero (printf %04d would read 010 as octal), J not below K, and a missing ckpt/epoch_<J %04d>.pth while the branch dir has
+# no epoch checkpoint of its own yet (as the source: once it has one the trainer resumes from it and never reads either file again). Empty or unset: the branch exactly as above.
 # CONSTLR_ABLATE (drop_path, rope or local_norm; empty or unset = off), only together with CONSTLR_NOGRAM=1, makes the no-Gram trunk a one-flag-off recipe ablation, "DINO-X ConstLR 224, no Gram, one recipe flag off" (Jarod,
 # 2026-10-26; for group members, one arm each): the no-Gram trunk's launch line (RECIPE and --no_gram) with exactly one RECIPE flag and its value removed, drop_path --drop_path_rate 0.3, rope --rope_rescale_coords 2, local_norm
 # --untie_local_cls_norm, the other two kept in RECIPE's order, so each flag's effect on the frozen probe and the cosine maps reads on its own: the plain trunk (CONSTLR_PLAIN) is the all-off control and the no-Gram trunk the all-on one.
@@ -80,6 +87,8 @@ BRANCH_ARK=${CONSTLR_BRANCH_ARK:-}
 [[ -z $ARK || -z $BRANCH ]] || { echo "ERROR: CONSTLR_ARK and CONSTLR_BRANCH_* are both set: a branch of the Ark-teacher trunk is CONSTLR_BRANCH_ARK=1 with the CONSTLR_BRANCH_* variables, so unset CONSTLR_ARK" >&2; exit 1; }
 [[ -z $ARK || -n $NOGRAM ]] || { echo "ERROR: CONSTLR_ARK=1 is set without CONSTLR_NOGRAM=1: the Ark-teacher trunk is the no-Gram trunk with the cyclic Ark+ teacher, so set both" >&2; exit 1; }
 [[ -z $BRANCH_ARK || -n $BRANCH ]] || { echo "ERROR: CONSTLR_BRANCH_ARK=1 is set without the CONSTLR_BRANCH_* variables: it picks the Ark-teacher trunk for a branch (run_d1_8_branch_gram_gaudi.sh sets the four)" >&2; exit 1; }
+GRAM_EPOCH=${CONSTLR_BRANCH_GRAM_EPOCH:-}
+[[ -z $GRAM_EPOCH || -n $BRANCH ]] || { echo "ERROR: CONSTLR_BRANCH_GRAM_EPOCH is set without the CONSTLR_BRANCH_* variables: it picks the trunk epoch a branch's Gram teacher is taken from (run_d1_8_branch_gram_gaudi.sh sets it from its fifth argument)" >&2; exit 1; }
 ARK_LOCK=${CONSTLR_ARK_LOCK:-}
 [[ -z $ARK_LOCK || $ARK_LOCK == 0 || $ARK_LOCK == 1 ]] || { echo "ERROR: CONSTLR_ARK_LOCK holds '$ARK_LOCK', which is not empty, 0 or 1" >&2; exit 1; }
 [[ -z $ARK_LOCK || -n $ARK || -n $BRANCH_ARK ]] || { echo "ERROR: CONSTLR_ARK_LOCK is set without CONSTLR_ARK=1 or CONSTLR_BRANCH_ARK=1: it picks the Ark-teacher trunk's lock arm, so set one of them" >&2; exit 1; }
@@ -146,12 +155,18 @@ else
   STOP_AFTER=$(branch_value STOP CONSTLR_BRANCH_STOP '^[1-9][0-9]*$' 'a positive integer without a leading zero (the epoch the branch stops after)')
   EVERY=$(branch_value EVERY CONSTLR_BRANCH_EVERY '^[1-9][0-9]{0,8}$' 'a positive integer of at most 9 digits (the steps between Gram refreshes)')
   COUNT=$(branch_value COUNT CONSTLR_BRANCH_COUNT '^[1-9][0-9]{0,3}$' 'a positive integer of at most 4 digits (the number of Gram refreshes)')
+  if [[ -n $GRAM_EPOCH ]]; then
+    J=$(branch_value J CONSTLR_BRANCH_GRAM_EPOCH '^[1-9][0-9]*$' 'a positive integer without a leading zero (the trunk epoch the Gram teacher is taken from)')
+  fi
   STOP_FILE="STOP (CONSTLR_BRANCH_STOP)"  # what the ceiling check below names
 fi
 # awk, not (( )): bash arithmetic wraps silently past 2^63 (18446744073709551617 would read as 1)
 awk -v v="$STOP_AFTER" -v cap="$EPOCHS" 'BEGIN { exit !(v + 0 <= cap + 0) }' || { echo "ERROR: $STOP_FILE holds '$STOP_AFTER', which is above the --epochs ceiling of $EPOCHS" >&2; exit 1; }
 if [[ -n $BRANCH ]]; then
   awk -v k="$K" -v s="$STOP_AFTER" 'BEGIN { exit !(k + 0 < s + 0) }' || { echo "ERROR: STOP (CONSTLR_BRANCH_STOP) holds '$STOP_AFTER', which is not after K (CONSTLR_BRANCH_EPOCH) '$K': the branch would train nothing" >&2; exit 1; }
+  if [[ -n $GRAM_EPOCH ]]; then  # J < K <= 1000 from here, so printf %04d is safe
+    awk -v j="$J" -v k="$K" 'BEGIN { exit !(j + 0 < k + 0) }' || { echo "ERROR: J (CONSTLR_BRANCH_GRAM_EPOCH) holds '$J', which is not before K (CONSTLR_BRANCH_EPOCH) '$K': the Gram teacher is taken from an earlier trunk epoch than the branch point (DINOv3's early-teacher rule)" >&2; exit 1; }
+  fi
   # from here K < STOP <= 1000, so (( )) and printf %04d are safe. The trainer writes args.json with json.dump(indent=2): one "epoch_length": N line
   TRUNK_ARGS=$TRUNK/args.json
   EPOCH_LENGTH=$(sed -n 's/^ *"epoch_length": *\([0-9][0-9]*\),\{0,1\} *$/\1/p' "$TRUNK_ARGS" 2>/dev/null || true)
@@ -162,12 +177,22 @@ if [[ -n $BRANCH ]]; then
   fi
   EK=$(printf %04d "$K")
   SOURCE=$TRUNK/ckpt/epoch_$EK.pth
-  RUN=${TRUNK%_seed_100}_e${EK}_gram_every${EVERY}x${COUNT}_seed_100
+  GT_TOKEN= GT_NOTE=  # CONSTLR_BRANCH_GRAM_EPOCH: the run dir's _gt<J %04d> token and the run: line's note
+  if [[ -n $GRAM_EPOCH ]]; then
+    EJ=$(printf %04d "$J")
+    GRAM_SOURCE=$TRUNK/ckpt/epoch_$EJ.pth
+    GT_TOKEN=_gt$EJ
+    GT_NOTE="; Gram teacher from trunk epoch $J (ckpt/epoch_$EJ.pth), DINOv3's early-teacher rule"
+  fi
+  RUN=${TRUNK%_seed_100}_e${EK}${GT_TOKEN}_gram_every${EVERY}x${COUNT}_seed_100
   # the branch's own epoch checkpoints: once there is one, the trainer resumes from it and never reads the source again. The name test is the trainer's epoch_checkpoints():
   # epoch_<digits>.pth (epoch_backup.pth, epoch_0011.pth.tmp and maxsteps_*.pth do not count), and it must be a regular file, not a directory of that name
   OWN=
   for f in "$RUN"/ckpt/epoch_*.pth; do if [[ -f $f && ${f##*/} =~ ^epoch_[0-9]+\.pth$ ]]; then OWN=$f; fi; done  # if, not &&: a false test leaves status 0 under set -e
   [[ -n $OWN || -f $SOURCE ]] || { echo "ERROR: $SOURCE not found and $RUN has no epoch checkpoint of its own yet: nothing to branch from (the trunk keeps every 10th epoch and its last 3)" >&2; exit 1; }
+  if [[ -n $GRAM_EPOCH ]]; then  # the same rule for the Gram teacher's checkpoint: read only at the branch's start
+    [[ -n $OWN || -f $GRAM_SOURCE ]] || { echo "ERROR: $GRAM_SOURCE not found and $RUN has no epoch checkpoint of its own yet: no Gram teacher to take from trunk epoch $J (the trunk keeps every 10th epoch and its last 3)" >&2; exit 1; }
+  fi
   BRANCH_STEP=$(( K * EPOCH_LENGTH ))
   STEPS=()
   for (( i = 1; i <= COUNT; i++ )); do STEPS+=("$(( BRANCH_STEP + i * EVERY ))"); done
@@ -178,7 +203,8 @@ if [[ -n $BRANCH ]]; then
   (( LAST <= END )) || { echo "ERROR: the last Gram refresh, after step $LAST, is past the end of the $EPOCHS-epoch schedule (step $END): it could never run; lower EVERY (CONSTLR_BRANCH_EVERY) or COUNT (CONSTLR_BRANCH_COUNT)" >&2; exit 1; }
   GRAM_ARGS=("${RECIPE[@]}" --branch_from "/workspace/$SOURCE" --gram_refresh_steps "$REFRESH")
   [[ -z $BRANCH_ARK ]] || GRAM_ARGS+=("${ARK_FLAGS[@]}")  # the Ark-teacher trunk's mode flags, where its line has them (no empty-array expansion: bash 3.2 under set -u)
-  echo "run: $RUN (Gram-anchored branch of $TRUNK from its epoch $K: --branch_from /workspace/$SOURCE --gram_refresh_steps in place of --no_gram; stop after epoch $STOP_AFTER)"
+  [[ -z $GRAM_EPOCH ]] || GRAM_ARGS+=(--gram_teacher_from "/workspace/$GRAM_SOURCE")  # last: the line without it plus this pair
+  echo "run: $RUN (Gram-anchored branch of $TRUNK from its epoch $K: --branch_from /workspace/$SOURCE --gram_refresh_steps in place of --no_gram$GT_NOTE; stop after epoch $STOP_AFTER)"
   echo "gram refresh steps: $REFRESH (branch step $BRANCH_STEP = epoch $K x epoch_length $EPOCH_LENGTH from $TRUNK_ARGS, then every $EVERY steps, $COUNT times)"
 fi
 [[ -z $NOGRAM ]] || echo "run: $RUN (no Gram teacher: --no_gram replaces --gram_refresh_steps 10000,20000,30000; $RECIPE_NOTE; stop after epoch $STOP_AFTER from $STOP_FILE)"
