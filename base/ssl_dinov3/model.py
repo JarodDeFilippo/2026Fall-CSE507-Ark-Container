@@ -28,20 +28,25 @@ def build_backbone(vit_kwargs, weights_path=None):
     return backbone
 
 
-def build_models(vit_kwargs, weights_path=None, head_kwargs=HEAD_KWARGS, gram=True):
+def build_models(vit_kwargs, weights_path=None, head_kwargs=HEAD_KWARGS, gram=True, heads=None):
     """Returns (student, teacher, gram_teacher) as nn.ModuleDicts keyed like SSLMetaArch: student/teacher have
     backbone, dino_head, ibot_head; gram_teacher has backbone only. Teacher = copy of the student (init_weights:
     model_ema.load_state_dict(student.state_dict())); Gram teacher = the same stock backbone, frozen, eval.
     gram=False (--no_gram): no Gram teacher is built (the backbone is not copied for it) and gram_teacher is None;
-    student and teacher are built exactly as with gram=True (deepcopy draws no RNG)."""
+    student and teacher are built exactly as with gram=True (deepcopy draws no RNG).
+    heads=None: one shared DINO and one iBOT head. heads=[dataset names] (--heads per_dataset): dino_head and ibot_head are nn.ModuleDicts
+    keyed by those names, one head of each per dataset, every one built and randomly initialized as the shared ones are (in that order: all
+    DINO heads, all iBOT heads, then their init_weights); the teacher copies them all."""
     backbone = build_backbone(vit_kwargs, weights_path)
+    new_head = lambda: DINOHead(in_dim=backbone.embed_dim, **head_kwargs)
     student = nn.ModuleDict(dict(
         backbone=backbone,
-        dino_head=DINOHead(in_dim=backbone.embed_dim, **head_kwargs),
-        ibot_head=DINOHead(in_dim=backbone.embed_dim, **head_kwargs),
+        dino_head=new_head() if heads is None else nn.ModuleDict({name: new_head() for name in heads}),
+        ibot_head=new_head() if heads is None else nn.ModuleDict({name: new_head() for name in heads}),
     ))
-    student.dino_head.init_weights()  # heads are random: the released weights ship none
-    student.ibot_head.init_weights()
+    for head in (student.dino_head, student.ibot_head):  # heads are random: the released weights ship none
+        for one in (head.values() if heads is not None else [head]):
+            one.init_weights()
     teacher = copy.deepcopy(student)
     teacher.requires_grad_(False)
     if not gram:
