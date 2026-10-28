@@ -8,6 +8,7 @@ Only the columns with both a positive and a negative example among the test imag
 It writes, for each dataset,
   <results_root>/<tag>/<dataset>.json    per run the best test epoch (0-based, as the script prints it), its mAUC and per-class AUCs; mean and s.d. over the runs; the weights and the
                                          protocol it ran; flags; for a RayDINO backbone also pretraining_overlap_train (informational: not a flag)
+                                         (written whole or not at all: a synced .part in probe/<dataset>/, hard-linked into place, or renamed where hard links are refused)
   <results_root>/<tag>/probe/<dataset>/  the script's own files: log.txt (a line per batch, large), linear_eval/<dataset>/<tag>/b2/log.txt (the average over the runs) and
                                          run_<i>/ckpt.pth (each run's best epoch)
 Every number in the JSON comes from the script's own run (its returned records) and is checked against the checkpoints (best epoch) and the average line the script wrote to its log.
@@ -205,8 +206,22 @@ def fit(name, args, meta, plan):
     records = main_linearprobing.main(options)
     result = collect(options, probe_dir, records, meta, plan, args.tag)
     result["elapsed_s"] = round(time.time() - began, 1)
-    with open(os.path.join(out, name + ".json"), "x") as f:
-        json.dump(result, f, indent=2, allow_nan=False)
+    text = json.dumps(result, indent=2, allow_nan=False)  # serialized first: a value json cannot write (NaN) raises here, before the JSON or its .part exists
+    final, part = os.path.join(out, name + ".json"), os.path.join(probe_dir, name + ".json.part")  # the .part is inside probe/<dataset>/: run_emb_fit_class.sh's resume rule removes that directory with a half-done fit
+    with open(part, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())  # the text is on disk before the JSON has a name; no directory fsync: a link lost in a crash means no JSON, so the dataset is fitted again, the safe direction
+    try:
+        os.link(part, final)  # atomic, and FileExistsError if final exists (what open(final, "x") gave): the JSON is there whole or not at all, which is why its existence means a finished fit to run_emb_fit_class.sh's resume rule
+    except FileExistsError:
+        raise
+    except OSError:  # a filesystem that refuses a hard link across directories: rename instead. Not race-free (the check, then the rename); what keeps two fits of one dataset apart there is the makedirs(probe_dir) above
+        if os.path.exists(final):
+            raise FileExistsError("{} exists already: refusing to overwrite it".format(final))
+        os.replace(part, final)
+    else:
+        os.remove(part)  # the JSON is the same file under its own name now
     for warning in result["warnings"]:
         print("run_linearprobe: WARNING {} {}: {}".format(args.tag, name, warning), file=sys.stderr)
     overlap = result["flags"]["rad_dino_pretraining_overlap"]
