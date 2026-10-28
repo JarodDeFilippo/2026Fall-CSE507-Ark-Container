@@ -13,7 +13,8 @@ Run from base/:  python -m ark_finetune.test_ark_finetune   (or python ark_finet
 (i3) the Ark+ Swin teacher through the extractor: a lab-style checkpoint's TEACHER (not its student) is embedded before the projector, 1024-d for swin_base; a model that does not fit the file (embed_dim, window, input size),
      a file with no teacher or with a missing block weight, a model name the loader does not build, a ViT's file under a swin name, and a crop that is not the Swin's size are refused; a file with no attn_mask buffers
      loads and says its input size is unverified
-(j) run_emb_gaudi.sh and its A100 sibling run_emb_class.sh in a fake repo, preflight, the allow-list of extractor arguments and the ARK_EMB_NO_FIT switch included, and the drift guard on the block the two share
+(j) run_emb_gaudi.sh and its A100 sibling run_emb_class.sh in a fake repo, preflight, the allow-list of extractor arguments and the ARK_EMB_NO_FIT switch included, and the drift guard on the block the two share;
+    the two-job probe: run_emb_fit_class.sh (the CPU-only fit: refusals, the resume rule, --check) and submit_probe_class.sh (the extraction and the fit as two sbatch lines behind a stub sbatch)
 """
 import ast
 import contextlib
@@ -27,6 +28,7 @@ import pickle
 import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1468,23 +1470,30 @@ assert NVIDIA_STUB != STUB
 USAGE = "Usage: sbatch run_emb_gaudi.sh|run_emb_class.sh <tag: letters, digits, . _ - only> <model> <in-container weights path under /workspace> <imagenet|chestx-ray|none|raddino> [--max_images N] [--datasets NAME...] [--workers N]"  # both print it: $0 is Slurm's spool copy under sbatch, so neither can name itself
 
 
-def run_wrapper(args, files=(STOCK_HOST,), card_check_exit=0, content="x", wrapper=WRAPPER, **env):
+def run_wrapper(args, files=(STOCK_HOST,), card_check_exit=0, content="x", wrapper=WRAPPER, snapshot=False, **env):
     """`wrapper` (run_emb_gaudi.sh unless given) from a different directory, ARK_ROOT = a fake repo whose gaudi.sh and nvidia.sh log each call (one line: OMP_NUM_THREADS, then the arguments; nvidia.sh's behind
-    "nvidia.sh ") and whose gaudi_check_cards.sh records a call. Returns (completed process, the launchers' calls or None, card check ran, results/<tag> listing or None)."""
+    "nvidia.sh ") and whose gaudi_check_cards.sh records a call. A `files` entry is a path, or (path, content). Returns (completed process, the launchers' calls or None, card check ran, results/<tag> listing or None),
+    and with snapshot=True a fifth item: the fake repo afterwards as {path: content}, the stubs and their log left out. The ARK_EMB_* / PROBE_* / SLURM_* variables of the caller's own environment do not reach the wrapper."""
     with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as elsewhere:
         for name, body in (("gaudi.sh", STUB), ("nvidia.sh", NVIDIA_STUB), ("gaudi_check_cards.sh", "echo CARD_CHECK; exit {}".format(card_check_exit))):
             with open(os.path.join(root, name), "w") as f:
                 f.write(body if body.startswith("#!") else "#!/usr/bin/env bash\n" + body + "\n")
             os.chmod(os.path.join(root, name), 0o755)
-        for name in files:
+        for entry in files:
+            name, body = entry if isinstance(entry, tuple) else (entry, content)
             os.makedirs(os.path.join(root, os.path.dirname(name)), exist_ok=True)
             with open(os.path.join(root, name), "w") as f:
-                f.write(content)
+                f.write(body)
         log = os.path.join(root, "stub.log")
-        done = subprocess.run(["bash", wrapper] + list(args), cwd=elsewhere, env=dict(os.environ, ARK_ROOT=root, STUB_LOG=log, **env), capture_output=True, text=True)
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(("ARK_EMB_", "PROBE_", "SLURM_"))}
+        done = subprocess.run(["bash", wrapper] + list(args), cwd=elsewhere, env=dict(environment, ARK_ROOT=root, STUB_LOG=log, **env), capture_output=True, text=True)
         calls = open(log).read().splitlines() if os.path.exists(log) else None
         results = os.path.join(root, "results", args[0] if args else "")
-        return done, calls, "CARD_CHECK" in done.stdout, sorted(os.listdir(results)) if os.path.isdir(results) else None
+        found = (done, calls, "CARD_CHECK" in done.stdout, sorted(os.listdir(results)) if os.path.isdir(results) else None)
+        if not snapshot:
+            return found
+        tree = {os.path.relpath(os.path.join(folder, name), root): open(os.path.join(folder, name)).read() for folder, _, names in os.walk(root) for name in names}
+        return found + ({path: body for path, body in tree.items() if path not in ("gaudi.sh", "nvidia.sh", "gaudi_check_cards.sh", "stub.log")},)
 
 
 done, calls, card_check, results = run_wrapper(["stock", "vit_base_dinov3", STOCK, "imagenet"])
@@ -1576,7 +1585,13 @@ print("OK (j) ARK_EMB_INPUT_SIZE: 224 / 448 / 512 / 768 -> --input_size N --img_
       "(224 / 256); 0, negative, non-numeric, 5 digits, a leading 0 -> exit 2 before anything runs; 512: " + emb_size_command)
 # ARK_EMB_NO_FIT: exactly 1 = extraction only (the extraction is the job's one gaudi.sh call, a stdout line says so, exit 0, results/<tag> never made); unset or empty = the extraction and the four fits as before; any other value
 # exits 2 before anything runs, the weights check, the results preflight and the card check included. The results preflight still runs for a job that does not fit, and a failed extraction still ends it with its own status
-NO_FIT_LINE = "ARK_EMB_NO_FIT=1: extraction only, no fit for tag stock; the job that extracts the last dataset of this tag without ARK_EMB_NO_FIT fits all four"
+def no_fit_line(tag):
+    """The line both extraction launchers print once an ARK_EMB_NO_FIT=1 extraction has succeeded: it names the fit launcher (CPU only) and keeps the one-job way of finishing a per-dataset split."""
+    return ("ARK_EMB_NO_FIT=1: extraction only, no fit for tag {0}; fit it with: sbatch run_emb_fit_class.sh {0} [--datasets NAME...] (CPU only, needs the caches it fits), "
+            "or the job that extracts the last dataset of this tag without ARK_EMB_NO_FIT fits all four").format(tag)
+
+
+NO_FIT_LINE = no_fit_line("stock")
 done, calls, card_check, results = run_wrapper(base, ARK_EMB_NO_FIT="1")
 assert done.returncode == 0 and done.stderr == "" and card_check and calls == [extraction] and results is None, (done, calls, results)
 assert done.stdout.splitlines() == ["CARD_CHECK", NO_FIT_LINE], done.stdout
@@ -1717,7 +1732,299 @@ assert CLASS_SUBMISSION in class_text  # the example in the class script's heade
 class_ark_extraction = "nvidia.sh OMP=unset python -m ark_finetune.extract_embeddings --device cuda --tag arkplus6 --model swin_large_768 --weights {} --normalization imagenet --workers 12 --input_size 768 --img_resize 878 --datasets MIMIC".format(ARK_WEIGHTS)
 done, calls, card_check, results = run_checked(CLASS_WRAPPER, ark_args + ["--datasets", "MIMIC"], files=ark_files, ARK_EMB_INPUT_SIZE="768", ARK_EMB_NO_FIT="1")
 assert done.returncode == 0 and done.stderr == "" and calls == [class_ark_extraction] and not card_check and results is None, (done, calls)
-assert done.stdout == "ARK_EMB_NO_FIT=1: extraction only, no fit for tag arkplus6; the job that extracts the last dataset of this tag without ARK_EMB_NO_FIT fits all four\n", done.stdout
+assert done.stdout == no_fit_line("arkplus6") + "\n", done.stdout
 print("OK (j) Ark+ Swin-L on the class lane: ARK_EMB_INPUT_SIZE=768 ARK_EMB_NO_FIT=1 with --datasets MIMIC expands to the one call {} and the extraction-only line".format(class_ark_extraction[len("nvidia.sh OMP=unset "):]))
+
+
+# the two-job probe: run_emb_fit_class.sh (the CPU-only fit) and submit_probe_class.sh (submits the extraction and, behind it, the fit) --------------------------------------------------------------
+FIT_LAUNCHER = os.path.join(REPO, "run_emb_fit_class.sh")
+SUBMIT = os.path.join(REPO, "submit_probe_class.sh")
+for script in (FIT_LAUNCHER, SUBMIT):
+    subprocess.run(["bash", "-n", script], check=True)
+    assert stat.S_IMODE(os.stat(script).st_mode) == 0o755, script
+fit_text, submit_text = open(FIT_LAUNCHER).read(), open(SUBMIT).read()
+assert fit_text.startswith("#!/usr/bin/env bash\n") and submit_text.startswith("#!/usr/bin/env bash\n")
+# the fit launcher is CPU only: a header with no --gres, no constraint and no GPU of any kind (the class QOS counts GPU minutes), and no launcher but nvidia.sh (the class image; run_linearprobe is cpu only by construction)
+fit_header = re.findall(r"^#SBATCH (.+)$", fit_text, re.M)
+assert fit_header == ["--job-name=b2-fit-c", "-A class_cse49478170fall2026", "-p public,htc", "-q class", "-t 03:00:00", "-N 1", "-c 12", "--mem=64G"], fit_header
+assert not re.search(r"gres|constraint|gpu", " ".join(fit_header)) and "PT_HPU_LAZY_MODE" not in fit_text and "./gaudi.sh" not in fit_text and "extract_embeddings" not in fit_text
+assert not re.search(r"^#SBATCH", submit_text, re.M)  # not an sbatch script: it runs on the login node, submits, prints one line and exits
+# the lines the fit launcher takes verbatim from the block the two extraction launchers share (that block is the extraction's: it also wants <model> <weights> <normalization> and the weights file, which the fit has none of)
+REUSED = ("TAG_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'   # the tag is a directory name: no path separators, no spaces", "datasets=(ChestXray14 CheXpert MIMIC VinDrCXR)",
+          'cd "${ARK_ROOT:-/scratch/$USER/2026Fall-CSE507-Ark-Container}" || exit 1',
+          'taken=()\nfor dataset in "${datasets[@]}"; do\n  for path in "results/$TAG/$dataset.json" "results/$TAG/probe/$dataset"; do\n    [[ -e $path ]] && taken+=("$path")\n  done\ndone')
+for text in REUSED:
+    assert ("\n" + text + "\n") in ("\n" + gaudi_shared) and ("\n" + text + "\n") in ("\n" + class_shared) and ("\n" + text + "\n") in ("\n" + fit_text), text
+print("OK (j) drift guard, three scripts: run_emb_fit_class.sh repeats {} lines of the shared block verbatim (TAG_RE=, datasets=(, the cd to ARK_ROOT, the loop that fills taken with the two paths run_linearprobe refuses); "
+      "its header is {} (no --gres, no constraint, no GPU); submit_probe_class.sh: bash -n, mode 755, no #SBATCH line".format(sum(t.count("\n") + 1 for t in REUSED), " ".join(fit_header)))
+
+FIT_USAGE = "Usage: sbatch run_emb_fit_class.sh <tag: letters, digits, . _ - only> [--datasets NAME...]   (NAME: ChestXray14 CheXpert MIMIC VinDrCXR, each at most once)"
+CACHES = tuple("embeddings/stock/{}/meta.json".format(d) for d in NAMES)  # a dataset's cache as the extractor leaves it: meta.json is the file it writes last
+FIT_CALL = FIT[CLASS_WRAPPER]  # the fit's one call, through nvidia.sh (the class image), OMP_NUM_THREADS=1 inside the container
+
+
+def fits(tag, names):
+    return sorted(FIT_CALL.format(tag, d) for d in names)
+
+
+def seeded(files, content="x"):
+    """{path: content} of the files run_wrapper puts in the fake repo (a `files` entry is a path, or (path, content))."""
+    return {(f[0] if isinstance(f, tuple) else f): (f[1] if isinstance(f, tuple) else content) for f in files}
+
+
+def run_fit(args, files=CACHES, **kwargs):
+    """run_wrapper through run_emb_fit_class.sh, plus what every run must satisfy: each call came through nvidia.sh (never gaudi.sh), none is an extraction, and no card check ran. snapshot=True adds the fake repo afterwards, {path: content}."""
+    found = run_wrapper(args, files=files, wrapper=FIT_LAUNCHER, **kwargs)
+    assert not found[2] and all(c.startswith("nvidia.sh ") and "extract_embeddings" not in c for c in found[1] or []), (args, found[1], found[0].stdout)
+    return found
+
+
+# a fresh fit: the four fits and nothing else, one log each, the PROBE lines in the job log; --datasets: only those, and only their caches are needed
+done, calls, _, results, tree = run_fit(["stock"], snapshot=True)
+assert done.returncode == 0 and done.stderr == "" and sorted(calls) == fits("stock", NAMES) and results == sorted(d + ".log" for d in NAMES), (done, calls, results)
+assert sorted(l for l in done.stdout.splitlines() if l.startswith(("fit ", "PROBE "))) == sorted(["fit {}: done".format(d) for d in NAMES] + ["PROBE tag {}: stub".format(d) for d in NAMES]), done.stdout
+assert not [l for l in done.stdout.splitlines() if l.startswith(("skip ", "refit "))] and tree == dict(seeded(CACHES), **{"results/stock/{}.log".format(d): "PROBE tag {}: stub\n".format(d) for d in NAMES}), (done.stdout, sorted(tree))
+done, calls, _, results = run_fit(["stock", "--datasets", "MIMIC", "CheXpert"], files=CACHES[1:3])  # CheXpert's and MIMIC's caches only
+assert done.returncode == 0 and sorted(calls) == fits("stock", ("CheXpert", "MIMIC")) and results == ["CheXpert.log", "MIMIC.log"], (done, calls, results)
+done, calls, _, results = run_fit(["stock", "--datasets", "VinDrCXR"], files=CACHES[3:] + ("embeddings/other/MIMIC/meta.json",))
+assert done.returncode == 0 and calls == fits("stock", ("VinDrCXR",)) and results == ["VinDrCXR.log"], (done, calls, results)
+# a failed fit: exit 1 after the other three have finished, the failure named with its log
+done, calls, _, results = run_fit(["stock"], FAIL_FIT="MIMIC")
+assert done.returncode == 1 and len(calls) == 4 and "ERROR: fit MIMIC failed (see results/stock/MIMIC.log)" in done.stderr and all("fit {}: done".format(d) in done.stdout for d in NAMES if d != "MIMIC"), (done, calls)
+print("OK (j) run_emb_fit_class.sh: four fits, each a nvidia.sh call 'env OMP_NUM_THREADS=1 python -m ark_linearprobe.run_linearprobe --tag stock --datasets <one>' in parallel, one log each, PROBE lines at the end of the job log, no extraction, no card check; "
+      "--datasets runs only the named ones (and needs only their caches); one failed fit exits 1 after the others finish")
+
+# refusals before anything runs: exit 2 for the arguments, whatever else is in place (the caches there or not, results that exist); nothing is made or removed
+for bad in ([], ["../x"], ["a b"], ["-x"], [""], ["--check"], ["--datasets", "MIMIC"], ["stock", "MIMIC"], ["stock", "--datasets"], ["stock", "--datasets=MIMIC"], ["stock", "--tag", "other"], ["stock", "--max_images", "5"], ["stock", "--workers", "4"]):
+    for files in (CACHES, (), CACHES + ("results/stock/MIMIC.json",)):
+        done, calls, _, _, tree = run_fit(bad, files=files, snapshot=True)
+        assert done.returncode == 2 and done.stderr == FIT_USAGE + "\n" and done.stdout == "" and calls is None and tree == seeded(files), (bad, files, done)
+for extra, message in ((["--datasets", "MIMC"], "ERROR: 'MIMC' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR)\n"), (["--datasets", "mimic"], "ERROR: 'mimic' is not a dataset of the probe"),
+                       (["--datasets", "ChestXray14 CheXpert"], "ERROR: 'ChestXray14 CheXpert' is not a dataset of the probe"), (["--datasets", "MIMIC", "--workers", "4"], "ERROR: '--workers' is not a dataset of the probe"),
+                       (["--datasets", "MIMIC", "MIMIC"], "ERROR: --datasets lists MIMIC twice\n"), (["--datasets", "CheXpert", "MIMIC", "CheXpert"], "ERROR: --datasets lists CheXpert twice\n")):
+    for files in (CACHES, ()):
+        done, calls, _, _, tree = run_fit(["stock"] + extra, files=files, snapshot=True)
+        assert done.returncode == 2 and done.stderr.startswith(message) and done.stdout == "" and calls is None and tree == seeded(files), (extra, files, done)
+for bad in ("0", "yes", "1 ", "true", "11"):  # ARK_EMB_FIT_RESUME: unset, empty or exactly 1
+    for files in (CACHES, (), CACHES + ("results/stock/MIMIC.json",)):
+        done, calls, _, _, tree = run_fit(["stock"], files=files, snapshot=True, ARK_EMB_FIT_RESUME=bad)
+        assert done.returncode == 2 and done.stderr == "ERROR: ARK_EMB_FIT_RESUME='{}' must be unset, empty or 1\n".format(bad) and done.stdout == "" and calls is None and tree == seeded(files), (bad, files, done)
+# the cache of every dataset to be fit must be there (meta.json, written last), and the message names each one that is not
+for present, missing in ((CACHES[:2] + CACHES[3:], ("MIMIC",)), (CACHES[:1], ("CheXpert", "MIMIC", "VinDrCXR")), ((), NAMES)):
+    done, calls, _, _, tree = run_fit(["stock"], files=present, snapshot=True)
+    expected = " ".join("embeddings/stock/{}/meta.json".format(d) for d in missing)
+    assert done.returncode == 1 and done.stdout == "" and calls is None and tree == seeded(present), (missing, done)
+    assert done.stderr.startswith("ERROR: no embeddings for tag stock: {} missing; extract them first (ARK_EMB_NO_FIT=1 sbatch run_emb_class.sh stock ".format(expected)), (missing, done.stderr)
+partial = tuple("embeddings/stock/MIMIC/" + f for f in ("train.npy", "test.npy", "train_paths.txt", "test_paths.txt"))  # a half-written cache has no meta.json yet
+done, calls, _, _, tree = run_fit(["stock"], files=CACHES[:2] + CACHES[3:] + partial, snapshot=True)
+assert done.returncode == 1 and calls is None and "embeddings/stock/MIMIC/meta.json missing;" in done.stderr and "ChestXray14" not in done.stderr, done
+done, calls, _, _ = run_fit(["stock"], files=tuple("embeddings/other/{}/meta.json".format(d) for d in NAMES))  # another tag's cache is no cache
+assert done.returncode == 1 and calls is None and "embeddings/stock/ChestXray14/meta.json embeddings/stock/CheXpert/meta.json" in done.stderr, done
+done, calls, _, _ = run_fit(["stock", "--datasets", "MIMIC"], files=CACHES[:2])  # --datasets: the requested dataset's cache is the one that counts
+assert done.returncode == 1 and calls is None and "no embeddings for tag stock: embeddings/stock/MIMIC/meta.json missing;" in done.stderr, done
+print("OK (j) run_emb_fit_class.sh refusals: the usage line (exit 2) for no tag, a bad tag, a second option or --datasets without names; an unknown, repeated or space-joined dataset name, and ARK_EMB_FIT_RESUME other than unset / empty / 1, exit 2 with "
+      "the cause named; a missing cache (exit 1) names each dataset's embeddings/stock/<dataset>/meta.json that is not there (a half-written cache, another tag's cache and an unrequested dataset's absence count as they should); all before anything runs, nothing made or removed")
+
+# results that exist stop a fresh fit (exit 1) BEFORE anything is removed or run, whichever of the two paths run_linearprobe refuses it is, and before the cache is looked at
+for name in NAMES:
+    for blocking in run_linearprobe.results_of("results", "stock", name):
+        files = CACHES + (os.path.join(blocking, "log.txt") if not blocking.endswith(".json") else blocking,)
+        done, calls, _, _, tree = run_fit(["stock"], files=files, snapshot=True)
+        assert done.returncode == 1 and calls is None and done.stdout == "" and tree == seeded(files), (blocking, done)
+        assert done.stderr.startswith("ERROR: results already exist for tag stock: {}; refusing to fit over them. To finish a fit that stopped half way set ARK_EMB_FIT_RESUME=1 ".format(blocking)), (blocking, done.stderr)
+done, calls, _, _ = run_fit(["stock"], files=CACHES + ("results/stock/CheXpert.json", "results/stock/probe/VinDrCXR/log.txt"))  # several: all are named
+assert done.returncode == 1 and calls is None and "results/stock/CheXpert.json results/stock/probe/VinDrCXR;" in done.stderr, done.stderr
+done, calls, _, _ = run_fit(["stock"], files=("results/stock/CheXpert.json",))  # results first, as run_linearprobe: the missing caches are not the reason
+assert done.returncode == 1 and calls is None and done.stderr.startswith("ERROR: results already exist for tag stock: results/stock/CheXpert.json;"), done.stderr
+done, calls, _, _ = run_fit(["stock"], files=CACHES, ARK_EMB_FIT_RESUME="")  # empty is unset
+assert done.returncode == 0 and len(calls) == 4, done
+done, calls, _, _ = run_fit(["stock"], files=CACHES + ("results/stock/CheXpert.json",), ARK_EMB_FIT_RESUME="")
+assert done.returncode == 1 and calls is None, done
+for files in (("results/stock/MIMIC.log",),  # the launcher's own redirect target from an earlier attempt is not a result
+              ("results/other/ChestXray14.json", "results/other/probe/MIMIC/log.txt"),  # nor is another tag's
+              ("results/stock2/CheXpert.json",)):  # nor a tag that merely starts with this one
+    done, calls, _, _ = run_fit(["stock"], files=CACHES + files)
+    assert done.returncode == 0 and len(calls) == 4, (files, done)
+done, calls, _, _ = run_fit(["stock", "--datasets", "MIMIC"], files=CACHES + ("results/stock/CheXpert.json", "results/stock/probe/VinDrCXR/log.txt"))  # a dataset that is not being fit does not matter
+assert done.returncode == 0 and calls == fits("stock", ("MIMIC",)), (done, calls)
+print("OK (j) run_emb_fit_class.sh, fresh fit: results.json or probe/<dataset> of a dataset to be fit (the two paths run_linearprobe refuses) stop the job with exit 1, the message names them and ARK_EMB_FIT_RESUME=1, nothing is removed or run; "
+      "that check comes before the cache check; a .log, another tag's results, a longer tag or the results of a dataset not being fit do not block")
+
+# the resume rule (ARK_EMB_FIT_RESUME=1) on a synthetic results dir: ChestXray14 finished (its JSON, the script's directory, its log), CheXpert half done (the script's directory and a stale log, no JSON), MIMIC not started, VinDrCXR
+# finished with its JSON alone, and another tag's results beside them
+RESUME_SEED = (("results/stock/ChestXray14.json", "finished json\n"), ("results/stock/probe/ChestXray14/log.txt", "finished script log\n"), ("results/stock/probe/ChestXray14/run_0/ckpt.pth", "finished ckpt\n"),
+               ("results/stock/ChestXray14.log", "PROBE stock ChestXray14: seeded\n"), ("results/stock/probe/CheXpert/log.txt", "half done\n"), ("results/stock/probe/CheXpert/run_0/ckpt.pth", "half-done ckpt\n"),
+               ("results/stock/CheXpert.log", "stale log of the dead fit\n"), ("results/stock/VinDrCXR.json", "json alone\n"), ("results/stock/VinDrCXR.log", "PROBE stock VinDrCXR: seeded\n"),
+               ("results/other/probe/CheXpert/log.txt", "another tag\n"), ("results/other/CheXpert.json", "another tag json\n"))
+done, calls, _, _, tree = run_fit(["stock"], files=CACHES + RESUME_SEED, snapshot=True, ARK_EMB_FIT_RESUME="1")
+lines = done.stdout.splitlines()
+assert done.returncode == 0 and done.stderr == "" and sorted(calls) == fits("stock", ("CheXpert", "MIMIC")), (done, calls)  # only the two that are not finished are fit
+assert [l for l in lines if l.startswith(("skip ", "refit "))] == ["skip ChestXray14: results/stock/ChestXray14.json exists, the fit is finished", "refit CheXpert: removing results/stock/probe/CheXpert, left half done by an earlier fit",
+                                                                    "skip VinDrCXR: results/stock/VinDrCXR.json exists, the fit is finished"], lines
+assert sorted(l for l in lines if l.startswith(("fit ", "PROBE "))) == ["PROBE stock ChestXray14: seeded", "PROBE stock VinDrCXR: seeded", "PROBE tag CheXpert: stub", "PROBE tag MIMIC: stub", "fit CheXpert: done", "fit MIMIC: done"], lines
+expected = seeded(CACHES + RESUME_SEED)  # everything stays byte for byte, but the half-done directory (gone), the stale log (rewritten by the new fit) and MIMIC's new log
+for gone in ("results/stock/probe/CheXpert/log.txt", "results/stock/probe/CheXpert/run_0/ckpt.pth"):
+    del expected[gone]
+expected.update({"results/stock/CheXpert.log": "PROBE tag CheXpert: stub\n", "results/stock/MIMIC.log": "PROBE tag MIMIC: stub\n"})
+assert tree == expected, sorted(set(tree) ^ set(expected)) or [(k, tree[k], expected[k]) for k in tree if tree[k] != expected[k]]
+# every dataset finished: four skip lines, the PROBE lines of their logs, no fit, nothing touched
+finished = tuple(("results/stock/{}.json".format(d), "json\n") for d in NAMES) + tuple(("results/stock/{}.log".format(d), "PROBE stock {}: seeded\n".format(d)) for d in NAMES)
+done, calls, _, _, tree = run_fit(["stock"], files=CACHES + finished, snapshot=True, ARK_EMB_FIT_RESUME="1")
+assert done.returncode == 0 and calls is None and tree == seeded(CACHES + finished), (done, calls)
+assert sorted(done.stdout.splitlines()) == sorted(["skip {0}: results/stock/{0}.json exists, the fit is finished".format(d) for d in NAMES] + ["PROBE stock {}: seeded".format(d) for d in NAMES]), done.stdout
+# nothing started yet: the same as a fresh fit; a half-done dataset whose cache is missing is NOT cleared (the cache check comes first); --datasets: the others are not looked at; a failed fit exits 1 after the others finish
+done, calls, _, _ = run_fit(["stock"], ARK_EMB_FIT_RESUME="1")
+assert done.returncode == 0 and sorted(calls) == fits("stock", NAMES) and not [l for l in done.stdout.splitlines() if l.startswith(("skip ", "refit "))], (done, calls)
+half = (("results/stock/probe/CheXpert/log.txt", "half done\n"), ("results/stock/CheXpert.log", "stale\n"))
+done, calls, _, _, tree = run_fit(["stock"], files=CACHES[:1] + CACHES[2:] + half, snapshot=True, ARK_EMB_FIT_RESUME="1")
+assert done.returncode == 1 and calls is None and "no embeddings for tag stock: embeddings/stock/CheXpert/meta.json missing;" in done.stderr and tree == seeded(CACHES[:1] + CACHES[2:] + half), (done, sorted(tree))
+done, calls, _, _, tree = run_fit(["stock", "--datasets", "MIMIC"], files=CACHES + RESUME_SEED, snapshot=True, ARK_EMB_FIT_RESUME="1")
+assert done.returncode == 0 and calls == fits("stock", ("MIMIC",)) and "results/stock/probe/CheXpert/log.txt" in tree and not [l for l in done.stdout.splitlines() if l.startswith(("skip ", "refit "))], (done, calls)
+done, calls, _, _ = run_fit(["stock"], files=CACHES + RESUME_SEED, ARK_EMB_FIT_RESUME="1", FAIL_FIT="CheXpert")
+assert done.returncode == 1 and len(calls) == 2 and "ERROR: fit CheXpert failed (see results/stock/CheXpert.log)" in done.stderr and "fit MIMIC: done" in done.stdout, (done, calls)
+print("OK (j) run_emb_fit_class.sh resume rule (ARK_EMB_FIT_RESUME=1): a dataset whose results/<tag>/<dataset>.json exists is skipped with a line and never touched (its probe directory, log and JSON stay byte for byte); one without it has its "
+      "results/<tag>/probe/<dataset> removed, with a line, and is fit again; the other tag's results are never touched; the fits are the unfinished datasets only, the job log carries every dataset's PROBE line; all finished -> no fit; "
+      "nothing started -> a fresh fit; a missing cache stops it before anything is removed; --datasets limits what is looked at; one failed fit exits 1 after the others")
+
+# --check, the first argument: the arguments and results checks, no cache check, nothing run, written or removed, and silence on success (submit_probe_class.sh prints one line of its own)
+for args in (["--check", "stock"], ["--check", "stock", "--datasets", "MIMIC", "CheXpert"]):
+    done, calls, _, results, tree = run_fit(args, files=(), snapshot=True)  # no caches: the extraction has not run yet when the wrapper asks
+    assert done.returncode == 0 and done.stdout == "" and done.stderr == "" and calls is None and results is None and tree == {}, (args, done)
+done, calls, _, _, tree = run_fit(["--check", "stock"], files=CACHES + RESUME_SEED, snapshot=True, ARK_EMB_FIT_RESUME="1")  # resume mode: nothing is removed
+assert done.returncode == 0 and done.stdout == "" and calls is None and tree == seeded(CACHES + RESUME_SEED), done
+for args, files, code, message in ((["--check"], (), 2, FIT_USAGE + "\n"), (["--check", "../x"], (), 2, FIT_USAGE + "\n"), (["--check", "stock", "--datasets", "MIMC"], (), 2, "ERROR: 'MIMC' is not a dataset of the probe"),
+                                    (["--check", "stock", "--datasets", "MIMIC", "MIMIC"], (), 2, "ERROR: --datasets lists MIMIC twice\n"), (["--check", "stock"], ("results/stock/CheXpert.json",), 1, "ERROR: results already exist for tag stock: results/stock/CheXpert.json;"),
+                                    (["--check", "stock"], ("results/stock/probe/MIMIC/log.txt",), 1, "ERROR: results already exist for tag stock: results/stock/probe/MIMIC;")):
+    done, calls, _, _, tree = run_fit(args, files=files, snapshot=True)
+    assert done.returncode == code and done.stderr.startswith(message) and done.stdout == "" and calls is None and tree == seeded(files), (args, files, done)
+done, calls, _, _, tree = run_fit(["--check", "stock"], files=(), snapshot=True, ARK_EMB_FIT_RESUME="2")
+assert done.returncode == 2 and done.stderr == "ERROR: ARK_EMB_FIT_RESUME='2' must be unset, empty or 1\n" and calls is None, done
+print("OK (j) run_emb_fit_class.sh --check: silent exit 0 without the caches, with the same refusals as the real run (usage, dataset names, ARK_EMB_FIT_RESUME, results that exist), no call, nothing written or removed, not even in resume mode")
+
+# run_emb_class.sh --check, the first argument: the shared block's checks (usage, extras, ARK_EMB_*, weights, results), then exit 0 with no extraction, no fit and no output
+done, calls, card_check, results, tree = run_wrapper(["--check"] + base, wrapper=CLASS_WRAPPER, snapshot=True)
+assert done.returncode == 0 and done.stdout == "" and done.stderr == "" and calls is None and results is None and tree == {STOCK_HOST: "x"}, done
+done, calls, _, results = run_wrapper(["--check"] + base + ["--datasets", "MIMIC", "CheXpert"], wrapper=CLASS_WRAPPER, ARK_EMB_INPUT_SIZE="512", ARK_EMB_NO_FIT="1")
+assert done.returncode == 0 and done.stdout == "" and done.stderr == "" and calls is None and results is None, done
+for args, kwargs, code, message in ((["--check"], {}, 2, USAGE + "\n"), (["--check"] + base[:3], {}, 2, USAGE + "\n"), (["--check", "../x"] + base[1:], {}, 2, USAGE + "\n"), (["--check"] + base + ["--tag", "other"], {}, 2, "ERROR: --tag: not accepted after <normalization>."),
+                                    (["--check"] + base, dict(files=()), 1, "ERROR: weights not found at ./" + STOCK_HOST), (["--check"] + base, dict(files=(STOCK_HOST, "results/stock/CheXpert.json")), 1, "ERROR: results already exist for tag stock: results/stock/CheXpert.json;"),
+                                    (["--check"] + base, dict(ARK_EMB_INPUT_SIZE="12345"), 2, "ERROR: ARK_EMB_INPUT_SIZE='12345'"), (["--check"] + base, dict(ARK_EMB_NO_FIT="yes"), 2, "ERROR: ARK_EMB_NO_FIT='yes' must be unset, empty or 1\n")):
+    done, calls, card_check, results = run_wrapper(args, wrapper=CLASS_WRAPPER, **kwargs)
+    assert done.returncode == code and done.stderr.startswith(message) and done.stdout == "" and calls is None and not card_check, (args, kwargs, done)
+print("OK (j) run_emb_class.sh --check: exit 0, no output, no call (no extraction, no fit) when the usage, extras, ARK_EMB_*, weights and results checks pass; the same exits and messages as the real run when they do not (2 / 2 / 2 / 1 / 1 / 2 / 2)")
+
+# the extraction-only exit message names the fit launcher (both extraction launchers), with the tag filled in, and says it is CPU only
+for wrapper in (WRAPPER, CLASS_WRAPPER):
+    done, calls, _, results = run_wrapper(base, wrapper=wrapper, ARK_EMB_NO_FIT="1")
+    assert done.returncode == 0 and done.stdout.splitlines()[-1] == no_fit_line("stock") and "sbatch run_emb_fit_class.sh stock [--datasets NAME...] (CPU only" in done.stdout, (wrapper, done.stdout)
+print("OK (j) ARK_EMB_NO_FIT=1 exit message, both extraction launchers: " + no_fit_line("<tag>"))
+
+# submit_probe_class.sh: the two sbatch lines behind a stub sbatch (and scancel) first on PATH; the launchers' own --check runs in the fake repo
+SBATCH_STUB = """#!/usr/bin/env bash
+n=$(( $(cat "$STUB_DIR/count" 2>/dev/null || echo 0) + 1 ))
+echo $n > "$STUB_DIR/count"
+{ printf 'NO_FIT=%s INPUT_SIZE=%s RESUME=%s\\n' "${ARK_EMB_NO_FIT-unset}" "${ARK_EMB_INPUT_SIZE-unset}" "${ARK_EMB_FIT_RESUME-unset}"; printf '%s\\n' "$@"; } > "$STUB_DIR/sbatch.$n"
+[[ $n == "${SBATCH_FAIL_ON:-}" ]] && { echo "sbatch: error: stub failure" >&2; exit 1; }
+printed="SBATCH_PRINT_$n"
+echo "${!printed:-$((1000 + n))}"
+"""
+SCANCEL_STUB = """#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/scancel.log"
+[[ -n "${SCANCEL_FAIL:-}" ]] && exit 1
+exit 0
+"""
+SUBMIT_USAGE = "Usage: ./submit_probe_class.sh <tag> <model> <in-container weights path under /workspace> <imagenet|chestx-ray|none|raddino> [--datasets NAME...]"
+
+
+def run_submit(args, files=(STOCK_HOST,), **env):
+    """submit_probe_class.sh run directly (its shebang and mode) from another directory, ARK_ROOT = a fake repo holding `files` and a stub nvidia.sh (a launcher that really ran would log a call there), with stub sbatch and scancel first on PATH.
+    Returns (completed process, one (environment line, argv) per sbatch call, the scancel argument lines, the launchers' calls or None). Every run must also satisfy: at most two sbatch calls, the second with the dependency on the id the first printed."""
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as elsewhere, tempfile.TemporaryDirectory() as stubs:
+        os.makedirs(os.path.join(stubs, "bin"))
+        for folder, name, body in ((os.path.join(stubs, "bin"), "sbatch", SBATCH_STUB), (os.path.join(stubs, "bin"), "scancel", SCANCEL_STUB), (root, "nvidia.sh", NVIDIA_STUB)):
+            with open(os.path.join(folder, name), "w") as f:
+                f.write(body)
+            os.chmod(os.path.join(folder, name), 0o755)
+        for name in files:
+            os.makedirs(os.path.join(root, os.path.dirname(name)), exist_ok=True)
+            with open(os.path.join(root, name), "w") as f:
+                f.write("x")
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(("ARK_EMB_", "PROBE_", "SLURM_", "SBATCH_", "SCANCEL_"))}
+        environment.update(ARK_ROOT=root, STUB_LOG=os.path.join(root, "stub.log"), STUB_DIR=stubs, PATH=os.path.join(stubs, "bin") + os.pathsep + os.environ["PATH"])
+        environment.update(env)
+        done = subprocess.run([SUBMIT] + list(args), cwd=elsewhere, env=environment, capture_output=True, text=True)
+        sbatch = []
+        while os.path.exists(os.path.join(stubs, "sbatch.%d" % (len(sbatch) + 1))):
+            lines = open(os.path.join(stubs, "sbatch.%d" % (len(sbatch) + 1))).read().split("\n")[:-1]
+            sbatch.append((lines[0], lines[1:]))
+        scancel = open(os.path.join(stubs, "scancel.log")).read().splitlines() if os.path.exists(os.path.join(stubs, "scancel.log")) else []
+        calls = open(os.path.join(root, "stub.log")).read().splitlines() if os.path.exists(os.path.join(root, "stub.log")) else None
+    first_id = env.get("SBATCH_PRINT_1", "1001").split(";")[0]
+    assert len(sbatch) <= 2 and (len(sbatch) < 2 or "--dependency=afterok:" + first_id in sbatch[1][1]), (args, sbatch)  # never a second submission without the dependency
+    return done, sbatch, scancel, calls
+
+
+X_DEFAULT = ["--parsable", "-J", "probe-stock-x", "-p", "public,htc", "-q", "class", "--constraint=a100", "-t", "01:15:00", "run_emb_class.sh"] + base
+FIT_DEFAULT = ["--parsable", "-J", "probe-stock-fit", "-t", "03:00:00", "--dependency=afterok:1001", "run_emb_fit_class.sh", "stock"]
+done, sbatch, scancel, calls = run_submit(base)
+assert done.returncode == 0 and done.stderr == "" and done.stdout == "probe stock: extraction 1001, fit 1002 (afterok)\n" and scancel == [] and calls is None, (done, scancel, calls)
+assert sbatch == [("NO_FIT=1 INPUT_SIZE=unset RESUME=unset", X_DEFAULT), ("NO_FIT=unset INPUT_SIZE=unset RESUME=unset", FIT_DEFAULT)], sbatch  # the extraction alone has ARK_EMB_NO_FIT=1; the fit is GPU-free: no -p/-q/constraint/gres of the extraction
+assert not [a for a in sbatch[1][1] if "gres" in a or "constraint" in a or "gpu" in a or a.startswith("-p")], sbatch[1]
+# --datasets goes to both jobs; the limits and the constraint are overridable; ARK_EMB_INPUT_SIZE reaches the extraction; an inherited ARK_EMB_FIT_RESUME does not reach the fit (a pair is a fresh fit); an inherited ARK_EMB_NO_FIT is the wrapper's 1 on the extraction
+done, sbatch, scancel, calls = run_submit(base + ["--datasets", "MIMIC", "CheXpert"], ARK_EMB_INPUT_SIZE="512", PROBE_X_TIME="2:00:00", PROBE_X_CONSTRAINT="a100_80", PROBE_FIT_TIME="1-00:00:00", ARK_EMB_FIT_RESUME="1", ARK_EMB_NO_FIT="yes")
+assert done.returncode == 0 and done.stdout == "probe stock: extraction 1001, fit 1002 (afterok)\n" and scancel == [] and calls is None, (done, scancel, calls)
+assert sbatch[0] == ("NO_FIT=1 INPUT_SIZE=512 RESUME=unset", ["--parsable", "-J", "probe-stock-x", "-p", "public,htc", "-q", "class", "--constraint=a100_80", "-t", "2:00:00", "run_emb_class.sh"] + base + ["--datasets", "MIMIC", "CheXpert"]), sbatch[0]
+assert sbatch[1] == ("NO_FIT=yes INPUT_SIZE=512 RESUME=unset", ["--parsable", "-J", "probe-stock-fit", "-t", "1-00:00:00", "--dependency=afterok:1001", "run_emb_fit_class.sh", "stock", "--datasets", "MIMIC", "CheXpert"]), sbatch[1]
+done, sbatch, scancel, calls = run_submit(base, PROBE_X_TIME="", PROBE_X_CONSTRAINT="", PROBE_FIT_TIME="")  # empty is unset: the defaults
+assert done.returncode == 0 and [argv for _, argv in sbatch] == [X_DEFAULT, FIT_DEFAULT], sbatch
+done, sbatch, scancel, calls = run_submit(["a.b-c_1", "vit_large_raydino", "/workspace/weights/xray_dino_vitl16_pretrained-ad31c2b0.pth", "imagenet"], files=("weights/xray_dino_vitl16_pretrained-ad31c2b0.pth",))  # another tag, model and weights: all in both names and arguments
+assert done.returncode == 0 and done.stdout == "probe a.b-c_1: extraction 1001, fit 1002 (afterok)\n" and sbatch[0][1][2] == "probe-a.b-c_1-x" and sbatch[1][1][2] == "probe-a.b-c_1-fit" and sbatch[1][1][-1] == "a.b-c_1", sbatch
+done, sbatch, scancel, calls = run_submit(base, SBATCH_PRINT_1="4242;sol", SBATCH_PRINT_2="4243;sol")  # --parsable may print "<id>;<cluster>"
+assert done.returncode == 0 and done.stdout == "probe stock: extraction 4242, fit 4243 (afterok)\n" and sbatch[1][1][5] == "--dependency=afterok:4242", (done, sbatch)
+print("OK (j) submit_probe_class.sh: the extraction line 'ARK_EMB_NO_FIT=1 sbatch " + " ".join(X_DEFAULT) + "' then the fit line 'sbatch " + " ".join(FIT_DEFAULT) + "' (afterok on the id the first printed, '<id>;<cluster>' accepted), "
+      "one stdout line 'probe <tag>: extraction <id1>, fit <id2> (afterok)'; --datasets reaches both jobs; PROBE_X_TIME / PROBE_X_CONSTRAINT / PROBE_FIT_TIME override (empty = default); ARK_EMB_INPUT_SIZE reaches the extraction; "
+      "an inherited ARK_EMB_FIT_RESUME does not reach the fit; the fit line has no -p, -q, constraint or gres")
+
+# nothing is submitted when a launcher's check refuses (exit 2 for the arguments, 1 for the weights file and for results that exist), when the shape is wrong (the wrapper's own usage), or inside a Slurm job; the launcher's message is kept
+CHECK_REFUSED = "submit_probe_class.sh: a launcher's check refused the arguments (exit {}); nothing was submitted\n"
+for args, files, env, code, stderr in ((base, (), {}, 1, None), (base[:3] + ["caffe"], (STOCK_HOST,), {}, 2, USAGE + "\n"), (["../x"] + base[1:], (STOCK_HOST,), {}, 2, USAGE + "\n"), (["stock", "vit_base_dinov3", "weights/x.pth", "imagenet"], (STOCK_HOST,), {}, 2, USAGE + "\n"),
+                                       (base, (STOCK_HOST,), dict(ARK_EMB_INPUT_SIZE="12345"), 2, None), (base, (STOCK_HOST,), dict(ARK_EMB_INPUT_SIZE="0512"), 2, None),
+                                       (base + ["--datasets"], (STOCK_HOST,), {}, 2, FIT_USAGE + "\n"), (base + ["--datasets", "MIMC"], (STOCK_HOST,), {}, 2, "ERROR: 'MIMC' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR)\n"),
+                                       (base + ["--datasets", "MIMIC", "MIMIC"], (STOCK_HOST,), {}, 2, "ERROR: --datasets lists MIMIC twice\n"), (base + ["--datasets", "MIMIC", "--max_images", "5"], (STOCK_HOST,), {}, 2, "ERROR: '--max_images' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR)\n")):
+    done, sbatch, scancel, calls = run_submit(args, files=files, **env)
+    assert done.returncode == code and sbatch == [] and scancel == [] and calls is None and done.stdout == "", (args, env, done)
+    assert done.stderr.endswith(CHECK_REFUSED.format(code)) and (stderr is None or done.stderr == stderr + CHECK_REFUSED.format(code)), (args, env, done.stderr)
+assert "ERROR: weights not found at ./" + STOCK_HOST in run_submit(base, files=())[0].stderr and "ERROR: ARK_EMB_INPUT_SIZE='12345'" in run_submit(base, ARK_EMB_INPUT_SIZE="12345")[0].stderr
+for name in NAMES:  # results that exist for the tag: the same preflight as the extraction launcher's, so nothing is queued that the fit would refuse to overwrite
+    for blocking in run_linearprobe.results_of("results", "stock", name):
+        done, sbatch, scancel, calls = run_submit(base, files=(STOCK_HOST, os.path.join(blocking, "log.txt") if not blocking.endswith(".json") else blocking))
+        assert done.returncode == 1 and sbatch == [] and scancel == [] and calls is None and done.stdout == "", (blocking, done)
+        assert "ERROR: results already exist for tag stock: {}; refusing to start the extraction".format(blocking) in done.stderr and done.stderr.endswith(CHECK_REFUSED.format(1)), (blocking, done.stderr)
+done, sbatch, scancel, calls = run_submit(base, files=(STOCK_HOST, "results/stock/CheXpert.json"), ARK_EMB_FIT_RESUME="1")  # an inherited resume switch does not make an existing result acceptable
+assert done.returncode == 1 and sbatch == [] and "results already exist for tag stock" in done.stderr, done
+for args in ([], base[:3], base + ["--max_images", "5"], base + ["--workers", "4"], base + ["--tag", "x"], base + ["--datasets=MIMIC"]):
+    done, sbatch, scancel, calls = run_submit(args)
+    assert (done.returncode, done.stdout, done.stderr, sbatch, scancel, calls) == (2, "", SUBMIT_USAGE + "\n", [], [], None), (args, done)
+done, sbatch, scancel, calls = run_submit(base, SLURM_JOB_ID="7")
+assert done.returncode == 1 and done.stdout == "" and sbatch == [] and scancel == [] and calls is None and done.stderr == "ERROR: submit_probe_class.sh submits the jobs itself: run it on the login node, not inside Slurm job 7\n", done
+print("OK (j) submit_probe_class.sh refusals, nothing submitted and no launcher run: a bad tag, normalization or weights path, an invalid ARK_EMB_INPUT_SIZE (the extraction launcher's check, exit 2), a missing weights file (1), results that exist (1; the JSON or "
+      "probe/<dataset> of any of the four), --datasets with no names, an unknown or repeated name or another option after it (the fit launcher's check, 2), and results that exist even with an inherited ARK_EMB_FIT_RESUME=1; every one keeps the "
+      "launcher's own message and ends with 'nothing was submitted'; the wrapper's own usage (2) for fewer than four arguments or a fifth that is not --datasets; exit 1 inside a Slurm job")
+
+# a failed submission: the extraction alone (nothing is queued, sbatch's own message); a fit that cannot be submitted after the extraction was -> the extraction is cancelled by id; a printed id that is no id
+done, sbatch, scancel, calls = run_submit(base, SBATCH_FAIL_ON="1")
+assert done.returncode == 1 and done.stdout == "" and len(sbatch) == 1 and scancel == [], (done, sbatch, scancel)
+assert done.stderr == "sbatch: error: stub failure\nERROR: sbatch refused the extraction job; nothing was submitted\n", done.stderr
+done, sbatch, scancel, calls = run_submit(base, SBATCH_FAIL_ON="2")
+assert done.returncode == 1 and done.stdout == "" and len(sbatch) == 2 and scancel == ["1001"], (done, sbatch, scancel)
+assert done.stderr == "sbatch: error: stub failure\nERROR: the fit job was not submitted (sbatch printed ''); extraction job 1001 cancelled. Fix the cause and run this again\n", done.stderr
+done, sbatch, scancel, calls = run_submit(base, SBATCH_FAIL_ON="2", SCANCEL_FAIL="1")
+assert done.returncode == 1 and scancel == ["1001"] and "WARNING: scancel 1001 failed: cancel the extraction by hand" in done.stderr, done
+done, sbatch, scancel, calls = run_submit(base, SBATCH_PRINT_2="oops")
+assert done.returncode == 1 and done.stdout == "" and scancel == ["1001"] and "the fit job was not submitted (sbatch printed 'oops'); extraction job 1001 cancelled" in done.stderr, done
+done, sbatch, scancel, calls = run_submit(base, SBATCH_PRINT_1="not-an-id")
+assert done.returncode == 1 and done.stdout == "" and len(sbatch) == 1 and scancel == [] and done.stderr == "ERROR: sbatch printed 'not-an-id' for the extraction, not a job id; the fit was not submitted\n", done
+print("OK (j) submit_probe_class.sh failures: sbatch failing on the extraction submits nothing more; failing (or printing no id) on the fit cancels the extraction by id (scancel 1001), a failed scancel is a WARNING; "
+      "a non-numeric extraction id stops before the fit; the fit is never submitted without --dependency=afterok:<the extraction's id>")
 
 print("ALL OK")

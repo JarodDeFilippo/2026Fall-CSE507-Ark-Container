@@ -50,6 +50,9 @@
 # It splits a long extraction (a Swin-L at 768 px) into one job per dataset: ARK_EMB_NO_FIT=1 sbatch ... <tag> <model> <weights> <normalization> --datasets <one dataset> for each dataset but the last, then the last
 # dataset's job without ARK_EMB_NO_FIT and with sbatch --dependency=afterok:<the other jobs' ids> ...: it extracts its dataset and fits all four. Every job of a tag takes the same <model>, <weights>, <normalization> and
 # ARK_EMB_INPUT_SIZE: the fit refuses the caches of one tag that were not extracted the same way.
+# RECOMMENDED FORM (2026-10-28): extraction and fit as TWO jobs, so the card is not held through the CPU fits: ARK_EMB_NO_FIT=1 sbatch run_emb_gaudi.sh <tag> <model> <weights> <normalization> [--datasets NAME...], then sbatch --dependency=afterok:<that job's id> run_emb_fit_class.sh <tag>
+# (the four fits, CPU only, no GPU, on the class account; it reads embeddings/<tag>/ under the same repo root the extraction wrote to). ./submit_probe_class.sh <tag> <model> <weights> <normalization> [--datasets NAME...] submits that pair for the A100 lane (run_emb_class.sh). The one-job form above, extraction then fit on
+# the same allocation, is unchanged and still works.
 # ARK_ROOT overrides the repo root (the Mac dry run in base/ark_finetune/test_ark_finetune.py points it at a fake repo).
 # The A100 sibling is run_emb_class.sh (one A100 on the class account, through nvidia.sh): the same usage, checks and fit, and the block between the two "shared" marker lines below is identical in both scripts (test_ark_finetune.py checks it).
 export PT_HPU_LAZY_MODE=1
@@ -111,8 +114,8 @@ fi
 ./gaudi_check_cards.sh || exit 1
 # 1. the extraction; it refuses an existing cache before the model loads, and a failure ends the job here: no fit on a half-written cache
 ./gaudi.sh python -m ark_finetune.extract_embeddings --device hpu --tag "$TAG" --model "$MODEL" --weights "$WEIGHTS" --normalization "$NORMALIZATION" --workers 32 "${EMB_SIZE_ARGS[@]}" "${@:5}" || exit $?
-if [[ ${ARK_EMB_NO_FIT:-} == 1 ]]; then  # extraction only: no fit and no results/<tag> here, the job that fits (the last dataset's, without the switch) finds all four caches
-  echo "ARK_EMB_NO_FIT=1: extraction only, no fit for tag $TAG; the job that extracts the last dataset of this tag without ARK_EMB_NO_FIT fits all four"
+if [[ ${ARK_EMB_NO_FIT:-} == 1 ]]; then  # extraction only: no fit and no results/<tag> here, the job that fits (run_emb_fit_class.sh, or the last dataset's job without the switch) finds all four caches
+  echo "ARK_EMB_NO_FIT=1: extraction only, no fit for tag $TAG; fit it with: sbatch run_emb_fit_class.sh $TAG [--datasets NAME...] (CPU only, needs the caches it fits), or the job that extracts the last dataset of this tag without ARK_EMB_NO_FIT fits all four"
   exit 0
 fi
 # 2. the fit: four CPU processes, one thread each (the loop is bound by Python overhead on small tensors), each with its own log; run_linearprobe refuses a (tag, dataset) that has results
