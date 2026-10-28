@@ -217,7 +217,7 @@ def fit(name, args, meta, plan):
     except FileExistsError:
         raise
     except OSError:  # a filesystem that refuses a hard link across directories: rename instead. Not race-free (the check, then the rename); what keeps two fits of one dataset apart there is the makedirs(probe_dir) above
-        if os.path.exists(final):
+        if os.path.lexists(final):  # lexists: a dangling symlink is a taken name too (O_EXCL and link(2) refuse it), and exists() follows it, finds nothing, and the rename would replace it
             raise FileExistsError("{} exists already: refusing to overwrite it".format(final))
         os.replace(part, final)
     else:

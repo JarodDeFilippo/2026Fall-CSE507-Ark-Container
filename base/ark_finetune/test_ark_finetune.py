@@ -1007,7 +1007,7 @@ with tempfile.TemporaryDirectory() as tmp:
         # the JSON is written whole or not at all: run_emb_fit_class.sh's resume rule takes its existence for a finished fit, so a file that is empty or cut short must never be there
         whole_root = os.path.join(tmp, "res_whole")  # a fresh results root: nothing in it but what these fits leave
         part_files = lambda: [os.path.join(d, f) for d, _, fs in os.walk(whole_root) for f in fs if f.endswith(".part")]
-        for name in ("VinDrCXR", "ChestXray14"):
+        for name in ("VinDrCXR", "ChestXray14", "CheXpert"):
             clone_cache(emb_root, "sig", "nolink", name)  # a second tag, for the fits that run with hard links refused
 
         @contextlib.contextmanager
@@ -1088,12 +1088,18 @@ with tempfile.TemporaryDirectory() as tmp:
         with publishing(eperm) as steps, after_collect(lambda result: open(raced, "w").write("{}")):
             message = rejects(FileExistsError, lambda: fit_whole("ChestXray14", "nolink"), "refusing to overwrite")
         assert raced in message and open(raced).read() == "{}" and [s[0] for s in steps] == ["fsync", "link"], (message, steps)
-        # the two refused fits leave their .part in probe/<dataset>/, where the resume rule's rm -rf clears it with the half-done fit; nothing else
-        assert sorted(part_files()) == sorted(os.path.join(script_dir(whole_root, tag, "ChestXray14")[0], "ChestXray14.json.part") for tag in ("sig", "nolink")), part_files()
+        # a dangling symlink at the JSON's name is a taken name too: os.link refuses it with EEXIST (as O_EXCL did), and the check before the rename must see it (lexists: exists() follows the link, finds nothing, and the rename would replace it)
+        for tag, link_error, expected in (("sig", None, os.strerror(errno.EEXIST)), ("nolink", eperm, "refusing to overwrite")):
+            dangling = os.path.join(whole_root, tag, "CheXpert.json")
+            with publishing(link_error) as steps, after_collect(lambda result: os.symlink("no_such_target", dangling)):
+                message = rejects(FileExistsError, lambda: fit_whole("CheXpert", tag), expected)
+            assert dangling in message and os.path.islink(dangling) and os.readlink(dangling) == "no_such_target" and not os.path.exists(dangling) and [s[0] for s in steps] == ["fsync", "link"], (tag, message, steps)
+        # the four refused fits leave their .part in probe/<dataset>/, where the resume rule's rm -rf clears it with the half-done fit; nothing else
+        assert sorted(part_files()) == sorted(os.path.join(script_dir(whole_root, tag, name)[0], name + ".json.part") for tag in ("sig", "nolink") for name in ("ChestXray14", "CheXpert")), part_files()
         print("OK (g10) the JSON is written whole or not at all: a NaN in the result fails the dump (ValueError) before any file exists, so no MIMIC.json of any size and no .part; an ordinary fit writes the "
               "whole text to probe/<dataset>/<dataset>.json.part, fsyncs it (all of it on disk by then), hard-links it to the JSON's name (os.link, atomic) and removes the .part, in json.dump(indent=2)'s format, "
               "with no .part left under the results root; with hard links refused (EPERM) the same JSON is published by os.replace; a JSON that appeared while the fit ran is refused (os.link's own EEXIST, or "
-              "the check before the rename) and left as it is, the refused fit's .part staying in its probe/<dataset>/")
+              "the check before the rename) and left as it is, and so is a dangling symlink there (EEXIST from os.link; lexists before the rename), still a symlink and still dangling; a refused fit's .part stays in its probe/<dataset>/")
     finally:
         run_linearprobe.dataset_entry = stock_entry
 
