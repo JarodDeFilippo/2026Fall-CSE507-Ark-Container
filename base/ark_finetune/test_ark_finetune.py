@@ -7,7 +7,7 @@ Run from base/:  python -m ark_finetune.test_ark_finetune   (or python ark_finet
 (d) the four dataset modules against the official classes: labels, embeddings, the alignment guard, smoke truncation, CheXpert's 5 scored findings
 (e) the probe as shipped: defaults, float64, sigmoid + BCELoss, Adam, batch 512, shuffled train loader, the lr that RISES (1e-4 -> 0.00626 at epoch 50 -> 0.02409 at epoch 99), CPU only
 (f) best epoch on TEST per run: the peak epoch is the one reported, ties keep the earlier, a run without a defined mAUC is refused
-(g) the runner: 10 runs, seeds, the JSON and its cross-checks, flags, refusals and the preflight order
+(g) the runner: 10 runs, seeds, the JSON and its cross-checks, flags, refusals and the preflight order, the JSON written whole or not at all
 (h) the extractor on tiny synthetic images and a tiny ViT (train and test only, one center crop each), and the normalization presets
 (i) extractor -> runner on the four official list formats
 (i3) the Ark+ Swin teacher through the extractor: a lab-style checkpoint's TEACHER (not its student) is embedded before the projector, 1024-d for swin_base; a model that does not fit the file (embed_dim, window, input size),
@@ -20,6 +20,7 @@ import ast
 import contextlib
 import csv
 import difflib
+import errno
 import hashlib
 import io
 import json
@@ -1002,6 +1003,97 @@ with tempfile.TemporaryDirectory() as tmp:
         print("OK (g9) provenance: caches under one tag must agree on model, weights path, size and sha256 (same path and size, another digest: refused), normalization, transform and max_images, whichever "
               "dataset is fit and whichever is the odd one out (RuntimeError naming the field and the datasets, nothing created); a meta.json without weights, or without a sha256 digest, or with one that is not "
               "a digest, is refused; one cache alone, or equal caches, fit and the JSON records the weights path, size and sha256")
+
+        # the JSON is written whole or not at all: run_emb_fit_class.sh's resume rule takes its existence for a finished fit, so a file that is empty or cut short must never be there
+        whole_root = os.path.join(tmp, "res_whole")  # a fresh results root: nothing in it but what these fits leave
+        part_files = lambda: [os.path.join(d, f) for d, _, fs in os.walk(whole_root) for f in fs if f.endswith(".part")]
+        for name in ("VinDrCXR", "ChestXray14"):
+            clone_cache(emb_root, "sig", "nolink", name)  # a second tag, for the fits that run with hard links refused
+
+        @contextlib.contextmanager
+        def after_collect(hook):
+            """run_linearprobe.collect with hook(result) run once the real one has returned: the fit has run, and nothing of the JSON is written yet."""
+            stock = run_linearprobe.collect
+
+            def collect(*args):
+                result = stock(*args)
+                hook(result)
+                return result
+
+            run_linearprobe.collect = collect
+            try:
+                yield
+            finally:
+                run_linearprobe.collect = stock
+
+        @contextlib.contextmanager
+        def publishing(link_error=None):
+            """Yields the list in which the calls that publish the JSON are recorded, in order, while this runs: ('fsync', the file's inode, its size on disk at that moment), ('link', src, dst),
+            ('replace', src, dst), ('remove', path). With link_error, os.link raises it (a filesystem that refuses a hard link)."""
+            steps, stock = [], (os.fsync, os.link, os.replace, os.remove)
+
+            def fsync(fd):
+                steps.append(("fsync", os.fstat(fd).st_ino, os.fstat(fd).st_size))
+                return stock[0](fd)
+
+            def link(src, dst):
+                steps.append(("link", src, dst))
+                if link_error:
+                    raise link_error
+                return stock[1](src, dst)
+
+            def replace(src, dst):
+                steps.append(("replace", src, dst))
+                return stock[2](src, dst)
+
+            def remove(path):
+                steps.append(("remove", path))
+                return stock[3](path)
+
+            os.fsync, os.link, os.replace, os.remove = fsync, link, replace, remove
+            try:
+                yield steps
+            finally:
+                os.fsync, os.link, os.replace, os.remove = stock
+
+        def fit_whole(name, tag="sig"):
+            with short_epochs(2):
+                run_fit(tag, emb_root, whole_root, "--datasets", name, "--runs", "1")
+
+        canonical = lambda text: text == json.dumps(json.loads(text), indent=2, allow_nan=False)  # json.dump(indent=2)'s format, as before (no trailing newline)
+        # a NaN: the dump fails before any file exists
+        with after_collect(lambda result: result.update(test_mAUC_std=float("nan"))):  # json cannot write it with allow_nan=False
+            rejects(ValueError, lambda: fit_whole("MIMIC"), "not JSON compliant")
+        assert not os.path.exists(os.path.join(whole_root, "sig", "MIMIC.json")) and part_files() == []  # no MIMIC.json of any size, and no .part either
+        # an ordinary fit: the whole text is written and synced to probe/<dataset>/<dataset>.json.part, hard-linked to the JSON's name (atomic, no rename) and the .part removed
+        with publishing() as steps:
+            fit_whole("VinDrCXR")
+        final, part = os.path.join(whole_root, "sig", "VinDrCXR.json"), os.path.join(script_dir(whole_root, "sig", "VinDrCXR")[0], "VinDrCXR.json.part")
+        assert steps == [("fsync", os.stat(final).st_ino, os.path.getsize(final)), ("link", part, final), ("remove", part)], steps  # the file that was synced is the one linked, all of it on disk by then
+        assert canonical(open(final).read()) and part_files() == []  # no .part anywhere under the root
+        # a filesystem that refuses the hard link (EPERM): the same JSON, published by a rename
+        eperm = PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+        with publishing(eperm) as steps:
+            fit_whole("VinDrCXR", "nolink")
+        final, part = os.path.join(whole_root, "nolink", "VinDrCXR.json"), os.path.join(script_dir(whole_root, "nolink", "VinDrCXR")[0], "VinDrCXR.json.part")
+        assert steps == [("fsync", os.stat(final).st_ino, os.path.getsize(final)), ("link", part, final), ("replace", part, final)], steps  # the link was tried and refused, then the rename
+        assert canonical(open(final).read()) and part_files() == []
+        # a JSON that appears while the fit runs (another fit of the same tag and dataset finished first) is refused by os.link itself (the kernel's EEXIST, not a check of ours) and left as it is
+        raced = os.path.join(whole_root, "sig", "ChestXray14.json")
+        with publishing() as steps, after_collect(lambda result: open(raced, "w").write("{}")):
+            message = rejects(FileExistsError, lambda: fit_whole("ChestXray14"), os.strerror(errno.EEXIST))
+        assert raced in message and open(raced).read() == "{}" and [s[0] for s in steps] == ["fsync", "link"], (message, steps)
+        # ... and where hard links are refused, by the check before the rename
+        raced = os.path.join(whole_root, "nolink", "ChestXray14.json")
+        with publishing(eperm) as steps, after_collect(lambda result: open(raced, "w").write("{}")):
+            message = rejects(FileExistsError, lambda: fit_whole("ChestXray14", "nolink"), "refusing to overwrite")
+        assert raced in message and open(raced).read() == "{}" and [s[0] for s in steps] == ["fsync", "link"], (message, steps)
+        # the two refused fits leave their .part in probe/<dataset>/, where the resume rule's rm -rf clears it with the half-done fit; nothing else
+        assert sorted(part_files()) == sorted(os.path.join(script_dir(whole_root, tag, "ChestXray14")[0], "ChestXray14.json.part") for tag in ("sig", "nolink")), part_files()
+        print("OK (g10) the JSON is written whole or not at all: a NaN in the result fails the dump (ValueError) before any file exists, so no MIMIC.json of any size and no .part; an ordinary fit writes the "
+              "whole text to probe/<dataset>/<dataset>.json.part, fsyncs it (all of it on disk by then), hard-links it to the JSON's name (os.link, atomic) and removes the .part, in json.dump(indent=2)'s format, "
+              "with no .part left under the results root; with hard links refused (EPERM) the same JSON is published by os.replace; a JSON that appeared while the fit ran is refused (os.link's own EEXIST, or "
+              "the check before the rename) and left as it is, the refused fit's .part staying in its probe/<dataset>/")
     finally:
         run_linearprobe.dataset_entry = stock_entry
 
