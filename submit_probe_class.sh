@@ -20,7 +20,10 @@
 # submits twice (the second extraction is then refused by the extractor, which leaves the first pair's cache alone, and the second fit stays pending on a dependency that is never met).
 # environment: ARK_EMB_INPUT_SIZE (as run_emb_gaudi.sh; reaches the checks and the extraction; a larger crop is slower, so raise PROBE_X_TIME with it); PROBE_X_TIME (the extraction's -t, default 01:15:00: the one ViT-B extraction at 224 px timed on an A100
 #   on Sol took 56 min (2026-10-26), plus a third; the class QOS counts the requested time of GPU jobs); PROBE_X_CONSTRAINT (the extraction's --constraint, default a100: any A100, see run_emb_class.sh for why not MIG slices or H100s);
-#   PROBE_FIT_TIME (the fit's -t, default 03:00:00, see run_emb_fit_class.sh). ARK_EMB_FIT_RESUME is unset here: a pair is always a fresh fit (to finish a fit that stopped half way, submit run_emb_fit_class.sh alone with it set).
+#   PROBE_FIT_TIME (the fit's -t, default 03:00:00, see run_emb_fit_class.sh); PROBE_ACCOUNT (the Slurm account of both jobs, -A right after each -J; unset or empty = no -A, so the launchers' own #SBATCH -A applies, class_cse49478170fall2026; it must carry the class QOS,
+#   so the lab account grp_jliang12 is not a substitute; an account sbatch refuses fails the first submission and nothing is queued): a group member in another class account runs
+#   PROBE_ACCOUNT=class_bme50769722fall2026 ./submit_probe_class.sh <tag> <model> <weights> <normalization>
+#   ARK_EMB_FIT_RESUME is unset here: a pair is always a fresh fit (to finish a fit that stopped half way, submit run_emb_fit_class.sh alone with it set).
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1   # the repo root: the launchers sit here and sbatch is given their names
 if [[ -n ${SLURM_JOB_ID:-} ]]; then
   echo "ERROR: submit_probe_class.sh submits the jobs itself: run it on the login node, not inside Slurm job $SLURM_JOB_ID" >&2
@@ -39,14 +42,15 @@ if [[ $status -ne 0 ]]; then
   echo "submit_probe_class.sh: a launcher's check refused the arguments (exit $status); nothing was submitted" >&2
   exit $status
 fi
+account=(); [[ -n ${PROBE_ACCOUNT:-} ]] && account=(-A "$PROBE_ACCOUNT")   # no -A when unset or empty: the launchers' own #SBATCH -A applies
 # --parsable prints "<id>" or "<id>;<cluster>"
-x_id=$(ARK_EMB_NO_FIT=1 sbatch --parsable -J "probe-$tag-x" -p public,htc -q class --constraint="${PROBE_X_CONSTRAINT:-a100}" -t "${PROBE_X_TIME:-01:15:00}" run_emb_class.sh "$@") || { echo "ERROR: sbatch refused the extraction job; nothing was submitted" >&2; exit 1; }
+x_id=$(ARK_EMB_NO_FIT=1 sbatch --parsable -J "probe-$tag-x" "${account[@]}" -p public,htc -q class --constraint="${PROBE_X_CONSTRAINT:-a100}" -t "${PROBE_X_TIME:-01:15:00}" run_emb_class.sh "$@") || { echo "ERROR: sbatch refused the extraction job; nothing was submitted" >&2; exit 1; }
 x_id=${x_id%%;*}
 if [[ ! $x_id =~ ^[0-9]+$ ]]; then
   echo "ERROR: sbatch printed '$x_id' for the extraction, not a job id; the fit was not submitted" >&2
   exit 1
 fi
-fit_id=$(sbatch --parsable -J "probe-$tag-fit" -t "${PROBE_FIT_TIME:-03:00:00}" --dependency="afterok:$x_id" run_emb_fit_class.sh "$tag" "${@:5}")
+fit_id=$(sbatch --parsable -J "probe-$tag-fit" "${account[@]}" -t "${PROBE_FIT_TIME:-03:00:00}" --dependency="afterok:$x_id" run_emb_fit_class.sh "$tag" "${@:5}")
 fit_id=${fit_id%%;*}
 if [[ ! $fit_id =~ ^[0-9]+$ ]]; then
   scancel "$x_id" || echo "WARNING: scancel $x_id failed: cancel the extraction by hand" >&2   # an extraction with no fit behind it would only spend the card

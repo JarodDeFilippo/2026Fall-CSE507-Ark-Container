@@ -2069,13 +2069,27 @@ assert sbatch[0] == ("NO_FIT=1 INPUT_SIZE=512 RESUME=unset", ["--parsable", "-J"
 assert sbatch[1] == ("NO_FIT=yes INPUT_SIZE=512 RESUME=unset", ["--parsable", "-J", "probe-stock-fit", "-t", "1-00:00:00", "--dependency=afterok:1001", "run_emb_fit_class.sh", "stock", "--datasets", "MIMIC", "CheXpert"]), sbatch[1]
 done, sbatch, scancel, calls = run_submit(base, PROBE_X_TIME="", PROBE_X_CONSTRAINT="", PROBE_FIT_TIME="")  # empty is unset: the defaults
 assert done.returncode == 0 and [argv for _, argv in sbatch] == [X_DEFAULT, FIT_DEFAULT], sbatch
+# PROBE_ACCOUNT: both jobs get -A <it>, right after their -J pair. Unset (the runs above: X_DEFAULT and FIT_DEFAULT have no -A) or empty, there is no -A at all and the launchers' own #SBATCH -A applies. The value is one argument, whatever it holds
+MEMBER_ACCOUNT = "class_bme50769722fall2026"
+with_account = lambda argv, account: argv[:3] + ["-A", account] + argv[3:]
+done, sbatch, scancel, calls = run_submit(base, PROBE_ACCOUNT=MEMBER_ACCOUNT)
+assert done.returncode == 0 and done.stderr == "" and done.stdout == "probe stock: extraction 1001, fit 1002 (afterok)\n" and scancel == [] and calls is None, (done, scancel, calls)
+assert sbatch == [("NO_FIT=1 INPUT_SIZE=unset RESUME=unset", with_account(X_DEFAULT, MEMBER_ACCOUNT)), ("NO_FIT=unset INPUT_SIZE=unset RESUME=unset", with_account(FIT_DEFAULT, MEMBER_ACCOUNT))], sbatch
+done, sbatch, scancel, calls = run_submit(base, PROBE_ACCOUNT="")  # empty is unset: no -A, not '-A ""'
+assert done.returncode == 0 and [argv for _, argv in sbatch] == [X_DEFAULT, FIT_DEFAULT], sbatch
+ODD_ACCOUNT = "class x*;$y"
+done, sbatch, scancel, calls = run_submit(base + ["--datasets", "MIMIC"], PROBE_ACCOUNT=ODD_ACCOUNT, PROBE_X_TIME="2:00:00", PROBE_FIT_TIME="1-00:00:00")  # with the other overrides and --datasets; neither split nor expanded
+assert done.returncode == 0 and [argv for _, argv in sbatch] == [
+    ["--parsable", "-J", "probe-stock-x", "-A", ODD_ACCOUNT, "-p", "public,htc", "-q", "class", "--constraint=a100", "-t", "2:00:00", "run_emb_class.sh"] + base + ["--datasets", "MIMIC"],
+    ["--parsable", "-J", "probe-stock-fit", "-A", ODD_ACCOUNT, "-t", "1-00:00:00", "--dependency=afterok:1001", "run_emb_fit_class.sh", "stock", "--datasets", "MIMIC"]], sbatch
 done, sbatch, scancel, calls = run_submit(["a.b-c_1", "vit_large_raydino", "/workspace/weights/xray_dino_vitl16_pretrained-ad31c2b0.pth", "imagenet"], files=("weights/xray_dino_vitl16_pretrained-ad31c2b0.pth",))  # another tag, model and weights: all in both names and arguments
 assert done.returncode == 0 and done.stdout == "probe a.b-c_1: extraction 1001, fit 1002 (afterok)\n" and sbatch[0][1][2] == "probe-a.b-c_1-x" and sbatch[1][1][2] == "probe-a.b-c_1-fit" and sbatch[1][1][-1] == "a.b-c_1", sbatch
 done, sbatch, scancel, calls = run_submit(base, SBATCH_PRINT_1="4242;sol", SBATCH_PRINT_2="4243;sol")  # --parsable may print "<id>;<cluster>"
 assert done.returncode == 0 and done.stdout == "probe stock: extraction 4242, fit 4243 (afterok)\n" and sbatch[1][1][5] == "--dependency=afterok:4242", (done, sbatch)
 print("OK (j) submit_probe_class.sh: the extraction line 'ARK_EMB_NO_FIT=1 sbatch " + " ".join(X_DEFAULT) + "' then the fit line 'sbatch " + " ".join(FIT_DEFAULT) + "' (afterok on the id the first printed, '<id>;<cluster>' accepted), "
       "one stdout line 'probe <tag>: extraction <id1>, fit <id2> (afterok)'; --datasets reaches both jobs; PROBE_X_TIME / PROBE_X_CONSTRAINT / PROBE_FIT_TIME override (empty = default); ARK_EMB_INPUT_SIZE reaches the extraction; "
-      "an inherited ARK_EMB_FIT_RESUME does not reach the fit; the fit line has no -p, -q, constraint or gres")
+      "an inherited ARK_EMB_FIT_RESUME does not reach the fit; the fit line has no -p, -q, constraint or gres; PROBE_ACCOUNT adds '-A <it>' right after the -J pair of both lines (one argument whatever it holds), "
+      "and unset or empty leaves both argv as above, with no -A")
 
 # nothing is submitted when a launcher's check refuses (exit 2 for the arguments, 1 for the weights file and for results that exist), when the shape is wrong (the wrapper's own usage), or inside a Slurm job; the launcher's message is kept
 CHECK_REFUSED = "submit_probe_class.sh: a launcher's check refused the arguments (exit {}); nothing was submitted\n"
@@ -2107,6 +2121,9 @@ print("OK (j) submit_probe_class.sh refusals, nothing submitted and no launcher 
 done, sbatch, scancel, calls = run_submit(base, SBATCH_FAIL_ON="1")
 assert done.returncode == 1 and done.stdout == "" and len(sbatch) == 1 and scancel == [], (done, sbatch, scancel)
 assert done.stderr == "sbatch: error: stub failure\nERROR: sbatch refused the extraction job; nothing was submitted\n", done.stderr
+done, sbatch, scancel, calls = run_submit(base, PROBE_ACCOUNT="class_nosuch", SBATCH_FAIL_ON="1")  # an account that sbatch refuses fails the first submission like any other failure: nothing is queued, so there is nothing to cancel
+assert done.returncode == 1 and done.stdout == "" and [argv for _, argv in sbatch] == [with_account(X_DEFAULT, "class_nosuch")] and scancel == [], (done, sbatch, scancel)
+assert done.stderr == "sbatch: error: stub failure\nERROR: sbatch refused the extraction job; nothing was submitted\n", done.stderr
 done, sbatch, scancel, calls = run_submit(base, SBATCH_FAIL_ON="2")
 assert done.returncode == 1 and done.stdout == "" and len(sbatch) == 2 and scancel == ["1001"], (done, sbatch, scancel)
 assert done.stderr == "sbatch: error: stub failure\nERROR: the fit job was not submitted (sbatch printed ''); extraction job 1001 cancelled. Fix the cause and run this again\n", done.stderr
@@ -2117,6 +2134,7 @@ assert done.returncode == 1 and done.stdout == "" and scancel == ["1001"] and "t
 done, sbatch, scancel, calls = run_submit(base, SBATCH_PRINT_1="not-an-id")
 assert done.returncode == 1 and done.stdout == "" and len(sbatch) == 1 and scancel == [] and done.stderr == "ERROR: sbatch printed 'not-an-id' for the extraction, not a job id; the fit was not submitted\n", done
 print("OK (j) submit_probe_class.sh failures: sbatch failing on the extraction submits nothing more; failing (or printing no id) on the fit cancels the extraction by id (scancel 1001), a failed scancel is a WARNING; "
-      "a non-numeric extraction id stops before the fit; the fit is never submitted without --dependency=afterok:<the extraction's id>")
+      "a non-numeric extraction id stops before the fit; the fit is never submitted without --dependency=afterok:<the extraction's id>; an account that sbatch refuses (PROBE_ACCOUNT) is the same first-submission failure: "
+      "one sbatch call, carrying its -A, nothing queued, no scancel")
 
 print("ALL OK")
