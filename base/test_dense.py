@@ -604,10 +604,25 @@ with tempfile.TemporaryDirectory() as seg_dir:
     assert torch.equal(saved["head"]["conv.weight"], at_2) and torch.equal(at_test, at_2)
     assert summary == "SEG sel jsrt_lung seed0: best iteration 2 (val loss 0.3000), test Dice mean 66.00, pooled 55.00\n", summary
     assert partials() == sorted([race_staging, empty_staging])  # the successful runs, the refused ones and the failed one left no staging directory; only the two failed publishes keep their runs
+
+    # --runs N through main(): the seeds --seed, --seed + 1, ... one after another in one call, each in its own seed<S> directory and with its own SEG line
+    multi_dir = os.path.join(seg_out, "multi", "jsrt_lung")
+    _, multi_stdout, _ = quietly(lambda: seg_probe.main(seg_argv("multi", "random", "--seed", "3", "--runs", "2")))
+    assert sorted(os.listdir(multi_dir)) == ["seed3", "seed4"] and partials() == sorted([race_staging, empty_staging])
+    for run_seed in (3, 4):
+        with open(os.path.join(multi_dir, "seed{}".format(run_seed), "result.json")) as f:
+            assert json.load(f)["seed"] == run_seed
+    assert [line.split(":")[0] for line in multi_stdout.splitlines()] == ["SEG multi jsrt_lung seed3", "SEG multi jsrt_lung seed4"], multi_stdout
+    # every run's directory is checked before the first run starts: with seed4 there (empty), the job of seeds 3 and 4 is refused with no seed3 run and no staging directory made
+    upfront_dir = os.path.join(seg_out, "upfront", "jsrt_lung")
+    os.makedirs(os.path.join(upfront_dir, "seed4"))
+    rejects(FileExistsError, lambda: quietly(lambda: seg_probe.main(seg_argv("upfront", "random", "--seed", "3", "--runs", "2"))), "refusing to overwrite " + os.path.join(upfront_dir, "seed4"))
+    assert os.listdir(upfront_dir) == ["seed4"] and partials() == sorted([race_staging, empty_staging])
 print("OK (seg_probe): evaluate gives the loss averaged by batch size and the pooled and per-image Dice x100 on stand-ins with a known answer, and hands the head back in its mode; "
       "a four-iteration run on a synthetic JSRT set writes result.json (every key, counts, null weights_sha256 for random, git sha, UTC times) and head_best.pt (trained part only, "
       "plain tensors, the state the test list saw); the optimizer steps at step_decay's rate (step_inc 1 for 4 iterations); the backbone is unchanged and gradient-free after training "
       "while the pyramid's layers and the head moved; the loss is given probabilities; the defaults are RayDINO's budget; the same seed repeats the run and another seed is a different run in its own seed<S> directory beside the first; a run directory that exists (a dangling symlink at its name too) is refused up front; a run is written (head_best.pt, then result.json, each fsynced) into a private seed<S>.partial-<pid>-<hex> directory beside it and published by an mkdir of seed<S> and a move of the two files into it (head_best.pt, then result.json; no directory is ever renamed, which Lustre refuses onto the empty one the mkdir made), which leaves no staging directory behind after a success or an exception, and which, when another job published first or made an empty seed<S>, fails naming both paths with the finished run kept in its staging directory and the other directory untouched (a move that fails on head_best.pt gives the name back, one that fails on result.json leaves head_best.pt in seed<S> and result.json in staging); validation losses 0.3 then 0.9 select iteration 2, and the test list is scored "
-      "with iteration 2's weights, once; the weights file's sha256 is recorded; bad flags (--batch 1 among them; 2 is accepted), a train list under the batch and a size off the patch grid are refused; the train loader is shuffled by the seed and drops a partial last batch, val and test keep every image")
+      "with iteration 2's weights, once; the weights file's sha256 is recorded; bad flags (--batch 1 among them; 2 is accepted), a train list under the batch and a size off the patch grid are refused; the train loader is shuffled by the seed and drops a partial last batch, val and test keep every image; --runs N runs the seeds --seed, --seed + 1, ... in one main() call, "
+      "one seed<S> directory and one SEG line each, and refuses up front, before the first run starts, when any of those directories exists (seed4 there: seed3 is not run, no staging directory is made)")
 
 print("ALL OK")

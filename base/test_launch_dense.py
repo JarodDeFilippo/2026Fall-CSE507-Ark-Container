@@ -47,6 +47,8 @@ with tempfile.TemporaryDirectory() as tmp:
     assert done.returncode == 0 and job_script(absent, "--iters", "10", "--seed", "3") in done.stdout, done.stdout
     assert launch(["--check"] + BASE + ["--seed", "3", "--iters", "10"], absent).stdout == done.stdout
     assert job_script(absent, "--seed", "0") in launch(["--check"] + BASE + ["--seed", "0"], absent).stdout  # an explicit seed 0 is passed on
+    done = launch(["--check"] + BASE + ["--seed", "1", "--runs", "3"], absent)  # --runs follows --seed, and the job script carries both
+    assert done.returncode == 0 and job_script(absent, "--seed", "1", "--runs", "3") in done.stdout, done.stdout
     done = launch(["--check", "jsrt_lung", "raydino", "vit_large_raydino", "/workspace/weights/xray_dino_vitl16_pretrained-ad31c2b0.pth", "imagenet"], absent, DENSE_TIME="00:45:00", DENSE_ACCOUNT="class_x")
     assert done.returncode == 0 and "-A class_x -p" in done.stdout and "-t 00:45:00 -J dense-raydino-jsrt_lung" in done.stdout, done.stdout
 
@@ -59,6 +61,7 @@ with tempfile.TemporaryDirectory() as tmp:
                (BASE[:4], "Usage: ./launch_dense.sh"),
                (BASE + ["--tag", "other"], "--tag: not accepted after <normalization>"),
                (BASE + ["--iters"], "--iters takes"), (BASE + ["--iters", "0"], "--iters takes"), (BASE + ["--iters", "5", "--iters", "6"], "--iters takes"),
+               (BASE + ["--runs", "0"], "--runs takes"), (BASE + ["--runs", "1", "--runs", "2"], "--runs takes"),
                (BASE + ["--seed", "-1"], "--seed takes"), (BASE + ["--seed", "1", "--seed", "2"], "--seed takes"),
                (BASE + ["--seed", "007"], "--seed takes"), (BASE + ["--seed", "1000000000"], "--seed takes")]  # seg_probe names the folder seed<int>: 007 and 7 would be one run
     for args, reason in refused:
@@ -102,6 +105,10 @@ with tempfile.TemporaryDirectory() as tmp:
         done = launch(["--check"] + BASE + seed_args, root)
         assert done.returncode == 1 and done.stdout == "" and "results/dense/stock_dinov3/candidptx/seed0 exists" in done.stderr, (seed_args, done)
     assert launch(["--check"] + BASE + ["--seed", "1"], root).returncode == 0  # another seed of the same (tag, dataset) is another folder
+    os.makedirs(os.path.join(runs, "seed3"))  # --runs checks every seed of the job: seeds 1-3 meet seed3's folder, seeds 1-2 do not
+    done = launch(["--check"] + BASE + ["--seed", "1", "--runs", "3"], root)
+    assert done.returncode == 1 and done.stdout == "" and "seed3 exists" in done.stderr, done
+    assert launch(["--check"] + BASE + ["--seed", "1", "--runs", "2"], root).returncode == 0
     finish("1")
     done = launch(["--check"] + BASE + ["--seed", "1"], root)
     assert done.returncode == 1 and done.stdout == "" and "seed1 exists" in done.stderr, done

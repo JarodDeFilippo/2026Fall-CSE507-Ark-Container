@@ -1,6 +1,6 @@
 """Frozen-backbone segmentation probe: Foundation X's UPerNet-style head (upernet.py) trained on the patch tokens of a frozen ViT (pyramid.py) for CANDID-PTX pneumothorax or
 JSRT lungs (data.py), under RayDINO's budget: 5,000 iterations of batch 16, AdamW (lr 1e-4, weight decay 1e-4) with Foundation X's cosine step_decay schedule, a validation pass every
-250 iterations, and the best validation-loss state tested once. One run is one (backbone, dataset, seed).
+250 iterations, and the best validation-loss state tested once. One run is one (backbone, dataset, seed); --runs N makes N of them in one job, seeds --seed, --seed + 1, ... one after another.
 
 Run from base/:
     python -m dense.seg_probe --model vit_base_dinov3 --weights ../weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth --normalization imagenet \
@@ -12,7 +12,7 @@ directory exists. Both files are written (and fsynced) into a private seed<S>.pa
 mkdir has claimed that name (the directory itself is not renamed: Lustre fails a rename onto an existing empty directory, which POSIX replaces): a seed<S> with result.json is a whole run, one without it is a
 publish interrupted mid-move and is deleted by hand, and a second job of the same (tag, dataset, seed) that finishes later fails at the mkdir, the first one's directory untouched and its own run left in its
 .partial- directory. Dice is x100 at the
-input size: "pooled" over every pixel of the test list, and "mean" over its images, which is Foundation X's CSV column. Progress goes to stderr; stdout is the one SEG line. --weights random
+input size: "pooled" over every pixel of the test list, and "mean" over its images, which is Foundation X's CSV column. Progress goes to stderr; stdout is one SEG line per run. --weights random
 builds the backbone without loading anything, for the CPU tests (it needs --device cpu).
 """
 import argparse
@@ -53,6 +53,7 @@ def parse_args(argv=None):
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--wd", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=0, help="torch, numpy and random, the train loader's shuffle and its augmentation draws; names the output directory, seed<seed>")
+    p.add_argument("--runs", type=int, default=1, help="seeds run one after another in this job: --seed, --seed + 1, ..., each its own seed<S> directory (the linear probe's convention)")
     p.add_argument("--workers", type=int, default=12)
     p.add_argument("--size", type=int, default=224, help="input side in pixels; a multiple of the backbone's patch size")
     p.add_argument("--out", default="results/dense")
@@ -69,8 +70,8 @@ def parse_args(argv=None):
         p.error("--weights {} is not a file".format(args.weights))
     if args.device == "cuda" and not torch.cuda.is_available():
         p.error("--device cuda, but CUDA is not available")
-    # iters: step_decay divides by iters - step_inc, so one iteration is too few; batch: the PSP bin of 1 x 1 gives training-mode BatchNorm2d one value per channel from a batch of one; seed: it names a directory
-    for name, least in (("iters", 2), ("batch", 2), ("val_every", 1), ("size", 1), ("workers", 0), ("seed", 0)):
+    # iters: step_decay divides by iters - step_inc, so one iteration is too few; batch: the PSP bin of 1 x 1 gives training-mode BatchNorm2d one value per channel from a batch of one; seed: it names a directory; runs: none would run nothing
+    for name, least in (("iters", 2), ("batch", 2), ("val_every", 1), ("size", 1), ("workers", 0), ("seed", 0), ("runs", 1)):
         if getattr(args, name) < least:
             p.error("--{} must be at least {}".format(name, least))
     return args
@@ -264,8 +265,18 @@ def train(args):
 
 
 def main(argv=None):
-    result = train(parse_args(argv))
-    print("SEG {tag} {dataset} seed{seed}: best iteration {best_iter} (val loss {best_val_loss:.4f}), test Dice mean {test_dice_mean:.2f}, pooled {test_dice_pooled:.2f}".format(**result))
+    args = parse_args(argv)
+    seeds = range(args.seed, args.seed + args.runs)
+    for seed in seeds:  # every run's directory is checked before the first run starts, so that a ten-seed job does not stop after five finished runs (train() checks again: it is the race guard)
+        final_dir = os.path.join(args.out, args.tag, args.dataset, "seed{}".format(seed))
+        if os.path.lexists(final_dir):
+            raise FileExistsError("refusing to overwrite {}; delete it to run again".format(final_dir))
+    for seed in seeds:
+        run_args = argparse.Namespace(**vars(args))
+        run_args.seed = seed
+        result = train(run_args)
+        print("SEG {tag} {dataset} seed{seed}: best iteration {best_iter} (val loss {best_val_loss:.4f}), test Dice mean {test_dice_mean:.2f}, pooled {test_dice_pooled:.2f}".format(**result),
+              flush=True)  # flushed: stdout is a file under Slurm, and a job killed by its time limit would lose the lines of the runs it finished
 
 
 if __name__ == "__main__":

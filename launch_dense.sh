@@ -1,30 +1,31 @@
 #!/usr/bin/env bash
 # The frozen-backbone segmentation probe (base/dense/seg_probe.py) as ONE Slurm job: one A100 on the class account, one (backbone, dataset) run. This script has no #SBATCH header of its own: it checks its arguments, generates the
 # job script and gives it to sbatch on stdin. NOT an sbatch script: run it on the login node, from the repo copy (it refuses inside a Slurm job). It prints sbatch's own line and exits; nothing is left running here.
-# usage: ./launch_dense.sh [--check] <candidptx|jsrt_lung> <tag> <model> <in-container weights path under /workspace> <imagenet|chestx-ray|none|raddino> [--iters N] [--seed S]
-#   <tag>     names the backbone and is a directory name (letters, digits, . _ - only): the run writes results/dense/<tag>/<dataset>/seed<S>/result.json and head_best.pt, S being --seed (0 without it)
+# usage: ./launch_dense.sh [--check] <candidptx|jsrt_lung> <tag> <model> <in-container weights path under /workspace> <imagenet|chestx-ray|none|raddino> [--iters N] [--seed S] [--runs N]
+#   <tag>     names the backbone and is a directory name (letters, digits, . _ - only): the job writes results/dense/<tag>/<dataset>/seed<S>/result.json and head_best.pt for S = --seed (0 without it), --seed + 1, ... , --seed + --runs - 1 (one run without --runs)
 #   <model>   vit_base_dinov3, vit_base_dinov2, vit_base_raddino or vit_large_raydino (base/models.py names; seg_probe's --model)
-#   --iters N, --seed S   the only options, each at most once; without them seg_probe's defaults apply (5000 iterations, seed 0)
-#   ponytail: --iters and --seed are checked as integers only; seg_probe applies its own minimums when the job starts.
+#   --iters N, --seed S, --runs N   the only options, each at most once; without them seg_probe's defaults apply (5000 iterations, seed 0, one run); --runs N runs the N seeds S, S + 1, ... one after another in the one job
+#   ponytail: --iters, --seed and --runs are checked as integers only; seg_probe applies its own minimums when the job starts.
 #   e.g. ./launch_dense.sh candidptx stock_dinov3 vit_base_dinov3 /workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth imagenet
 # The job: cd to ARK_ROOT (default /scratch/$USER/2026Fall-CSE507-Ark-Container) and ./nvidia.sh python -m dense.seg_probe on the arguments, with --workers 12 (= -c 12) and --out /workspace/results/dense (results/dense in ARK_ROOT).
 # Its header is run_emb_class.sh's: -A class_cse49478170fall2026 -p public,htc -q class -N 1 --gres=gpu:1 --constraint=a100_80 -c 12 --mem=64G, then -t and -J dense-<tag>-<dataset>.
-# environment: DENSE_TIME (-t, default 02:00:00: a default, not a measurement, so set it from the first run's wall time: the class QOS counts the requested -t of a user's running GPU jobs against its GPU-minute cap);
+# environment: DENSE_TIME (-t, default 02:00:00: a default, not a measurement, so set it from the first run's wall time times --runs: the class QOS counts the requested -t of a user's running GPU jobs against its GPU-minute cap);
 #   DENSE_ACCOUNT (-A, default class_cse49478170fall2026; a group member in another class account sets it, and it must carry the class QOS); ARK_ROOT (the repo copy the job runs in).
-# Checks, each a stop that names its cause (exit 2: the arguments, DENSE_TIME, DENSE_ACCOUNT; exit 1: the rest): the arguments' shape and values (the regexes of run_emb_class.sh, plus the datasets, the models and the two options); not inside a Slurm job
-#   (a real submission only); then, if ARK_ROOT exists, that the weights file is under it (a missing file would otherwise fail only after the queue wait) and that results/dense/<tag>/<dataset>/seed<S> does not exist in any form (seg_probe refuses to run when it does,
+# Checks, each a stop that names its cause (exit 2: the arguments, DENSE_TIME, DENSE_ACCOUNT; exit 1: the rest): the arguments' shape and values (the regexes of run_emb_class.sh, plus the datasets, the models and the three options); not inside a Slurm job
+#   (a real submission only); then, if ARK_ROOT exists, that the weights file is under it (a missing file would otherwise fail only after the queue wait) and that none of results/dense/<tag>/<dataset>/seed<S>, for the job's seeds, exists in any form (seg_probe refuses to run when one does,
 #   after the same wait). A real submission also needs ARK_ROOT to exist, and sbatch.
 # --check as the FIRST argument: every check runs, then the sbatch line and the job script are printed, as a heredoc that repeats the submission, and nothing is submitted (exit 0). No Slurm command is called, so it runs on any machine; where ARK_ROOT does
 #   not exist (a laptop) it says on stderr that the weights file and the results were not checked.
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1   # the repo root: sbatch writes slurm-<id>.out in the directory it is run from
 check_only=0
 if [[ ${1:-} == --check ]]; then check_only=1; shift; fi
-USAGE="Usage: ./launch_dense.sh [--check] <candidptx|jsrt_lung> <tag: letters, digits, . _ - only> <vit_base_dinov3|vit_base_dinov2|vit_base_raddino|vit_large_raydino> <in-container weights path under /workspace> <imagenet|chestx-ray|none|raddino> [--iters N] [--seed S]"
+USAGE="Usage: ./launch_dense.sh [--check] <candidptx|jsrt_lung> <tag: letters, digits, . _ - only> <vit_base_dinov3|vit_base_dinov2|vit_base_raddino|vit_large_raydino> <in-container weights path under /workspace> <imagenet|chestx-ray|none|raddino> [--iters N] [--seed S] [--runs N]"
 DATASET_RE='^(candidptx|jsrt_lung)$'
 TAG_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'   # the tag is a directory name: no path separators, no spaces
 MODEL_RE='^(vit_base_dinov3|vit_base_dinov2|vit_base_raddino|vit_large_raydino)$'
 NORMALIZATION_RE='^(imagenet|chestx-ray|none|raddino)$'
 ITERS_RE='^[1-9][0-9]{0,6}$'
+RUNS_RE='^[1-9][0-9]{0,2}$'
 SEED_RE='^(0|[1-9][0-9]{0,8})$'   # no leading zeros: seg_probe names the folder seed<int>, so 007 and 7 would be one run
 TIME_RE='^([0-9]+-)?[0-9]+(:[0-9]{2}){0,2}$'   # a Slurm -t: minutes, M:SS, H:MM:SS, D-H, D-H:MM or D-H:MM:SS
 ACCOUNT_RE='^[A-Za-z0-9_]+$'
@@ -43,13 +44,15 @@ NORMALIZATION=$5
 extra=("${@:6}")
 iters=
 seed=
+runs=
 i=0
 while [[ $i -lt ${#extra[@]} ]]; do
   value=${extra[$((i + 1))]:-}
   case ${extra[$i]} in
     --iters) [[ -z $iters && $value =~ $ITERS_RE ]] || die "--iters takes one positive integer, once (got '$value')"; iters=$value ;;
     --seed) [[ -z $seed && $value =~ $SEED_RE ]] || die "--seed takes one non-negative integer without leading zeros, once (got '$value')"; seed=$value ;;
-    *) die "${extra[$i]}: not accepted after <normalization>; only --iters N and --seed S may follow" ;;
+    --runs) [[ -z $runs && $value =~ $RUNS_RE ]] || die "--runs takes one positive integer, once (got '$value')"; runs=$value ;;
+    *) die "${extra[$i]}: not accepted after <normalization>; only --iters N, --seed S and --runs N may follow" ;;
   esac
   i=$((i + 2))
 done
@@ -68,11 +71,13 @@ if [[ -d $ARK_ROOT ]]; then
     echo "ERROR: weights not found at $HOST_WEIGHTS (host path for $WEIGHTS); nothing was submitted" >&2
     exit 1
   fi
-  RESULT_DIR=results/dense/$TAG/$DATASET/seed${seed:-0}   # seg_probe's folder for this seed, refused when it exists in any form; its default seed is 0
-  if [[ -e $ARK_ROOT/$RESULT_DIR || -L $ARK_ROOT/$RESULT_DIR ]]; then
-    echo "ERROR: $RESULT_DIR exists in $ARK_ROOT and seg_probe will not run over it: delete $RESULT_DIR there to rerun, or use another tag or seed; nothing was submitted" >&2
-    exit 1
-  fi
+  for ((s = ${seed:-0}; s < ${seed:-0} + ${runs:-1}; s++)); do   # seg_probe's folder for each seed of the job, refused when it exists in any form; its default is seed 0, one run
+    RESULT_DIR=results/dense/$TAG/$DATASET/seed$s
+    if [[ -e $ARK_ROOT/$RESULT_DIR || -L $ARK_ROOT/$RESULT_DIR ]]; then
+      echo "ERROR: $RESULT_DIR exists in $ARK_ROOT and seg_probe will not run over it: delete $RESULT_DIR there to rerun, or use another tag or seed; nothing was submitted" >&2
+      exit 1
+    fi
+  done
 elif [[ $check_only == 1 ]]; then
   echo "note: $ARK_ROOT is not a directory here, so the weights file and existing results were not checked" >&2
 else
@@ -82,6 +87,7 @@ fi
 cmd=(./nvidia.sh python -m dense.seg_probe --model "$MODEL" --weights "$WEIGHTS" --normalization "$NORMALIZATION" --dataset "$DATASET" --tag "$TAG" --workers 12 --out /workspace/results/dense)
 [[ -n $iters ]] && cmd+=(--iters "$iters")
 [[ -n $seed ]] && cmd+=(--seed "$seed")
+[[ -n $runs ]] && cmd+=(--runs "$runs")
 body=$(printf '#!/usr/bin/env bash\ncd %q && ' "$ARK_ROOT"; printf '%q ' "${cmd[@]}")
 body=${body% }
 opts=(-A "$account" -p "public,htc" -q class -N 1 --gres=gpu:1 --constraint=a100_80 -c 12 --mem=64G -t "$time_limit" -J "dense-$TAG-$DATASET")
