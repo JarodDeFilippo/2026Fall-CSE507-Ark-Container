@@ -20,22 +20,26 @@ The segmentation probe asks whether a frozen backbone's patch features say where
 
 Three things differ from the Demo 2 code, each on purpose. The train augmentation is Demo 2's four steps (resize, `ShiftScaleRotate`, `RandomBrightnessContrast`, normalization) with the normalization moved last, after the brightness-contrast step, on the uint8 image: the Demo 2 loader normalizes first, and its brightness-contrast step then clips the normalized image to a single value whenever it fires (checked with albumentations 1.3.0 and 2.0.8). Validation and test images are only resized and normalized, and nothing is flipped. `rle2mask` takes `width` as the number of columns and `height` as the number of rows, where the Demo 2 call passes them the other way round and so transposes the mask of a non-square image. CANDID-PTX is read from the raw DICOMs through `dicom_to_uint8` (per-image min-max to 0-255), never from the `png/` folder, whose conversion clips every value of 255 or more to white.
 
+Every trunk and branch gets a row for its last cycle and one for its best linear-probe cycle (the lock arm's best is its last, c100, so it has one row).
+
 ```bash
 cd /scratch/$USER/2026Fall-CSE507-Ark-Container   # your copy of this repo on Sol; run the launcher on the login node
 
 # 1. The gate, first: stock DINOv3 on JSRT lungs. It passes if test_dice_mean is at least 90 in results/dense/stock_dinov3/jsrt_lung/seed0/result.json; below that the head or a loader is wrong, so do not launch the rest
 ./launch_dense.sh jsrt_lung stock_dinov3 vit_base_dinov3 /workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth imagenet
 
-# 2-6. CANDID-PTX pneumothorax, one job per backbone (the tag names the backbone, as in registry/probes.tsv of the DINO-X repo)
+# 2-7. CANDID-PTX pneumothorax, one job per backbone (the tag names the backbone, as in registry/probes.tsv of the DINO-X repo)
 ./launch_dense.sh candidptx stock_dinov3 vit_base_dinov3 /workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth imagenet
 ./launch_dense.sh candidptx arkteacher_e0200 vit_base_dinov3 /workspace/ssl_dinov3_cxr_constlr_arkteacher_seed_100/export/teacher_backbone_epoch_0200.pth imagenet
+./launch_dense.sh candidptx arkteacher_e0180 vit_base_dinov3 /workspace/ssl_dinov3_cxr_constlr_arkteacher_seed_100/export/teacher_backbone_epoch_0180.pth imagenet
 ./launch_dense.sh candidptx arkteacher_lock_e0100 vit_base_dinov3 /workspace/ssl_dinov3_cxr_constlr_arkteacher_lock_seed_100/export/teacher_backbone_epoch_0100.pth imagenet
 ./launch_dense.sh candidptx rad_dino vit_base_raddino /workspace/weights/rad_dino_vitb14_pretrain.pth raddino
 ./launch_dense.sh candidptx raydino vit_large_raydino /workspace/weights/xray_dino_vitl16_pretrained-ad31c2b0.pth imagenet
 
-# The ten-seed form of 2-6: seeds 0-9 of a row, one loop per row. A loop includes seed 0, which the row's single-seed line above already launches, so run a row's loop instead of its single-seed line, or start the loop at 1
+# The ten-seed form of 2-7: seeds 0-9 of a row, one loop per row. A loop includes seed 0, which the row's single-seed line above already launches, so run a row's loop instead of its single-seed line, or start the loop at 1
 for s in 0 1 2 3 4 5 6 7 8 9; do ./launch_dense.sh candidptx stock_dinov3 vit_base_dinov3 /workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth imagenet --seed $s; done
 for s in 0 1 2 3 4 5 6 7 8 9; do ./launch_dense.sh candidptx arkteacher_e0200 vit_base_dinov3 /workspace/ssl_dinov3_cxr_constlr_arkteacher_seed_100/export/teacher_backbone_epoch_0200.pth imagenet --seed $s; done
+for s in 0 1 2 3 4 5 6 7 8 9; do ./launch_dense.sh candidptx arkteacher_e0180 vit_base_dinov3 /workspace/ssl_dinov3_cxr_constlr_arkteacher_seed_100/export/teacher_backbone_epoch_0180.pth imagenet --seed $s; done
 for s in 0 1 2 3 4 5 6 7 8 9; do ./launch_dense.sh candidptx arkteacher_lock_e0100 vit_base_dinov3 /workspace/ssl_dinov3_cxr_constlr_arkteacher_lock_seed_100/export/teacher_backbone_epoch_0100.pth imagenet --seed $s; done
 for s in 0 1 2 3 4 5 6 7 8 9; do ./launch_dense.sh candidptx rad_dino vit_base_raddino /workspace/weights/rad_dino_vitb14_pretrain.pth raddino --seed $s; done
 for s in 0 1 2 3 4 5 6 7 8 9; do ./launch_dense.sh candidptx raydino vit_large_raydino /workspace/weights/xray_dino_vitl16_pretrained-ad31c2b0.pth imagenet --seed $s; done
