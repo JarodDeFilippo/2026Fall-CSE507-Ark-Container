@@ -284,6 +284,7 @@ print("OK (data): rle2mask puts the runs down the columns of a (height, width) m
 
 # (seg_probe) the training / evaluation entry point: a random-init ViT-B/16 at 64 px on a synthetic JSRT set, four iterations ----------------------------
 import copy
+import glob
 import hashlib
 import io
 import json
@@ -355,9 +356,15 @@ with tempfile.TemporaryDirectory() as seg_dir:
             rejects(SystemExit, lambda: seg_probe.parse_args(seg_argv("refused", "random", *extra)))
         return err.getvalue()
 
+    def partials():
+        """Every staging directory (seed<S>.partial-<pid>-<hex>) under the results, whatever its tag or dataset."""
+        return sorted(glob.glob(os.path.join(seg_out, "*", "*", "*.partial-*")))
+
     assert "needs --device cpu" in refused("--device", "cuda") and "is not a file" in refused("--weights", os.path.join(seg_dir, "missing.pth"))
     assert "letters, digits" in refused("--tag", "bad tag") and "at least 2" in refused("--iters", "1") and "invalid choice" in refused("--model", "vit_large_dinov3")
     assert "at least 0" in refused("--seed", "-1")  # the seed names a directory, seed<S>
+    assert "--batch must be at least 2" in refused("--batch", "1")  # PSP's 1 x 1 bin gives training-mode BatchNorm2d one value per channel from a batch of one: refused here, not by the first forward pass
+    assert seg_probe.parse_args(seg_argv("batch2", "random", "--batch", "2")).batch == 2
     assert [seg_probe.step_inc_for(n) for n in (5000, 20000, 100, 20, 4, 2)] == [250, 250, 5, 1, 1, 1]  # 250 at RayDINO's 5,000 iterations, never above iters
     defaults = seg_probe.parse_args(["--model", "vit_base_dinov3", "--weights", "random", "--normalization", "imagenet", "--dataset", "jsrt_lung", "--tag", "d", "--device", "cpu"])
     assert [getattr(defaults, k) for k in ("iters", "batch", "val_every", "lr", "wd", "seed", "workers", "size", "out", "data_root", "list_dir")] == \
@@ -395,6 +402,7 @@ with tempfile.TemporaryDirectory() as seg_dir:
     plain_dir = os.path.join(seg_out, "plain", "jsrt_lung")
     run_dir = os.path.join(plain_dir, "seed0")  # <out>/<tag>/<dataset>/seed<S>/
     assert sorted(os.listdir(run_dir)) == ["head_best.pt", "result.json"] and stdout == "" and stderr.count("seg_probe: iteration ") == 2
+    assert os.listdir(plain_dir) == ["seed0"] and partials() == []  # published by the rename: no seed0.partial-* beside it
     with open(os.path.join(run_dir, "result.json")) as f:
         assert json.load(f) == result
     assert set(result) == {"tag", "model", "weights", "weights_sha256", "normalization", "dataset", "seed", "iters", "batch", "lr", "wd", "size", "step_inc", "best_iter", "best_val_loss",
@@ -437,10 +445,15 @@ with tempfile.TemporaryDirectory() as seg_dir:
     rejects(FileExistsError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("plain"))), "refusing to overwrite")
     with open(os.path.join(run_dir, "result.json")) as f:
         assert f.read() == before
-    # a dangling symlink at the result's name is a file that exists too: refused up front, not after the run
+    # a run directory that exists is refused up front, not after the run, whatever is in it: here a dangling symlink at result.json, which os.path.exists would call absent
     os.makedirs(os.path.join(seg_out, "dangling", "jsrt_lung", "seed0"))
     os.symlink(os.path.join(seg_dir, "nowhere.json"), os.path.join(seg_out, "dangling", "jsrt_lung", "seed0", "result.json"))
     rejects(FileExistsError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("dangling"))), "refusing to overwrite")
+    # and so is a dangling symlink at the run directory's own name (lexists, not exists), with no staging directory made for the refused run
+    os.makedirs(os.path.join(seg_out, "dangling_dir", "jsrt_lung"))
+    os.symlink(os.path.join(seg_dir, "nowhere"), os.path.join(seg_out, "dangling_dir", "jsrt_lung", "seed0"))
+    rejects(FileExistsError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("dangling_dir"))), "refusing to overwrite")
+    assert os.listdir(os.path.join(seg_out, "dangling_dir", "jsrt_lung")) == ["seed0"]
     # --seed names the output directory, so the seeds of one (tag, dataset) coexist: seed 1 lands next to seed 0, which it leaves alone, and is a different run
     loaders.clear()
     with mock.patch.object(seg_probe, "make_loader", spy_loader):
@@ -451,24 +464,52 @@ with tempfile.TemporaryDirectory() as seg_dir:
         assert json.load(f) == other
     with open(os.path.join(run_dir, "result.json")) as f:
         assert f.read() == before
-    # another job writes the same result.json while this one trains: refused when this one gets to write it, the other's file untouched. Three iterations, validation every
-    # two: evaluate runs at iteration 2, at the last iteration (3), and on the test list
-    race_calls, race_result = [], os.path.join(seg_out, "race", "jsrt_lung", "seed0", "result.json")
+    # another job of the same (tag, dataset, seed) publishes before this one does: this one runs to its end, then its publish fails naming both paths, its finished run stays in its own
+    # staging directory beside the run directory, and the other job's directory is untouched. Three iterations, validation every two: evaluate runs at iteration 2, at the last
+    # iteration (3), and on the test list
+    race_dir, race_calls, race_paths, synced, real_publish, real_fsync = os.path.join(seg_out, "race", "jsrt_lung", "seed0"), [], [], [], seg_probe.publish, os.fsync
 
-    def racing_evaluate(pyramid, head, loader, device):
+    def counting_evaluate(pyramid, head, loader, device):
         race_calls.append(len(loader.dataset))
-        with open(race_result, "w") as f:
-            f.write("{}")
         return 0.5, 50.0, 50.0
 
-    with mock.patch.object(seg_probe, "evaluate", racing_evaluate):
-        rejects(FileExistsError, lambda: quietly(lambda: seg_probe.train(seg_probe.parse_args(seg_argv("race", "random", "--iters", "3")))))
-    with open(race_result) as f:
-        assert f.read() == "{}" and race_calls == [2, 2, 3]
+    def spy_fsync(fd):  # what the run's staging directory held when each fsync ran
+        synced.append(sorted(os.listdir(partials()[0])))
+        return real_fsync(fd)
+
+    def publish_after_other_job(staging, final_dir):  # the other job's directory lands between this run's last write and its rename
+        race_paths.append((staging, final_dir))
+        os.makedirs(final_dir)
+        with open(os.path.join(final_dir, "result.json"), "w") as f:
+            f.write("{}")
+        return real_publish(staging, final_dir)
+
+    with mock.patch.object(seg_probe, "evaluate", counting_evaluate), mock.patch.object(seg_probe, "publish", publish_after_other_job), mock.patch.object(os, "fsync", spy_fsync):
+        message = rejects(RuntimeError, lambda: quietly(lambda: seg_probe.train(seg_probe.parse_args(seg_argv("race", "random", "--iters", "3")))), "could not publish")
+    [(race_staging, race_final)] = race_paths
+    assert race_calls == [2, 2, 3] and race_final == race_dir and race_staging in message and race_dir in message
+    assert os.path.dirname(race_staging) == os.path.dirname(race_dir) and re.fullmatch(r"seed0\.partial-{}-[0-9a-f]+".format(os.getpid()), os.path.basename(race_staging))
+    assert sorted(os.listdir(race_staging)) == ["head_best.pt", "result.json"]  # the finished run is kept whole, for inspection
+    assert synced == [["head_best.pt"], ["head_best.pt", "result.json"]]  # both files fsynced, head_best.pt first
+    with open(os.path.join(race_staging, "result.json")) as f:
+        assert json.load(f)["tag"] == "race"
+    with open(os.path.join(race_dir, "result.json")) as f:
+        assert f.read() == "{}" and os.listdir(race_dir) == ["result.json"]  # the other job's directory is as it left it
+    assert partials() == [race_staging]
     # refusals that cost nothing: a train list smaller than the batch (the loader drops its partial batch and would never yield), a size the patch grid does not divide
     rejects(ValueError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("small", "random", "--batch", "6"))), "at least --batch (6)")
     rejects(ValueError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("size", "random", "--size", "60"))), "patch size 16")
-    assert not os.path.exists(os.path.join(seg_out, "small", "jsrt_lung", "seed0", "result.json")) and not os.path.exists(os.path.join(seg_out, "size", "jsrt_lung", "seed0", "result.json"))
+    assert os.listdir(os.path.join(seg_out, "small", "jsrt_lung")) == [] and os.listdir(os.path.join(seg_out, "size", "jsrt_lung")) == []  # not the run directory, not its staging directory
+
+    # an exception before the publish removes the staging directory with whatever the run had written into it, and is raised as it was
+    def failing_train_into(args, out_dir):
+        with open(os.path.join(out_dir, "head_best.pt"), "w") as f:
+            f.write("half a run")
+        raise RuntimeError("boom")
+
+    with mock.patch.object(seg_probe, "train_into", failing_train_into):
+        rejects(RuntimeError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("boom"))), "boom")
+    assert os.listdir(os.path.join(seg_out, "boom", "jsrt_lung")) == []
 
     # best-validation selection, through main(): validation losses 0.3 then 0.9, so iteration 2 is the best and the last iteration is worse. Scripted evaluate calls record the
     # val/test list they got and a head weight; the saved file and the test call must both hold the weight of iteration 2
@@ -499,10 +540,11 @@ with tempfile.TemporaryDirectory() as seg_dir:
     saved = torch.load(os.path.join(sel_dir, "head_best.pt"), weights_only=True)
     assert torch.equal(saved["head"]["conv.weight"], at_2) and torch.equal(at_test, at_2)
     assert summary == "SEG sel jsrt_lung seed0: best iteration 2 (val loss 0.3000), test Dice mean 66.00, pooled 55.00\n", summary
+    assert partials() == [race_staging]  # the successful runs, the refused ones and the failed one left no staging directory; only the race's failed publish keeps its run
 print("OK (seg_probe): evaluate gives the loss averaged by batch size and the pooled and per-image Dice x100 on stand-ins with a known answer, and hands the head back in its mode; "
       "a four-iteration run on a synthetic JSRT set writes result.json (every key, counts, null weights_sha256 for random, git sha, UTC times) and head_best.pt (trained part only, "
       "plain tensors, the state the test list saw); the optimizer steps at step_decay's rate (step_inc 1 for 4 iterations); the backbone is unchanged and gradient-free after training "
-      "while the pyramid's layers and the head moved; the loss is given probabilities; the defaults are RayDINO's budget; the same seed repeats the run and another seed is a different run in its own seed<S> directory beside the first; an existing result.json (a dangling symlink at its name too) is never overwritten, not by a job that writes one meanwhile either; validation losses 0.3 then 0.9 select iteration 2, and the test list is scored "
-      "with iteration 2's weights, once; the weights file's sha256 is recorded; bad flags, a train list under the batch and a size off the patch grid are refused; the train loader is shuffled by the seed and drops a partial last batch, val and test keep every image")
+      "while the pyramid's layers and the head moved; the loss is given probabilities; the defaults are RayDINO's budget; the same seed repeats the run and another seed is a different run in its own seed<S> directory beside the first; a run directory that exists (a dangling symlink at its name too) is refused up front; a run is written (head_best.pt, then result.json, each fsynced) into a private seed<S>.partial-<pid>-<hex> directory beside it and published by one rename, which leaves no staging directory behind after a success or an exception, and which, when another job published first, fails naming both paths with the finished run kept in its staging directory and the other job's directory untouched; validation losses 0.3 then 0.9 select iteration 2, and the test list is scored "
+      "with iteration 2's weights, once; the weights file's sha256 is recorded; bad flags (--batch 1 among them; 2 is accepted), a train list under the batch and a size off the patch grid are refused; the train loader is shuffled by the seed and drops a partial last batch, val and test keep every image")
 
 print("ALL OK")

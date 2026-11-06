@@ -7,9 +7,11 @@ Run from base/:
         --dataset jsrt_lung --tag stock_dinov3 --out results/dense
 
 It writes <out>/<tag>/<dataset>/seed<S>/result.json (the settings, the validation losses, the test Dice, the list sizes, the git sha and the times) and head_best.pt (what trained: the
-pyramid's level layers and the head; the frozen backbone is the weights file), S being --seed so that the seeds of one (tag, dataset) sit side by side, and refuses to overwrite a
-result.json that exists. Dice is x100 at the input size: "pooled" over every pixel of the test list, and "mean" over its images, which is Foundation X's CSV column. Progress goes to
-stderr; stdout is the one SEG line. --weights random builds the backbone without loading anything, for the CPU tests (it needs --device cpu).
+pyramid's level layers and the head; the frozen backbone is the weights file), S being --seed so that the seeds of one (tag, dataset) sit side by side, and refuses to run when that seed<S>
+directory exists. Both files are written (and fsynced) into a private seed<S>.partial-<pid>-<hex>/ beside it, which one rename makes seed<S> at the end: a seed<S> that exists is a whole run, and
+a second job of the same (tag, dataset, seed) that finishes later fails at the rename, the first one's directory untouched and its own run left in its .partial- directory. Dice is x100 at the
+input size: "pooled" over every pixel of the test list, and "mean" over its images, which is Foundation X's CSV column. Progress goes to stderr; stdout is the one SEG line. --weights random
+builds the backbone without loading anything, for the CPU tests (it needs --device cpu).
 """
 import argparse
 import datetime
@@ -17,6 +19,8 @@ import json
 import math
 import os
 import random
+import secrets
+import shutil
 import subprocess
 import sys
 
@@ -42,7 +46,7 @@ def parse_args(argv=None):
     p.add_argument("--dataset", required=True, choices=list(DATASETS))
     p.add_argument("--tag", required=True, help="names the backbone, e.g. stock_dinov3: the result is <out>/<tag>/<dataset>/seed<seed>/")
     p.add_argument("--iters", type=int, default=5000)
-    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--batch", type=int, default=16, help="images per batch, at least 2: the head's pyramid pooling reduces a map to 1 x 1, where training-mode BatchNorm needs more than one image")
     p.add_argument("--val_every", type=int, default=250, help="iterations between validation passes (and one at the last iteration)")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--wd", type=float, default=1e-4)
@@ -63,7 +67,8 @@ def parse_args(argv=None):
         p.error("--weights {} is not a file".format(args.weights))
     if args.device == "cuda" and not torch.cuda.is_available():
         p.error("--device cuda, but CUDA is not available")
-    for name, least in (("iters", 2), ("batch", 1), ("val_every", 1), ("size", 1), ("workers", 0), ("seed", 0)):  # iters: step_decay divides by iters - step_inc, so one iteration is too few; seed: it names a directory
+    # iters: step_decay divides by iters - step_inc, so one iteration is too few; batch: the PSP bin of 1 x 1 gives training-mode BatchNorm2d one value per channel from a batch of one; seed: it names a directory
+    for name, least in (("iters", 2), ("batch", 2), ("val_every", 1), ("size", 1), ("workers", 0), ("seed", 0)):
         if getattr(args, name) < least:
             p.error("--{} must be at least {}".format(name, least))
     return args
@@ -139,15 +144,10 @@ def make_loader(dataset, args, device, **kwargs):
     return DataLoader(dataset, batch_size=args.batch, num_workers=args.workers, pin_memory=device.type == "cuda", **kwargs)
 
 
-def train(args):
-    """One run: train on the train list, validate every --val_every iterations (and at the last), test the best validation-loss state once, write head_best.pt and result.json.
-    Returns the result dict."""
+def train_into(args, out_dir):
+    """One run: train on the train list, validate every --val_every iterations (and at the last), test the best validation-loss state once, write head_best.pt and result.json (both
+    fsynced) into `out_dir`, which exists. Returns the result dict."""
     started = utc_now()
-    out_dir = os.path.join(args.out, args.tag, args.dataset, "seed{}".format(args.seed))
-    result_path = os.path.join(out_dir, "result.json")
-    if os.path.lexists(result_path):  # a run costs hours: say so before the hash, the model and the data (lexists: a dangling symlink at that name refuses too)
-        raise FileExistsError("refusing to overwrite {}; delete {} to run again".format(result_path, out_dir))
-    os.makedirs(out_dir, exist_ok=True)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -200,15 +200,47 @@ def train(args):
     pyramid.levels.load_state_dict(best_state["pyramid"])  # the test list sees the best validation-loss state, not the last one
     head.load_state_dict(best_state["head"])
     _, test_pooled, test_mean = evaluate(pyramid, head, test_loader, device)
-    # ponytail: head_best.pt and result.json are written once, here; a Slurm time-limit kill loses the run. Save on each improvement if that ever costs one.
-    torch.save(best_state, os.path.join(out_dir, "head_best.pt"))
+    # ponytail: head_best.pt and result.json are written once, here; a Slurm time-limit kill loses the run (and leaves its .partial- directory). Save on each improvement if that ever costs one.
+    with open(os.path.join(out_dir, "head_best.pt"), "wb") as f:
+        torch.save(best_state, f)
+        f.flush()
+        os.fsync(f.fileno())
     result = {"tag": args.tag, "model": args.model, "weights": args.weights, "weights_sha256": sha, "normalization": args.normalization, "dataset": args.dataset,
               "seed": args.seed, "iters": args.iters, "batch": args.batch, "lr": args.lr, "wd": args.wd, "size": args.size, "step_inc": step_inc,
               "best_iter": best_iter, "best_val_loss": best_val, "val_losses": val_losses, "test_dice_pooled": test_pooled, "test_dice_mean": test_mean,
               "n_train": counts["train"], "n_val": counts["val"], "n_test": counts["test"], "git_sha": git_sha(), "started": started, "finished": utc_now()}
-    text = json.dumps(result, indent=2, allow_nan=False)  # serialized first: a NaN raises before a file exists
-    with open(result_path, "x") as f:  # "x": never overwrites
+    text = json.dumps(result, indent=2, allow_nan=False)  # serialized first: a NaN raises before result.json exists
+    with open(os.path.join(out_dir, "result.json"), "w") as f:
         f.write(text + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    return result
+
+
+def publish(staging, final_dir):
+    """Rename the finished run in `staging` to `final_dir`. One rename, so `final_dir` appears whole or not at all, and it fails when anything but an empty directory is already there (a job of
+    the same tag, dataset and seed that published first): what is there is not touched, and this run stays in `staging`, for inspection."""
+    try:
+        os.rename(staging, final_dir)  # staging is beside final_dir, so on its filesystem: no copy fallback
+    except OSError as error:
+        raise RuntimeError("could not publish {} as {} ({}): the run stays in {} and {} was not touched; another job with this tag, dataset and seed may have published first".format(
+            staging, final_dir, error.strerror or error, staging, final_dir)) from error
+
+
+def train(args):
+    """One run (train_into), written into a private seed<S>.partial-<pid>-<hex> directory beside <out>/<tag>/<dataset>/seed<S> and published by renaming that directory to seed<S> once both
+    files are complete. Returns the result dict."""
+    final_dir = os.path.join(args.out, args.tag, args.dataset, "seed{}".format(args.seed))
+    if os.path.lexists(final_dir):  # a run costs hours: say so before the hash, the model and the data (lexists: a dangling symlink at that name refuses too)
+        raise FileExistsError("refusing to overwrite {}; delete it to run again".format(final_dir))
+    staging = "{}.partial-{}-{}".format(final_dir, os.getpid(), secrets.token_hex(4))  # makedirs, not mkdtemp: the umask sets its mode, as it did for seed<S> itself
+    os.makedirs(staging)  # now and not at the end, so that an output directory that cannot be written fails before the hours
+    try:
+        result = train_into(args, staging)
+    except BaseException:  # best effort; a failed publish, below this try, keeps the finished run
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    publish(staging, final_dir)
     return result
 
 

@@ -12,7 +12,7 @@
 # environment: DENSE_TIME (-t, default 02:00:00: a default, not a measurement, so set it from the first run's wall time: the class QOS counts the requested -t of a user's running GPU jobs against its GPU-minute cap);
 #   DENSE_ACCOUNT (-A, default class_cse49478170fall2026; a group member in another class account sets it, and it must carry the class QOS); ARK_ROOT (the repo copy the job runs in).
 # Checks, each a stop that names its cause (exit 2: the arguments, DENSE_TIME, DENSE_ACCOUNT; exit 1: the rest): the arguments' shape and values (the regexes of run_emb_class.sh, plus the datasets, the models and the two options); not inside a Slurm job
-#   (a real submission only); then, if ARK_ROOT exists, that the weights file is under it (a missing file would otherwise fail only after the queue wait) and that results/dense/<tag>/<dataset>/seed<S>/result.json is not (seg_probe refuses to overwrite one,
+#   (a real submission only); then, if ARK_ROOT exists, that the weights file is under it (a missing file would otherwise fail only after the queue wait) and that results/dense/<tag>/<dataset>/seed<S> does not exist in any form (seg_probe refuses to run when it does,
 #   after the same wait). A real submission also needs ARK_ROOT to exist, and sbatch.
 # --check as the FIRST argument: every check runs, then the sbatch line and the job script are printed, as a heredoc that repeats the submission, and nothing is submitted (exit 0). No Slurm command is called, so it runs on any machine; where ARK_ROOT does
 #   not exist (a laptop) it says on stderr that the weights file and the results were not checked.
@@ -68,9 +68,9 @@ if [[ -d $ARK_ROOT ]]; then
     echo "ERROR: weights not found at $HOST_WEIGHTS (host path for $WEIGHTS); nothing was submitted" >&2
     exit 1
   fi
-  RESULT_DIR=results/dense/$TAG/$DATASET/seed${seed:-0}   # seg_probe's folder for this seed; its default seed is 0
-  if [[ -e $ARK_ROOT/$RESULT_DIR/result.json ]]; then
-    echo "ERROR: $RESULT_DIR/result.json exists in $ARK_ROOT and seg_probe will not overwrite it: delete $RESULT_DIR there, or use another tag or seed; nothing was submitted" >&2
+  RESULT_DIR=results/dense/$TAG/$DATASET/seed${seed:-0}   # seg_probe's folder for this seed, refused when it exists in any form; its default seed is 0
+  if [[ -e $ARK_ROOT/$RESULT_DIR || -L $ARK_ROOT/$RESULT_DIR ]]; then
+    echo "ERROR: $RESULT_DIR exists in $ARK_ROOT and seg_probe will not run over it: delete $RESULT_DIR there to rerun, or use another tag or seed; nothing was submitted" >&2
     exit 1
   fi
 elif [[ $check_only == 1 ]]; then

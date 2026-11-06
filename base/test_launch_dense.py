@@ -81,7 +81,16 @@ with tempfile.TemporaryDirectory() as tmp:
     os.makedirs(os.path.join(runs, "seed0"))
     with open(os.path.join(runs, "seed0", "head_best.pt"), "w") as f:
         f.write("x")
-    assert launch(["--check"] + BASE, root).returncode == 0  # a seed folder without a result.json (a run that died) does not block a new run
+    done = launch(["--check"] + BASE, root)  # a seed folder without a result.json (a run that died) blocks too: seg_probe refuses any seed<S> that exists
+    assert done.returncode == 1 and done.stdout == "" and "results/dense/stock_dinov3/candidptx/seed0 exists" in done.stderr, done
+    os.makedirs(os.path.join(runs, "seed4"))  # an empty seed folder blocks as well
+    done = launch(["--check"] + BASE + ["--seed", "4"], root)
+    assert done.returncode == 1 and done.stdout == "" and "seed4 exists" in done.stderr, done
+    os.symlink(os.path.join(runs, "nowhere"), os.path.join(runs, "seed5"))  # a dangling symlink at that name blocks too (-e is false for it, -L is true)
+    done = launch(["--check"] + BASE + ["--seed", "5"], root)
+    assert done.returncode == 1 and done.stdout == "" and "seed5 exists" in done.stderr, done
+    os.makedirs(os.path.join(runs, "seed6.partial-123-abcd"))  # a staging leftover (a run killed mid-run) does not block a run of its seed
+    assert launch(["--check"] + BASE + ["--seed", "6"], root).returncode == 0
 
     def finish(seed):  # the run of that seed has written its result
         os.makedirs(os.path.join(runs, "seed" + seed), exist_ok=True)
@@ -91,11 +100,11 @@ with tempfile.TemporaryDirectory() as tmp:
     finish("0")
     for seed_args in ([], ["--seed", "0"]):  # seed 0 is the default
         done = launch(["--check"] + BASE + seed_args, root)
-        assert done.returncode == 1 and done.stdout == "" and "results/dense/stock_dinov3/candidptx/seed0/result.json exists" in done.stderr, (seed_args, done)
+        assert done.returncode == 1 and done.stdout == "" and "results/dense/stock_dinov3/candidptx/seed0 exists" in done.stderr, (seed_args, done)
     assert launch(["--check"] + BASE + ["--seed", "1"], root).returncode == 0  # another seed of the same (tag, dataset) is another folder
     finish("1")
     done = launch(["--check"] + BASE + ["--seed", "1"], root)
-    assert done.returncode == 1 and done.stdout == "" and "seed1/result.json exists" in done.stderr, done
+    assert done.returncode == 1 and done.stdout == "" and "seed1 exists" in done.stderr, done
     assert launch(["--check"] + BASE + ["--seed", "2"], root).returncode == 0
     assert launch(["--check", "jsrt_lung"] + BASE[1:], root).returncode == 0  # the same tag on the other dataset is another result folder
 
@@ -112,7 +121,7 @@ with tempfile.TemporaryDirectory() as tmp:
             return argv.read().splitlines(), stdin.read()
 
     done = launch(BASE, root, **stubbed)  # an existing result blocks the real submission too, before sbatch is called
-    assert done.returncode == 1 and "seed0/result.json exists" in done.stderr and not os.path.exists(os.path.join(stub_dir, "argv")), done
+    assert done.returncode == 1 and "seed0 exists" in done.stderr and not os.path.exists(os.path.join(stub_dir, "argv")), done
     shutil.rmtree(os.path.join(root, "results"))
     done = launch(BASE + ["--iters", "10", "--seed", "3"], root, **stubbed)
     assert done.returncode == 0 and done.stdout == "Submitted batch job 4242\n" and done.stderr == "", done
