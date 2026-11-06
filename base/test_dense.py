@@ -195,7 +195,7 @@ for _ in range(40):
     out = train_pipeline(image=gradient, mask=np.zeros((64, 64), np.uint8))["image"]
     assert out.dtype == torch.float32 and out.shape == (3, 64, 64) and out.min() < -1 and out.max() > 1
 
-# JSRT: images_png/<id>.png, the union of the two lung masks; "b" has its masks at half the image's resolution and valued 1, not 255; "align" is one bright block
+# JSRT: images_png/<id>.png, the union of the two lung masks; "b" has its masks at half the image's resolution and valued 1, not 255; "align" is one bright block; "p" is "a" with a palette image and left mask
 with tempfile.TemporaryDirectory() as jsrt_root:
     left = np.zeros((64, 64), np.uint8)
     left[10:50, 8:28] = 255
@@ -211,17 +211,23 @@ with tempfile.TemporaryDirectory() as jsrt_root:
         write_png(os.path.join(jsrt_root, "images_png", id_ + ".png"), image)
         write_png(os.path.join(jsrt_root, "masks", "left_lung_png", id_ + ".png"), left_mask)
         write_png(os.path.join(jsrt_root, "masks", "right_lung_png", id_ + ".png"), right_mask)
+    # "p": "a" as palette (P) PNGs, the image and the left mask; the right mask stays 8-bit
+    Image.fromarray(lungs).convert("P").save(os.path.join(jsrt_root, "images_png", "p.png"))
+    Image.fromarray(left).convert("P").save(os.path.join(jsrt_root, "masks", "left_lung_png", "p.png"))
+    write_png(os.path.join(jsrt_root, "masks", "right_lung_png", "p.png"), right)
     jsrt_list = os.path.join(jsrt_root, "list.txt")
     with open(jsrt_list, "w") as f:
-        f.write("a\nb\n\nalign\n")
+        f.write("a\nb\n\nalign\np\n")
     jsrt_test = data.JSRTLung(jsrt_root, jsrt_list, size=224, mode="test", normalization="imagenet")
-    assert len(jsrt_test) == 3  # the blank line is skipped
+    assert len(jsrt_test) == 4  # the blank line is skipped
     img, msk = jsrt_test[0]
     assert img.shape == (3, 224, 224) and img.dtype == torch.float32 and msk.shape == (1, 224, 224) and msk.dtype == torch.float32
     assert set(msk.unique().tolist()) <= {0.0, 1.0} and msk.sum() > 0
     assert np.array_equal(msk[0].numpy(), cv2.resize(left | right, (224, 224), interpolation=cv2.INTER_NEAREST) // 255)  # both lungs, nothing else
     assert torch.allclose(img, plain_pipeline(np.repeat(lungs[..., None], 3, axis=-1), 224, "imagenet"), atol=1e-4)
     assert torch.equal(jsrt_test[1][1], msk)  # the half-resolution masks of "b" give the same mask
+    p_img, p_msk = jsrt_test[3]  # the palette image and mask of "p" give the same shapes and values as "a"
+    assert p_img.shape == (3, 224, 224) and p_msk.shape == (1, 224, 224) and torch.equal(p_img, img) and torch.equal(p_msk, msk)
     jsrt_train = data.JSRTLung(jsrt_root, jsrt_list, size=224, mode="train", normalization="imagenet")
     img, msk = jsrt_train[0]
     assert img.shape == (3, 224, 224) and img.dtype == torch.float32 and msk.shape == (1, 224, 224) and msk.dtype == torch.float32
@@ -232,7 +238,7 @@ with tempfile.TemporaryDirectory() as jsrt_root:
     jsrt_none = data.make_dataset("jsrt_lung", "val", 64, "none", root=jsrt_root, list_path=jsrt_list)
     assert isinstance(jsrt_none, data.JSRTLung) and torch.allclose(jsrt_none[0][0], plain_pipeline(np.repeat(lungs[..., None], 3, axis=-1), 64, "none"), atol=1e-6)
     jsrt_copy = pickle.loads(pickle.dumps(jsrt_train))  # DataLoader workers get a copy of the dataset
-    assert len(jsrt_copy) == 3 and jsrt_copy[0][0].shape == (3, 224, 224)
+    assert len(jsrt_copy) == 4 and jsrt_copy[0][0].shape == (3, 224, 224)
 
     def draws(seed):  # six train items of a fresh dataset, as a worker whose torch seed is `seed` would draw them
         dataset = data.JSRTLung(jsrt_root, jsrt_list, size=64, mode="train", normalization="imagenet")
@@ -278,7 +284,7 @@ with tempfile.TemporaryDirectory() as candid_root:
     rejects(ValueError, lambda: data.CandidPTX(candid_root, candid_list + ".bad"), "uid,rle")
 print("OK (data): rle2mask puts the runs down the columns of a (height, width) mask and gives zeros for -1 / blank, through a round trip on 6 x 9 and on 1250 x 1024 and "
       "1024 x 1250 masks (sum = run total, block stays on the right); dicom_to_uint8 spreads 12- and 14-bit ranges over 0-255 without clipping and gives zeros for a constant image; "
-      "NORMALIZATION equals the linear probe's constants; JSRTLung (union of both lungs, half-resolution masks, 16-bit PNG refused) and CandidPTX (non-square, -1, blank lines, "
+      "NORMALIZATION equals the linear probe's constants; JSRTLung (union of both lungs, half-resolution masks, palette PNGs read like 8-bit ones, 16-bit PNG refused) and CandidPTX (non-square, -1, blank lines, "
       "no-comma line refused) return float32 (3, S, S) / (1, S, S) {0, 1} items in test and train mode, equal to a plain cv2 resize + normalize; normalization comes last; "
       "the train mask follows the geometric augmentation; --seed (torch's seed) fixes the augmentation draws")
 

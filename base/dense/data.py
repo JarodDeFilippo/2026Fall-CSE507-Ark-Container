@@ -116,8 +116,10 @@ class JSRTLung(_SegDataset):
     def read(self, id_):
         path = os.path.join(self.root, "images_png", id_ + ".png")
         with Image.open(path) as im:
+            if im.mode in ("P", "PA"):  # a palette PNG: apply the palette, as cv2's color read does
+                im = im.convert("RGB")
             if im.mode not in ("L", "RGB"):  # a 16-bit PNG would convert with every value >= 255 clipped to white
-                raise ValueError("{}: {} PNG, expected 8-bit".format(path, im.mode))
+                raise ValueError("{}: {} PNG, expected 8-bit L, RGB or P (palette)".format(path, im.mode))
             image = np.asarray(im.convert("L"))
         mask = np.zeros(image.shape, dtype=np.uint8)
         for side in ("left", "right"):
