@@ -282,4 +282,227 @@ print("OK (data): rle2mask puts the runs down the columns of a (height, width) m
       "no-comma line refused) return float32 (3, S, S) / (1, S, S) {0, 1} items in test and train mode, equal to a plain cv2 resize + normalize; normalization comes last; "
       "the train mask follows the geometric augmentation; --seed (torch's seed) fixes the augmentation draws")
 
+# (seg_probe) the training / evaluation entry point: a random-init ViT-B/16 at 64 px on a synthetic JSRT set, four iterations ----------------------------
+import copy
+import hashlib
+import io
+import json
+import re
+from unittest import mock
+
+from dense import seg_probe
+
+
+def quietly(call):
+    """call() with stdout and stderr captured: (its value, stdout, stderr)."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        value = call()
+    return value, out.getvalue(), err.getvalue()
+
+
+# evaluate on stand-ins with a known answer: the "image" carries the map to predict (the mask itself, or its inverse), the stub head turns it into +-20 logits
+class EchoHead(torch.nn.Module):
+    def forward(self, feats, out_size):
+        return 40 * (feats[0][:, :1] - 0.5)
+
+
+m1 = torch.zeros(2, 1, 8, 8)
+m1[:, :, 2:6, 2:6] = 1  # two images, 16 ones each, predicted right
+m2 = torch.zeros(1, 1, 8, 8)
+m2[:, :, 0:4, 0:4] = 1  # one image, 16 ones, predicted as its inverse
+echo, cpu = EchoHead().train(), torch.device("cpu")
+loss, pooled, mean = seg_probe.evaluate(lambda img: [img], echo, [(m1.repeat(1, 3, 1, 1), m1), ((1 - m2).repeat(1, 3, 1, 1), m2)], cpu)
+assert echo.training  # evaluate hands the head back in the mode it got it
+assert abs(loss - (0 * 2 + (1 - 1 / 65) * 1) / 3) < 1e-5  # batch losses ~0 and 1 - 1/(16 + 48 + 1), averaged by batch size (2 and 1), not by batch
+assert abs(pooled - 50.0) < 1e-4 and abs(mean - 200 / 3) < 1e-4  # pooled: 2 x 32 / (80 + 48); per image: 1, 1, 0
+seg_probe.evaluate(lambda img: [img], echo.eval(), [(m1.repeat(1, 3, 1, 1), m1)], cpu)
+assert not echo.training
+assert seg_probe.evaluate(lambda img: [img], echo, [(m1.repeat(1, 3, 1, 1), m1)], cpu)[1:] == (100.0, 100.0)
+with seg_probe.autocast(cpu):  # bf16 autocast is for CUDA only
+    assert not torch.is_autocast_enabled("cpu")
+
+with tempfile.TemporaryDirectory() as seg_dir:
+    rng = np.random.default_rng(2)
+    seg_ids = ["s{}".format(i) for i in range(10)]  # train s0-s4 (five: batch 2 leaves a partial last batch), val s5-s6, test s7-s9
+    for id_ in seg_ids:
+        left = np.zeros((64, 64), np.uint8)
+        left[10:50, 8:28] = 255
+        right = np.zeros((64, 64), np.uint8)
+        right[10:50, 36:56] = 255
+        image = rng.integers(0, 60, (64, 64)).astype(np.uint8)
+        image[(left > 0) | (right > 0)] += 150
+        write_png(os.path.join(seg_dir, "images_png", id_ + ".png"), image)
+        write_png(os.path.join(seg_dir, "masks", "left_lung_png", id_ + ".png"), left)
+        write_png(os.path.join(seg_dir, "masks", "right_lung_png", id_ + ".png"), right)
+    seg_lists = os.path.join(seg_dir, "lists")
+    os.makedirs(seg_lists)
+    for split, split_ids in (("train", seg_ids[:5]), ("val", seg_ids[5:7]), ("test", seg_ids[7:])):
+        with open(os.path.join(seg_lists, split + ".txt"), "w") as f:
+            f.write("\n".join(split_ids) + "\n")
+    seg_out = os.path.join(seg_dir, "results")
+
+    def seg_argv(tag, weights="random", *extra):
+        """The command line of a four-iteration run (batch 2, validation at 2 and 4, lr 2e-4, weight decay 5e-5) on the synthetic set; `extra` flags come last and win."""
+        return ["--model", "vit_base_dinov3", "--weights", weights, "--normalization", "imagenet", "--dataset", "jsrt_lung", "--tag", tag, "--iters", "4", "--batch", "2",
+                "--val_every", "2", "--workers", "0", "--size", "64", "--seed", "0", "--lr", "2e-4", "--wd", "5e-5", "--device", "cpu", "--out", seg_out, "--data_root", seg_dir,
+                "--list_dir", seg_lists] + list(extra)
+
+    def refused(*extra):
+        """parse_args' error text for the run's command line plus `extra` (argparse prints it to stderr and exits 2)."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rejects(SystemExit, lambda: seg_probe.parse_args(seg_argv("refused", "random", *extra)))
+        return err.getvalue()
+
+    assert "needs --device cpu" in refused("--device", "cuda") and "is not a file" in refused("--weights", os.path.join(seg_dir, "missing.pth"))
+    assert "letters, digits" in refused("--tag", "bad tag") and "at least 2" in refused("--iters", "1") and "invalid choice" in refused("--model", "vit_large_dinov3")
+    assert "at least 0" in refused("--seed", "-1")  # the seed names a directory, seed<S>
+    assert [seg_probe.step_inc_for(n) for n in (5000, 20000, 100, 20, 4, 2)] == [250, 250, 5, 1, 1, 1]  # 250 at RayDINO's 5,000 iterations, never above iters
+    defaults = seg_probe.parse_args(["--model", "vit_base_dinov3", "--weights", "random", "--normalization", "imagenet", "--dataset", "jsrt_lung", "--tag", "d", "--device", "cpu"])
+    assert [getattr(defaults, k) for k in ("iters", "batch", "val_every", "lr", "wd", "seed", "workers", "size", "out", "data_root", "list_dir")] == \
+        [5000, 16, 250, 1e-4, 1e-4, 0, 12, 224, "results/dense", None, None]  # RayDINO's budget
+
+    # a run with spies: the model it builds, the backbone loads it asks for, the loaders, the learning rate and weight decay each optimizer step runs at, what the Dice loss is given
+    real_build, real_load, real_step, real_loader, real_loss = seg_probe.build_model, seg_probe.load_backbone, torch.optim.AdamW.step, seg_probe.make_loader, seg_probe.torch_dice_coef_loss
+    built, loads, lrs, loaders, loss_inputs = {}, [], [], [], []
+
+    def spy_build(*args, **kwargs):
+        built["pyramid"], built["head"] = real_build(*args, **kwargs)
+        built["backbone"], built["head0"] = copy.deepcopy(built["pyramid"].backbone.state_dict()), copy.deepcopy(built["head"].state_dict())
+        built["levels0"] = copy.deepcopy(built["pyramid"].levels.state_dict())
+        return built["pyramid"], built["head"]
+
+    def spy_load(model_name, weights):
+        loads.append((model_name, weights))
+        return real_load(model_name, weights)
+
+    def spy_step(self, *args, **kwargs):
+        lrs.append((self.param_groups[0]["lr"], self.param_groups[0]["weight_decay"]))
+        return real_step(self, *args, **kwargs)
+
+    def spy_loader(*args, **kwargs):
+        loaders.append(real_loader(*args, **kwargs))
+        return loaders[-1]
+
+    def spy_loss(y_true, y_pred):
+        loss_inputs.append((y_true.unique().tolist(), float(y_pred.min()), float(y_pred.max())))
+        return real_loss(y_true, y_pred)
+
+    with mock.patch.object(seg_probe, "build_model", spy_build), mock.patch.object(seg_probe, "load_backbone", spy_load), mock.patch.object(torch.optim.AdamW, "step", spy_step), \
+            mock.patch.object(seg_probe, "make_loader", spy_loader), mock.patch.object(seg_probe, "torch_dice_coef_loss", spy_loss):
+        result, stdout, stderr = quietly(lambda: seg_probe.train(seg_probe.parse_args(seg_argv("plain"))))
+    plain_dir = os.path.join(seg_out, "plain", "jsrt_lung")
+    run_dir = os.path.join(plain_dir, "seed0")  # <out>/<tag>/<dataset>/seed<S>/
+    assert sorted(os.listdir(run_dir)) == ["head_best.pt", "result.json"] and stdout == "" and stderr.count("seg_probe: iteration ") == 2
+    with open(os.path.join(run_dir, "result.json")) as f:
+        assert json.load(f) == result
+    assert set(result) == {"tag", "model", "weights", "weights_sha256", "normalization", "dataset", "seed", "iters", "batch", "lr", "wd", "size", "step_inc", "best_iter", "best_val_loss",
+                           "val_losses", "test_dice_pooled", "test_dice_mean", "n_train", "n_val", "n_test", "git_sha", "started", "finished"}
+    assert [result[k] for k in ("tag", "model", "weights", "weights_sha256", "normalization", "dataset")] == ["plain", "vit_base_dinov3", "random", None, "imagenet", "jsrt_lung"]
+    assert [result[k] for k in ("seed", "iters", "batch", "lr", "wd", "size", "step_inc", "n_train", "n_val", "n_test")] == [0, 4, 2, 2e-4, 5e-5, 64, 1, 5, 2, 3]
+    assert len(result["val_losses"]) == 2 and all(0 <= v <= 1 for v in result["val_losses"]) and result["best_iter"] in (2, 4)
+    assert result["best_val_loss"] == min(result["val_losses"]) == result["val_losses"][result["best_iter"] // 2 - 1]
+    assert 0 <= result["test_dice_mean"] <= 100 and 0 <= result["test_dice_pooled"] <= 100
+    assert result["git_sha"] is None or re.fullmatch("[0-9a-f]{40}", result["git_sha"])
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", result["started"]) and result["started"] <= result["finished"]
+    assert loads == [("vit_base_dinov3", None)]  # 'random' reaches load_backbone as no weights
+    # the loaders: train is shuffled by the run's seed and drops a partial last batch (a batch of one would break BatchNorm); val and test keep every image, in order
+    train_loader, val_loader, test_loader = loaders
+    assert isinstance(train_loader.sampler, torch.utils.data.RandomSampler) and train_loader.drop_last and train_loader.generator.initial_seed() == 0
+    assert not isinstance(val_loader.sampler, torch.utils.data.RandomSampler) and not val_loader.drop_last and not test_loader.drop_last
+    assert [len(b[0]) for b in test_loader] == [2, 1] and [len(b[0]) for b in train_loader] == [2, 2]
+    # step_decay at iterations 1-4 of 4 with step_inc 1 and lr 2e-4: the full rate, then 0.75, 0.25 and nothing of it (cosine to zero at the last iteration); weight decay 5e-5 throughout
+    assert len(lrs) == 4 and all(abs(lr - want) < 1e-12 and wd == 5e-5 for (lr, wd), want in zip(lrs, [2e-4, 1.5e-4, 0.5e-4, 0.0])), lrs
+    # the Dice loss gets the sigmoid of the logits and a {0, 1} mask: 4 training steps, 2 validation passes of one batch, 2 test batches
+    assert len(loss_inputs) == 8 and all(set(m) <= {0.0, 1.0} and 0 <= lo <= hi <= 1 for m, lo, hi in loss_inputs), loss_inputs
+    # the backbone is frozen: every tensor of it as it was built, no gradient, still in eval; the pyramid's level layers and the head did move
+    backbone = built["pyramid"].backbone
+    assert all(torch.equal(v, built["backbone"][k]) for k, v in backbone.state_dict().items())
+    assert all(p.grad is None and not p.requires_grad for p in backbone.parameters()) and not backbone.training
+    assert any(not torch.equal(v, built["head0"][k]) for k, v in built["head"].state_dict().items() if v.is_floating_point())
+    assert any(not torch.equal(v, built["levels0"][k]) for k, v in built["pyramid"].levels.state_dict().items())
+    # head_best.pt: plain tensors of the trained part only, keyed as the modules are, and the state the test list was scored with
+    saved = torch.load(os.path.join(run_dir, "head_best.pt"), weights_only=True)
+    assert sorted(saved) == ["head", "pyramid"] and not any(k.startswith("backbone") for k in saved["pyramid"])
+    assert list(saved["pyramid"]) == list(built["pyramid"].levels.state_dict()) and list(saved["head"]) == list(built["head"].state_dict())
+    assert all(torch.equal(saved["head"][k], v) for k, v in built["head"].state_dict().items())
+    assert all(torch.equal(saved["pyramid"][k], v) for k, v in built["pyramid"].levels.state_dict().items())
+    del built, backbone, saved
+    # the same seed gives the same run (init, shuffle, augmentation draws); a result.json that exists is never overwritten
+    again, _, _ = quietly(lambda: seg_probe.train(seg_probe.parse_args(seg_argv("again"))))
+    assert again["best_iter"] == result["best_iter"] and all(abs(a - b) < 1e-9 for a, b in zip(again["val_losses"], result["val_losses"]))
+    with open(os.path.join(run_dir, "result.json")) as f:
+        before = f.read()
+    rejects(FileExistsError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("plain"))), "refusing to overwrite")
+    with open(os.path.join(run_dir, "result.json")) as f:
+        assert f.read() == before
+    # a dangling symlink at the result's name is a file that exists too: refused up front, not after the run
+    os.makedirs(os.path.join(seg_out, "dangling", "jsrt_lung", "seed0"))
+    os.symlink(os.path.join(seg_dir, "nowhere.json"), os.path.join(seg_out, "dangling", "jsrt_lung", "seed0", "result.json"))
+    rejects(FileExistsError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("dangling"))), "refusing to overwrite")
+    # --seed names the output directory, so the seeds of one (tag, dataset) coexist: seed 1 lands next to seed 0, which it leaves alone, and is a different run
+    loaders.clear()
+    with mock.patch.object(seg_probe, "make_loader", spy_loader):
+        other, _, _ = quietly(lambda: seg_probe.train(seg_probe.parse_args(seg_argv("plain", "random", "--seed", "1"))))
+    assert sorted(os.listdir(plain_dir)) == ["seed0", "seed1"] and other["seed"] == 1 and other["val_losses"] != result["val_losses"]
+    assert loaders[0].generator.initial_seed() == 1  # the train loader's shuffle follows --seed
+    with open(os.path.join(plain_dir, "seed1", "result.json")) as f:
+        assert json.load(f) == other
+    with open(os.path.join(run_dir, "result.json")) as f:
+        assert f.read() == before
+    # another job writes the same result.json while this one trains: refused when this one gets to write it, the other's file untouched. Three iterations, validation every
+    # two: evaluate runs at iteration 2, at the last iteration (3), and on the test list
+    race_calls, race_result = [], os.path.join(seg_out, "race", "jsrt_lung", "seed0", "result.json")
+
+    def racing_evaluate(pyramid, head, loader, device):
+        race_calls.append(len(loader.dataset))
+        with open(race_result, "w") as f:
+            f.write("{}")
+        return 0.5, 50.0, 50.0
+
+    with mock.patch.object(seg_probe, "evaluate", racing_evaluate):
+        rejects(FileExistsError, lambda: quietly(lambda: seg_probe.train(seg_probe.parse_args(seg_argv("race", "random", "--iters", "3")))))
+    with open(race_result) as f:
+        assert f.read() == "{}" and race_calls == [2, 2, 3]
+    # refusals that cost nothing: a train list smaller than the batch (the loader drops its partial batch and would never yield), a size the patch grid does not divide
+    rejects(ValueError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("small", "random", "--batch", "6"))), "at least --batch (6)")
+    rejects(ValueError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("size", "random", "--size", "60"))), "patch size 16")
+    assert not os.path.exists(os.path.join(seg_out, "small", "jsrt_lung", "seed0", "result.json")) and not os.path.exists(os.path.join(seg_out, "size", "jsrt_lung", "seed0", "result.json"))
+
+    # best-validation selection, through main(): validation losses 0.3 then 0.9, so iteration 2 is the best and the last iteration is worse. Scripted evaluate calls record the
+    # val/test list they got and a head weight; the saved file and the test call must both hold the weight of iteration 2
+    seg_weights = os.path.join(seg_dir, "backbone.pth")
+    with open(seg_weights, "wb") as f:
+        f.write(b"hashed, never loaded")
+    recorded, loads = [], []
+
+    def scripted_evaluate(pyramid, head, loader, device):
+        recorded.append((list(loader.dataset.items), head.conv.weight.detach().clone()))
+        return [(0.3, 11.0, 12.0), (0.9, 21.0, 22.0), (0.4, 55.0, 66.0)][len(recorded) - 1]  # a 4th call (a second test pass) is an IndexError
+
+    def fake_load(model_name, weights):
+        loads.append((model_name, weights))
+        return real_load(model_name, None)
+
+    with mock.patch.object(seg_probe, "evaluate", scripted_evaluate), mock.patch.object(seg_probe, "load_backbone", fake_load):
+        _, summary, _ = quietly(lambda: seg_probe.main(seg_argv("sel", seg_weights)))
+    sel_dir = os.path.join(seg_out, "sel", "jsrt_lung", "seed0")
+    with open(os.path.join(sel_dir, "result.json")) as f:
+        sel = json.load(f)
+    assert sel["best_iter"] == 2 and sel["val_losses"] == [0.3, 0.9] and sel["best_val_loss"] == 0.3
+    assert (sel["test_dice_pooled"], sel["test_dice_mean"]) == (55.0, 66.0)  # the test call's numbers, not a validation call's
+    assert sel["weights"] == seg_weights and sel["weights_sha256"] == hashlib.sha256(b"hashed, never loaded").hexdigest() and loads == [("vit_base_dinov3", seg_weights)]
+    (val_a, at_2), (val_b, at_4), (test_ids, at_test) = recorded
+    assert val_a == val_b == ["s5", "s6"] and test_ids == ["s7", "s8", "s9"]
+    assert not torch.equal(at_2, at_4)  # training went on past the best state, so the equalities below mean something
+    saved = torch.load(os.path.join(sel_dir, "head_best.pt"), weights_only=True)
+    assert torch.equal(saved["head"]["conv.weight"], at_2) and torch.equal(at_test, at_2)
+    assert summary == "SEG sel jsrt_lung seed0: best iteration 2 (val loss 0.3000), test Dice mean 66.00, pooled 55.00\n", summary
+print("OK (seg_probe): evaluate gives the loss averaged by batch size and the pooled and per-image Dice x100 on stand-ins with a known answer, and hands the head back in its mode; "
+      "a four-iteration run on a synthetic JSRT set writes result.json (every key, counts, null weights_sha256 for random, git sha, UTC times) and head_best.pt (trained part only, "
+      "plain tensors, the state the test list saw); the optimizer steps at step_decay's rate (step_inc 1 for 4 iterations); the backbone is unchanged and gradient-free after training "
+      "while the pyramid's layers and the head moved; the loss is given probabilities; the defaults are RayDINO's budget; the same seed repeats the run and another seed is a different run in its own seed<S> directory beside the first; an existing result.json (a dangling symlink at its name too) is never overwritten, not by a job that writes one meanwhile either; validation losses 0.3 then 0.9 select iteration 2, and the test list is scored "
+      "with iteration 2's weights, once; the weights file's sha256 is recorded; bad flags, a train list under the batch and a size off the patch grid are refused; the train loader is shuffled by the seed and drops a partial last batch, val and test keep every image")
+
 print("ALL OK")
