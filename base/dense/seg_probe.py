@@ -8,9 +8,10 @@ Run from base/:
 
 It writes <out>/<tag>/<dataset>/seed<S>/result.json (the settings, the validation losses, the test Dice, the list sizes, the git sha and the times) and head_best.pt (what trained: the
 pyramid's level layers and the head; the frozen backbone is the weights file), S being --seed so that the seeds of one (tag, dataset) sit side by side, and refuses to run when that seed<S>
-directory exists. Both files are written (and fsynced) into a private seed<S>.partial-<pid>-<hex>/ beside it, which one rename makes seed<S> at the end, after an mkdir has claimed that name: a
-seed<S> that exists is a whole run (bar the instant between the two, when it is the empty directory the mkdir made), and a second job of the same (tag, dataset, seed) that finishes later fails
-at the mkdir, the first one's directory untouched and its own run left in its .partial- directory. Dice is x100 at the
+directory exists. Both files are written (and fsynced) into a private seed<S>.partial-<pid>-<hex>/ beside it, and at the end moved into seed<S> one at a time, head_best.pt and then result.json, after an
+mkdir has claimed that name (the directory itself is not renamed: Lustre fails a rename onto an existing empty directory, which POSIX replaces): a seed<S> with result.json is a whole run, one without it is a
+publish interrupted mid-move and is deleted by hand, and a second job of the same (tag, dataset, seed) that finishes later fails at the mkdir, the first one's directory untouched and its own run left in its
+.partial- directory. Dice is x100 at the
 input size: "pooled" over every pixel of the test list, and "mean" over its images, which is Foundation X's CSV column. Progress goes to stderr; stdout is the one SEG line. --weights random
 builds the backbone without loading anything, for the CPU tests (it needs --device cpu).
 """
@@ -219,27 +220,35 @@ def train_into(args, out_dir):
 
 
 def publish(staging, final_dir):
-    """Make the finished run in `staging` the directory `final_dir`: the name is claimed first with os.mkdir, which is atomic and fails when anything is there (a job of the same tag, dataset
-    and seed that published first, a dangling symlink, an empty directory, which rename(2) alone would replace), then one rename puts `staging` over the empty directory just made, so `final_dir`
-    appears whole. What was there is not touched, and a run that fails to publish stays in `staging`, for inspection."""
+    """Make the finished run in `staging` the directory `final_dir`, on any filesystem. The name is claimed first with os.mkdir, which is atomic and fails when anything is there (a job of the same tag,
+    dataset and seed that published first, a dangling symlink, an empty directory); then head_best.pt and result.json are renamed into the directory just made, in that order, and the emptied `staging` is
+    removed. The directory itself is never renamed: Lustre fails a rename onto an existing empty directory with EEXIST, where POSIX replaces it. A `final_dir` with result.json is a whole run; one without it
+    is a publish interrupted mid-move, to be deleted by hand. What was there is not touched, and a run that fails to publish stays in `staging` for inspection: whole if the first move failed (the claim is
+    given back), minus head_best.pt, which is then in `final_dir`, if the second did (the operator finishes by hand)."""
+    moved, claimed = [], False
     try:
         os.mkdir(final_dir)  # the claim: EEXIST for anything at the name, a dangling symlink and an empty directory included
-        try:
-            os.rename(staging, final_dir)  # staging is beside final_dir, so on its filesystem: no copy fallback; it replaces the empty directory made above
-        except OSError:
+        claimed = True
+        for name in ("head_best.pt", "result.json"):  # staging is beside final_dir, so on its filesystem: no copy fallback; result.json last, so that final_dir has it only when the run is whole
+            os.rename(os.path.join(staging, name), os.path.join(final_dir, name))
+            moved.append(name)
+    except OSError as error:
+        if claimed and not moved:
             try:
                 os.rmdir(final_dir)  # the claim is given back; best effort, and rmdir takes nothing but the empty directory made above
             except OSError:
                 pass
-            raise
-    except OSError as error:
-        raise RuntimeError("could not publish {} as {} ({}): the run stays in {} and {} was not touched; another job with this tag, dataset and seed may have published first".format(
-            staging, final_dir, error.strerror or error, staging, final_dir)) from error
+        raise RuntimeError("could not publish {} as {} ({}): {} moved into {}, the rest of the run stays in {}; another job with this tag, dataset and seed may have published first".format(
+            staging, final_dir, error.strerror or error, ", ".join(moved) or "nothing", final_dir, staging)) from error
+    try:
+        os.rmdir(staging)  # empty now; the run is whole in final_dir, so a staging directory that will not go is clutter, not a failed publish
+    except OSError:
+        pass
 
 
 def train(args):
-    """One run (train_into), written into a private seed<S>.partial-<pid>-<hex> directory beside <out>/<tag>/<dataset>/seed<S> and published by renaming that directory to seed<S> once both
-    files are complete. Returns the result dict."""
+    """One run (train_into), written into a private seed<S>.partial-<pid>-<hex> directory beside <out>/<tag>/<dataset>/seed<S> and published by moving its two files into seed<S> once both are
+    complete. Returns the result dict."""
     final_dir = os.path.join(args.out, args.tag, args.dataset, "seed{}".format(args.seed))
     if os.path.lexists(final_dir):  # a run costs hours: say so before the hash, the model and the data (lexists: a dangling symlink at that name refuses too)
         raise FileExistsError("refusing to overwrite {}; delete it to run again".format(final_dir))

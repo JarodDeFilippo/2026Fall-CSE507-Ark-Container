@@ -290,6 +290,7 @@ print("OK (data): rle2mask puts the runs down the columns of a (height, width) m
 
 # (seg_probe) the training / evaluation entry point: a random-init ViT-B/16 at 64 px on a synthetic JSRT set, four iterations ----------------------------
 import copy
+import errno
 import glob
 import hashlib
 import io
@@ -408,7 +409,7 @@ with tempfile.TemporaryDirectory() as seg_dir:
     plain_dir = os.path.join(seg_out, "plain", "jsrt_lung")
     run_dir = os.path.join(plain_dir, "seed0")  # <out>/<tag>/<dataset>/seed<S>/
     assert sorted(os.listdir(run_dir)) == ["head_best.pt", "result.json"] and stdout == "" and stderr.count("seg_probe: iteration ") == 2
-    assert os.listdir(plain_dir) == ["seed0"] and partials() == []  # published by the rename: no seed0.partial-* beside it
+    assert os.listdir(plain_dir) == ["seed0"] and partials() == []  # published, the emptied staging directory removed: no seed0.partial-* beside it
     with open(os.path.join(run_dir, "result.json")) as f:
         assert json.load(f) == result
     assert set(result) == {"tag", "model", "weights", "weights_sha256", "normalization", "dataset", "seed", "iters", "batch", "lr", "wd", "size", "step_inc", "best_iter", "best_val_loss",
@@ -483,7 +484,7 @@ with tempfile.TemporaryDirectory() as seg_dir:
         synced.append(sorted(os.listdir(partials()[0])))
         return real_fsync(fd)
 
-    def publish_after_other_job(staging, final_dir):  # the other job's directory lands between this run's last write and its rename
+    def publish_after_other_job(staging, final_dir):  # the other job's directory lands between this run's last write and its publish
         race_paths.append((staging, final_dir))
         os.makedirs(final_dir)
         with open(os.path.join(final_dir, "result.json"), "w") as f:
@@ -502,7 +503,7 @@ with tempfile.TemporaryDirectory() as seg_dir:
     with open(os.path.join(race_dir, "result.json")) as f:
         assert f.read() == "{}" and os.listdir(race_dir) == ["result.json"]  # the other job's directory is as it left it
     assert partials() == [race_staging]
-    # an EMPTY seed0 at the name when the publish comes (made by another process after the up-front check) is refused as well, though rename(2) would replace an empty directory: the publish
+    # an EMPTY seed0 at the name when the publish comes (made by another process after the up-front check) is refused as well, though the files would move into it: the publish
     # claims the name with an mkdir first, so the finished run stays in its staging directory and the empty directory is still there, still empty
     empty_dir, empty_paths = os.path.join(seg_out, "empty", "jsrt_lung", "seed0"), []
 
@@ -518,11 +519,46 @@ with tempfile.TemporaryDirectory() as seg_dir:
     assert sorted(os.listdir(empty_staging)) == ["head_best.pt", "result.json"]  # the finished run is kept whole, for inspection
     assert os.path.isdir(empty_dir) and not os.path.islink(empty_dir) and os.listdir(empty_dir) == []  # the other directory is still there, still empty
     assert partials() == sorted([race_staging, empty_staging])
-    # a rename that fails after the claim gives the name back: with no staging directory to rename, the empty directory the claim made is all the publish leaves to remove
-    gone_dir = os.path.join(seg_out, "gone", "jsrt_lung", "seed0")
-    os.makedirs(os.path.dirname(gone_dir))
-    rejects(RuntimeError, lambda: seg_probe.publish(gone_dir + ".partial-1-0", gone_dir), "could not publish")
-    assert os.listdir(os.path.dirname(gone_dir)) == []
+    # publish itself, on hand-made staging directories under <seg_dir>/publish (where partials() does not look): the files move into the directory the claim made, head_best.pt and then
+    # result.json, and the emptied staging directory goes. A directory is never renamed: Lustre fails a rename onto an existing empty directory with EEXIST and macOS replaces it, so a run on macOS
+    # cannot see that failure, and this checks instead, on any filesystem, that the source of every rename is a file at the moment of the call
+    pub_root, real_rename, renames = os.path.join(seg_dir, "publish"), os.rename, []
+
+    def stage(name, *files):
+        """(staging, final_dir) for pub_root/<name>/seed0: the staging directory exists beside it, holding `files` (each written with its own name), and final_dir does not exist."""
+        final_dir = os.path.join(pub_root, name, "seed0")
+        staging = final_dir + ".partial-1-0"
+        os.makedirs(staging)
+        for file in files:
+            with open(os.path.join(staging, file), "w") as f:
+                f.write(file)
+        return staging, final_dir
+
+    def spy_rename(src, dst):  # the source as it is when the call is made, before it moves
+        renames.append((os.path.basename(src), os.path.isfile(src)))
+        return real_rename(src, dst)
+
+    def fail_on_result(src, dst):  # a filesystem that fails the second move
+        if os.path.basename(src) == "result.json":
+            raise OSError(errno.EIO, "Input/output error")
+        return real_rename(src, dst)
+
+    staging, final_dir = stage("whole", "head_best.pt", "result.json")
+    with mock.patch.object(os, "rename", spy_rename):
+        seg_probe.publish(staging, final_dir)
+    assert renames == [("head_best.pt", True), ("result.json", True)]  # two renames, result.json last, each of a file: none of a directory
+    assert sorted(os.listdir(final_dir)) == ["head_best.pt", "result.json"] and os.listdir(os.path.dirname(final_dir)) == ["seed0"]  # whole, and the emptied staging directory is gone
+    # no head_best.pt to move: the claim is given back, and result.json does not go into the directory ahead of it
+    staging, final_dir = stage("first", "result.json")
+    message = rejects(RuntimeError, lambda: seg_probe.publish(staging, final_dir), "could not publish")
+    assert staging in message and final_dir in message and "nothing moved into " + final_dir in message
+    assert not os.path.lexists(final_dir) and os.listdir(staging) == ["result.json"]
+    # result.json fails to move: head_best.pt stays in the final directory and result.json in staging, as they are, for the operator to finish by hand
+    staging, final_dir = stage("second", "head_best.pt", "result.json")
+    with mock.patch.object(os, "rename", fail_on_result):
+        message = rejects(RuntimeError, lambda: seg_probe.publish(staging, final_dir), "could not publish")
+    assert staging in message and final_dir in message and "head_best.pt moved into " + final_dir in message and "Input/output error" in message
+    assert os.listdir(final_dir) == ["head_best.pt"] and os.listdir(staging) == ["result.json"]
     # refusals that cost nothing: a train list smaller than the batch (the loader drops its partial batch and would never yield), a size the patch grid does not divide
     rejects(ValueError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("small", "random", "--batch", "6"))), "at least --batch (6)")
     rejects(ValueError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("size", "random", "--size", "60"))), "patch size 16")
@@ -571,7 +607,7 @@ with tempfile.TemporaryDirectory() as seg_dir:
 print("OK (seg_probe): evaluate gives the loss averaged by batch size and the pooled and per-image Dice x100 on stand-ins with a known answer, and hands the head back in its mode; "
       "a four-iteration run on a synthetic JSRT set writes result.json (every key, counts, null weights_sha256 for random, git sha, UTC times) and head_best.pt (trained part only, "
       "plain tensors, the state the test list saw); the optimizer steps at step_decay's rate (step_inc 1 for 4 iterations); the backbone is unchanged and gradient-free after training "
-      "while the pyramid's layers and the head moved; the loss is given probabilities; the defaults are RayDINO's budget; the same seed repeats the run and another seed is a different run in its own seed<S> directory beside the first; a run directory that exists (a dangling symlink at its name too) is refused up front; a run is written (head_best.pt, then result.json, each fsynced) into a private seed<S>.partial-<pid>-<hex> directory beside it and published by an mkdir of seed<S> and one rename over it, which leaves no staging directory behind after a success or an exception, and which, when another job published first or made an empty seed<S>, fails naming both paths with the finished run kept in its staging directory and the other directory untouched (a rename that fails after the mkdir gives the name back); validation losses 0.3 then 0.9 select iteration 2, and the test list is scored "
+      "while the pyramid's layers and the head moved; the loss is given probabilities; the defaults are RayDINO's budget; the same seed repeats the run and another seed is a different run in its own seed<S> directory beside the first; a run directory that exists (a dangling symlink at its name too) is refused up front; a run is written (head_best.pt, then result.json, each fsynced) into a private seed<S>.partial-<pid>-<hex> directory beside it and published by an mkdir of seed<S> and a move of the two files into it (head_best.pt, then result.json; no directory is ever renamed, which Lustre refuses onto the empty one the mkdir made), which leaves no staging directory behind after a success or an exception, and which, when another job published first or made an empty seed<S>, fails naming both paths with the finished run kept in its staging directory and the other directory untouched (a move that fails on head_best.pt gives the name back, one that fails on result.json leaves head_best.pt in seed<S> and result.json in staging); validation losses 0.3 then 0.9 select iteration 2, and the test list is scored "
       "with iteration 2's weights, once; the weights file's sha256 is recorded; bad flags (--batch 1 among them; 2 is accepted), a train list under the batch and a size off the patch grid are refused; the train loader is shuffled by the seed and drops a partial last batch, val and test keep every image")
 
 print("ALL OK")
