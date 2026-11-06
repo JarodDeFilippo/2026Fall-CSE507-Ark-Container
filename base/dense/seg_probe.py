@@ -8,8 +8,9 @@ Run from base/:
 
 It writes <out>/<tag>/<dataset>/seed<S>/result.json (the settings, the validation losses, the test Dice, the list sizes, the git sha and the times) and head_best.pt (what trained: the
 pyramid's level layers and the head; the frozen backbone is the weights file), S being --seed so that the seeds of one (tag, dataset) sit side by side, and refuses to run when that seed<S>
-directory exists. Both files are written (and fsynced) into a private seed<S>.partial-<pid>-<hex>/ beside it, which one rename makes seed<S> at the end: a seed<S> that exists is a whole run, and
-a second job of the same (tag, dataset, seed) that finishes later fails at the rename, the first one's directory untouched and its own run left in its .partial- directory. Dice is x100 at the
+directory exists. Both files are written (and fsynced) into a private seed<S>.partial-<pid>-<hex>/ beside it, which one rename makes seed<S> at the end, after an mkdir has claimed that name: a
+seed<S> that exists is a whole run (bar the instant between the two, when it is the empty directory the mkdir made), and a second job of the same (tag, dataset, seed) that finishes later fails
+at the mkdir, the first one's directory untouched and its own run left in its .partial- directory. Dice is x100 at the
 input size: "pooled" over every pixel of the test list, and "mean" over its images, which is Foundation X's CSV column. Progress goes to stderr; stdout is the one SEG line. --weights random
 builds the backbone without loading anything, for the CPU tests (it needs --device cpu).
 """
@@ -218,10 +219,19 @@ def train_into(args, out_dir):
 
 
 def publish(staging, final_dir):
-    """Rename the finished run in `staging` to `final_dir`. One rename, so `final_dir` appears whole or not at all, and it fails when anything but an empty directory is already there (a job of
-    the same tag, dataset and seed that published first): what is there is not touched, and this run stays in `staging`, for inspection."""
+    """Make the finished run in `staging` the directory `final_dir`: the name is claimed first with os.mkdir, which is atomic and fails when anything is there (a job of the same tag, dataset
+    and seed that published first, a dangling symlink, an empty directory, which rename(2) alone would replace), then one rename puts `staging` over the empty directory just made, so `final_dir`
+    appears whole. What was there is not touched, and a run that fails to publish stays in `staging`, for inspection."""
     try:
-        os.rename(staging, final_dir)  # staging is beside final_dir, so on its filesystem: no copy fallback
+        os.mkdir(final_dir)  # the claim: EEXIST for anything at the name, a dangling symlink and an empty directory included
+        try:
+            os.rename(staging, final_dir)  # staging is beside final_dir, so on its filesystem: no copy fallback; it replaces the empty directory made above
+        except OSError:
+            try:
+                os.rmdir(final_dir)  # the claim is given back; best effort, and rmdir takes nothing but the empty directory made above
+            except OSError:
+                pass
+            raise
     except OSError as error:
         raise RuntimeError("could not publish {} as {} ({}): the run stays in {} and {} was not touched; another job with this tag, dataset and seed may have published first".format(
             staging, final_dir, error.strerror or error, staging, final_dir)) from error

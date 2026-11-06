@@ -496,6 +496,27 @@ with tempfile.TemporaryDirectory() as seg_dir:
     with open(os.path.join(race_dir, "result.json")) as f:
         assert f.read() == "{}" and os.listdir(race_dir) == ["result.json"]  # the other job's directory is as it left it
     assert partials() == [race_staging]
+    # an EMPTY seed0 at the name when the publish comes (made by another process after the up-front check) is refused as well, though rename(2) would replace an empty directory: the publish
+    # claims the name with an mkdir first, so the finished run stays in its staging directory and the empty directory is still there, still empty
+    empty_dir, empty_paths = os.path.join(seg_out, "empty", "jsrt_lung", "seed0"), []
+
+    def publish_after_empty_dir(staging, final_dir):  # the empty directory lands between this run's last write and its publish
+        empty_paths.append((staging, final_dir))
+        os.makedirs(final_dir)
+        return real_publish(staging, final_dir)
+
+    with mock.patch.object(seg_probe, "evaluate", counting_evaluate), mock.patch.object(seg_probe, "publish", publish_after_empty_dir):
+        message = rejects(RuntimeError, lambda: quietly(lambda: seg_probe.train(seg_probe.parse_args(seg_argv("empty", "random", "--iters", "3")))), "could not publish")
+    [(empty_staging, empty_final)] = empty_paths
+    assert empty_final == empty_dir and empty_staging in message and empty_dir in message
+    assert sorted(os.listdir(empty_staging)) == ["head_best.pt", "result.json"]  # the finished run is kept whole, for inspection
+    assert os.path.isdir(empty_dir) and not os.path.islink(empty_dir) and os.listdir(empty_dir) == []  # the other directory is still there, still empty
+    assert partials() == sorted([race_staging, empty_staging])
+    # a rename that fails after the claim gives the name back: with no staging directory to rename, the empty directory the claim made is all the publish leaves to remove
+    gone_dir = os.path.join(seg_out, "gone", "jsrt_lung", "seed0")
+    os.makedirs(os.path.dirname(gone_dir))
+    rejects(RuntimeError, lambda: seg_probe.publish(gone_dir + ".partial-1-0", gone_dir), "could not publish")
+    assert os.listdir(os.path.dirname(gone_dir)) == []
     # refusals that cost nothing: a train list smaller than the batch (the loader drops its partial batch and would never yield), a size the patch grid does not divide
     rejects(ValueError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("small", "random", "--batch", "6"))), "at least --batch (6)")
     rejects(ValueError, lambda: seg_probe.train(seg_probe.parse_args(seg_argv("size", "random", "--size", "60"))), "patch size 16")
@@ -540,11 +561,11 @@ with tempfile.TemporaryDirectory() as seg_dir:
     saved = torch.load(os.path.join(sel_dir, "head_best.pt"), weights_only=True)
     assert torch.equal(saved["head"]["conv.weight"], at_2) and torch.equal(at_test, at_2)
     assert summary == "SEG sel jsrt_lung seed0: best iteration 2 (val loss 0.3000), test Dice mean 66.00, pooled 55.00\n", summary
-    assert partials() == [race_staging]  # the successful runs, the refused ones and the failed one left no staging directory; only the race's failed publish keeps its run
+    assert partials() == sorted([race_staging, empty_staging])  # the successful runs, the refused ones and the failed one left no staging directory; only the two failed publishes keep their runs
 print("OK (seg_probe): evaluate gives the loss averaged by batch size and the pooled and per-image Dice x100 on stand-ins with a known answer, and hands the head back in its mode; "
       "a four-iteration run on a synthetic JSRT set writes result.json (every key, counts, null weights_sha256 for random, git sha, UTC times) and head_best.pt (trained part only, "
       "plain tensors, the state the test list saw); the optimizer steps at step_decay's rate (step_inc 1 for 4 iterations); the backbone is unchanged and gradient-free after training "
-      "while the pyramid's layers and the head moved; the loss is given probabilities; the defaults are RayDINO's budget; the same seed repeats the run and another seed is a different run in its own seed<S> directory beside the first; a run directory that exists (a dangling symlink at its name too) is refused up front; a run is written (head_best.pt, then result.json, each fsynced) into a private seed<S>.partial-<pid>-<hex> directory beside it and published by one rename, which leaves no staging directory behind after a success or an exception, and which, when another job published first, fails naming both paths with the finished run kept in its staging directory and the other job's directory untouched; validation losses 0.3 then 0.9 select iteration 2, and the test list is scored "
+      "while the pyramid's layers and the head moved; the loss is given probabilities; the defaults are RayDINO's budget; the same seed repeats the run and another seed is a different run in its own seed<S> directory beside the first; a run directory that exists (a dangling symlink at its name too) is refused up front; a run is written (head_best.pt, then result.json, each fsynced) into a private seed<S>.partial-<pid>-<hex> directory beside it and published by an mkdir of seed<S> and one rename over it, which leaves no staging directory behind after a success or an exception, and which, when another job published first or made an empty seed<S>, fails naming both paths with the finished run kept in its staging directory and the other directory untouched (a rename that fails after the mkdir gives the name back); validation losses 0.3 then 0.9 select iteration 2, and the test list is scored "
       "with iteration 2's weights, once; the weights file's sha256 is recorded; bad flags (--batch 1 among them; 2 is accepted), a train list under the batch and a size off the patch grid are refused; the train loader is shuffled by the seed and drops a partial last batch, val and test keep every image")
 
 print("ALL OK")
