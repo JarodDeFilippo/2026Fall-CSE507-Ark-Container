@@ -5,7 +5,7 @@ import torch.nn as nn
 
 def layers_for(backbone):
     """The four blocks whose patch tokens feed the pyramid: every 3rd block of a 12-block ViT, every 6th of a 24-block one."""
-    depth = len(backbone.blocks)
+    depth = backbone.n_blocks
     if depth == 12:
         return [2, 5, 8, 11]
     if depth == 24:
