@@ -124,6 +124,11 @@ iBOT head to each new dataset (the student's pair from the checkpoint's student,
 set once, at the run's start: recorded in args.json, locked on --resume (a checkpoint without the key reads as None) and, like --init_from_checkpoint, free in a --branch_from
 comparison. (A Gram branch of a --gram_teacher_size = --global_crops_size run must pass the same --gram_teacher_size: the default, 2 x global, would cut its global crops
 differently from the trunk's.)
+
+--pre_resize N (default 0: off; chain/newdata512.sh passes 512) squashes each image to N x N right after the decode and before the random crops, the Ark loader's
+convention (base/dataloader.py resizes every image to a square before its RandomResizedCrop); the other runs cut their crops from the full decode. The JPEG decode side
+is then N, since the whole image is squashed to N anyway: printed on the crops: line and recorded as decode_min_side in args.json. It changes the inputs, so it is locked
+on --resume and a --branch_from source must match it (a checkpoint without the key reads as 0); an --init_from_checkpoint source is not compared.
 """
 import argparse
 import csv
@@ -167,20 +172,21 @@ LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "i
 # drop_path_rate / rope_rescale_coords / untie_local_cls_norm: the student's training recipe (its forward; untied, its parameters too)
 # cyclic_ark_teacher / ark_teacher_momentum / teacher_clean_view / heads / lock_half_pass / keep_all_checkpoints: the Ark-teacher mode (its data order,
 # teacher rule, teacher views, head parameters, lock passes, checkpoint record); a --branch_from must match them too (none is branch-free)
+# pre_resize: the image the crops are cut from (squashed to N x N first; 0: the full decode); like the crop sizes it changes the inputs, so a --branch_from must match it too
 RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_lr_scaling", "warmup_epochs",
                 "weight_decay", "momentum_teacher", "teacher_temp_warmup_epochs", "gram_weight", "global_crops_size",
                 "local_crops_size", "gram_teacher_size", "gram_refresh_steps", "freeze_backbone_epochs", "local_crops_number",
                 "seed", "bf16", "world_size", "init_from_checkpoint", "init_new_heads_from", "no_gram", "branch_from", "drop_path_rate",
                 "rope_rescale_coords", "untie_local_cls_norm", "cyclic_ark_teacher", "ark_teacher_momentum", "teacher_clean_view", "heads",
-                "lock_half_pass", "keep_all_checkpoints", "gram_teacher_from")
+                "lock_half_pass", "keep_all_checkpoints", "gram_teacher_from", "pre_resize")
 # checkpoints written before the crop-size flags existed (pilots, main, constlr) were all trained at these
 CROP_DEFAULTS = dict(global_crops_size=224, local_crops_size=96, gram_teacher_size=448)
 # keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off, no --branch_from (nor
-# --gram_teacher_from), no --init_new_heads_from, no recipe setting (drop path 0, no RoPE rescale, tied CLS norm), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads,
-# no lock passes, the pruned checkpoint record)
+# --gram_teacher_from), no --init_new_heads_from, no recipe setting (drop path 0, no RoPE rescale, tied CLS norm), no --pre_resize (crops cut from the full decode), and the mixed-batch mode
+# (per-step EMA teacher on the student's crops, shared heads, no lock passes, the pruned checkpoint record)
 ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None, drop_path_rate=0.0, rope_rescale_coords=None, untie_local_cls_norm=False,
                     cyclic_ark_teacher=False, ark_teacher_momentum=None, teacher_clean_view=False, heads="shared", lock_half_pass=False,
-                    keep_all_checkpoints=False, gram_teacher_from=None, init_new_heads_from=None)
+                    keep_all_checkpoints=False, gram_teacher_from=None, init_new_heads_from=None, pre_resize=0)
 # what a --branch_from start may differ from its source in (check_resume skips these): the Gram switch and knobs the branch turns on, the path itself,
 # the source's own init provenance (its full state is restored; a branch cannot pass --init_from_checkpoint or --init_new_heads_from, so they would always differ)
 # and the Gram teacher's own source (a no-Gram trunk has none)
@@ -265,6 +271,8 @@ def parse_args(argv=None):
                         f"{DEFAULT_GRAM_REFRESH_STEPS}; none: no refresh). Refused with --no_gram, where there are none")
     p.add_argument("--freeze_backbone_epochs", type=int, default=1, help="backbone LR 0 (heads train) for this many epochs")
     p.add_argument("--local_crops_number", type=int, default=8)
+    p.add_argument("--pre_resize", type=int, default=0,
+                   help="squash each image to N x N after decode and before the random crops, the Ark loader convention (base/dataloader.py); 0 = crop from the full decode")
     p.add_argument("--drop_path_rate", type=float, default=0.0,
                    help="student stochastic depth, in [0, 1) (Meta's DINOv3 recipe: 0.3); train mode only")
     p.add_argument("--rope_rescale_coords", type=parse_rescale, default=None,
@@ -303,6 +311,8 @@ def parse_args(argv=None):
             p.error(f"--{name} is empty: pass a checkpoint path, or leave the flag out")
     if not 0.0 <= args.drop_path_rate < 1.0:  # 1 would drop every sample of every residual branch (and NaN fails both)
         p.error(f"--drop_path_rate must be in [0, 1), got {args.drop_path_rate}")
+    if args.pre_resize < 0:  # 0 is off
+        p.error(f"--pre_resize must be 0 (off) or a size in pixels, got {args.pre_resize}")
     if args.pretrained_weights is None and args.init_from_checkpoint is None and args.branch_from is None:
         p.error("--pretrained_weights is required unless --init_from_checkpoint is given (or --branch_from)")
     if args.gram_teacher_from is not None:  # the Gram teacher of a branch's start, from an earlier checkpoint of its source's run
@@ -640,15 +650,17 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     transform = DataAugmentationCXR(local_crops_number=args.local_crops_number, global_crops_size=args.global_crops_size,
                                     local_crops_size=args.local_crops_size, gram_teacher_crops_size=args.gram_teacher_size,
                                     emit_gram_teacher_crops=not args.no_gram, teacher_no_distortions=args.teacher_clean_view)
-    decode_side = transform.decode_min_side  # follows the crop sizes: 1024 for 224 / 96 / 448 (as before), 2368 for 512 / 224 / 1024
+    decode_side = args.pre_resize or transform.decode_min_side  # --pre_resize N: N (the image is squashed to N x N after the decode); else follows the crop sizes: 1024 for 224 / 96 / 448 (as before), 2368 for 512 / 224 / 1024
     cut_note = (f"global crops cut at {args.global_crops_size}, no resize" if args.gram_teacher_size == args.global_crops_size else
                 f"global crops cut at {args.gram_teacher_size} and resized to {args.global_crops_size}, as in the Gram runs")
     gram_crops_note = f"no Gram teacher ({cut_note})" if args.no_gram else f"Gram teacher {args.gram_teacher_size}"
+    pre_resize_note = (f"pre-resize {args.pre_resize}x{args.pre_resize} (whole image squashed to a square before the random crops, Ark loader convention), so "
+                       if args.pre_resize else "")
     say(f"crops: global {args.global_crops_size}, local {args.local_crops_size} (x{args.local_crops_number}), "
-        f"{gram_crops_note}; JPEG decode min side {decode_side}")
+        f"{gram_crops_note}; {pre_resize_note}JPEG decode min side {decode_side}")
     if datasets_config is None:
         datasets_config = get_config(args.datasets_config)
-    dataset = build_dataset(args.data_set, datasets_config, transform, check_exists=check_exists and main, decode_side=decode_side)
+    dataset = build_dataset(args.data_set, datasets_config, transform, check_exists=check_exists and main, decode_side=decode_side, pre_resize=args.pre_resize)
     collate_fn = make_collate_fn(global_crops_size=args.global_crops_size, teacher_crops=args.teacher_clean_view)
     loader, sampler = build_data_loader(dataset, args.batch_size_per_gpu, args.workers, rank, world_size, args.seed,
                                         accelerator.pin_memory, collate_fn)  # --cyclic_ark_teacher: built, never iterated
@@ -657,7 +669,7 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     if epoch_length == 0:
         raise ValueError(f"{len(dataset)} images give no full batch of {args.batch_size_per_gpu} x {world_size} ranks")
     if args.cyclic_ark_teacher:  # per dataset, largest first: (FX lock-release) a lock pass over a random half, then the release pass over all of it; a cycle = an epoch
-        parts = {name: SSLImageDataset(image_paths(name, datasets_config[name]["data_dir"], datasets_config[name]["train_list"]), transform, decode_side)
+        parts = {name: SSLImageDataset(image_paths(name, datasets_config[name]["data_dir"], datasets_config[name]["train_list"]), transform, decode_side, args.pre_resize)
                  for name in args.data_set}
         assert [path for name in args.data_set for path in parts[name].paths] == dataset.paths  # the same images as the mixed-batch run's
         order = sorted(args.data_set, key=lambda name: -len(parts[name]))  # by image count, largest first; a tie keeps the --data_set order

@@ -1,6 +1,6 @@
-"""CPU checks for the 512 px new-data run (chain/newdata512.sh): the three datasets added to Stage A's four (PadChest, TAIXRay, ReXGradient), SSLImageDataset's 16-bit-safe read, --no_gram
-with --gram_teacher_size = --global_crops_size, --init_new_heads_from (parse_args, load_init_state, and a tiny end-to-end start from a finished run's checkpoint with its --resume), the launch
-script and its sbatch wrapper in a fake repo, ssl_common.sh's SSL_DATASETS and gaudi.sh's EXTRA_BINDS.
+"""CPU checks for the 512 px new-data run (chain/newdata512.sh): the three datasets added to Stage A's four (PadChest, TAIXRay, ReXGradient), SSLImageDataset's 16-bit-safe read and --pre_resize
+squash, --no_gram with --gram_teacher_size = --global_crops_size, --init_new_heads_from (parse_args, load_init_state, and a tiny end-to-end start from a finished run's checkpoint with its --resume),
+--pre_resize (its locks, and in that end-to-end start), the launch script and its sbatch wrapper in a fake repo, ssl_common.sh's SSL_DATASETS and gaudi.sh's EXTRA_BINDS.
 Run from base/: python test_newdata.py (needs torch, timm, torchvision, PIL; no Slurm, no Gaudi). The test_ functions are also collected by pytest."""
 import contextlib
 import io
@@ -116,6 +116,35 @@ def test_sslimagedataset_reads():
         assert not read(np.full((8, 8), 1234, np.uint16)).any()  # a flat image is all 0
         out = read(a.astype(np.float32), "tiff")  # float images too
         assert out.dtype == np.uint8 and (out.min(), out.max()) == (0, 255)
+
+
+def test_pre_resize_squash():
+    rng = np.random.RandomState(0)
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = []
+        for name, array in (("i16", rng.randint(0, 4001, (2000, 1500)).astype(np.uint16)), ("l", rng.randint(0, 256, (400, 300), dtype=np.uint8))):  # 1500 x 2000 (12 bit in a 16-bit PNG), 300 x 400
+            paths.append(os.path.join(tmp, name + ".png"))
+            Image.fromarray(array).save(paths[-1])
+        assert Image.open(paths[0]).mode in ("I;16", "I") and Image.open(paths[1]).mode == "L"
+        plain, squashed = SSLImageDataset(paths, lambda img: img), SSLImageDataset(paths, lambda img: img, pre_resize=512)
+        assert (plain.pre_resize, squashed.pre_resize) == (0, 512)
+        for i, size in enumerate(((1500, 2000), (300, 400))):
+            full, out = plain[i][0], squashed[i][0]
+            assert full.mode == "L" and full.size == size, (i, full.mode, full.size)  # off: the whole image, as before
+            assert out.mode == "L" and out.size == (512, 512), (i, out.mode, out.size)  # on: a 512 x 512 square, up or down
+            assert out.tobytes() == full.resize((512, 512), Image.BICUBIC).tobytes(), i  # the squash comes after the grey conversion, BICUBIC like the Ark loader's resize
+
+
+def test_pre_resize_flag():
+    assert P().pre_resize == 0 == ssl_pretrain.ARG_DEFAULTS["pre_resize"] and P("--pre_resize", "512").pre_resize == 512
+    assert "pre_resize" in ssl_pretrain.RESUME_MATCH and "pre_resize" not in ssl_pretrain.BRANCH_FREE
+    refused("--pre_resize", "-1", words=("--pre_resize", "-1"))
+    # locked on --resume and by --branch_from (it changes the inputs); a checkpoint written before the flag reads as 0
+    ckpt = dict(args={k: v for k, v in vars(P()).items() if k != "pre_resize"}, world_size=1, step=0, epoch=0, data_fingerprint="f")
+    for skip, action in (((), "--resume"), (ssl_pretrain.BRANCH_FREE, "--branch_from")):
+        ssl_pretrain.check_resume(ckpt, P(), 1, 1, "f", skip, action)
+        message = raises(ValueError, ssl_pretrain.check_resume, ckpt, P("--pre_resize", "512"), 1, 1, "f", skip, action)
+        assert "cannot " + action in message and "pre_resize: checkpoint 0, now 512" in message, message
 
 
 def test_no_gram_gram_teacher_size_equal_to_global():
@@ -242,10 +271,19 @@ def test_new_datasets_end_to_end():
         args.pretrained_weights = None  # random init: the tiny ViT has no stock weights
         return args
 
+    last = {}  # the latest go(): the sizes of the images the crops were cut from (--workers 0: in this process) and the datasets build_dataset made
+
     def go(config, out, datasets, *extra):
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            summary = ssl_pretrain.run(args_for(out, datasets, *extra), TINY_VIT, TINY_HEADS, config)
+        buf, sizes, built = io.StringIO(), set(), []
+        real_call, real_build = DataAugmentationCXR.__call__, ssl_pretrain.build_dataset
+        DataAugmentationCXR.__call__ = lambda self, image: (sizes.add(image.size), real_call(self, image))[1]
+        ssl_pretrain.build_dataset = lambda *a, **k: built.append(real_build(*a, **k)) or built[-1]
+        try:
+            with contextlib.redirect_stdout(buf):
+                summary = ssl_pretrain.run(args_for(out, datasets, *extra), TINY_VIT, TINY_HEADS, config)
+        finally:
+            DataAugmentationCXR.__call__, ssl_pretrain.build_dataset = real_call, real_build
+        last.update(sizes=sizes, built=built)
         return summary, buf.getvalue()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -256,13 +294,20 @@ def test_new_datasets_end_to_end():
         summary, text = go(config, trunk, OLD, "--stop_after_epochs", "1")
         assert summary["epoch"] == 1 and summary["epoch_length"] == 15
         assert "no Gram teacher (global crops cut at 128 and resized to 64, as in the Gram runs); JPEG decode min side" in text
+        assert last["sizes"] == {(80, 60), (70, 90)} and [d.pre_resize for d in last["built"]] == [0]  # off: the crops are cut from the images as decoded
         source = os.path.join(trunk, "ckpt", "epoch_0001.pth")
-        # the new run: seven sets, crops cut at the global size, the new heads from MIMIC's
+        trunk_ckpt = torch.load(source, map_location="cpu", weights_only=False)  # the real trunk predates --pre_resize: no such key in its args
+        assert trunk_ckpt["args"]["pre_resize"] == 0
+        del trunk_ckpt["args"]["pre_resize"]
+        torch.save(trunk_ckpt, source)
+        # the new run: seven sets, crops cut at the global size from images squashed to 64 x 64 first (--init_from_checkpoint compares no setting of its source), the new heads from MIMIC's
         new = os.path.join(tmp, "new")
-        extra = ["--gram_teacher_size", "64", "--init_from_checkpoint", source, "--init_new_heads_from", "MIMIC"]
+        extra = ["--gram_teacher_size", "64", "--pre_resize", "64", "--init_from_checkpoint", source, "--init_new_heads_from", "MIMIC"]
         summary, text = go(config, new, SEVEN, "--stop_after_epochs", "1", *extra)
         assert summary["epoch"] == 1 and summary["epoch_length"] == 6 + 4 + 3 + 2 + 3 + 2 + 2
-        assert "no Gram teacher (global crops cut at 64, no resize); JPEG decode min side" in text
+        assert last["sizes"] == {(64, 64)} and [(d.pre_resize, d.decode_side) for d in last["built"]] == [(64, 64)]  # every pass's images were squashed (the mixed set too, which is not iterated here)
+        assert ("no Gram teacher (global crops cut at 64, no resize); pre-resize 64x64 (whole image squashed to a square before the random crops, Ark loader convention), "
+                "so JPEG decode min side 64") in text
         assert "teacher (heads included) loaded strictly but for the new datasets' heads (below)" in text
         assert ("new heads: ReXGradient, TAIXRay, PadChest (not among the checkpoint's VinDrCXR, ChestXray14, CheXpert, MIMIC): their DINO and iBOT heads start as copies of "
                 "MIMIC's (student's from the checkpoint's student, teacher's from its teacher)") in text
@@ -271,6 +316,7 @@ def test_new_datasets_end_to_end():
         assert "--data_set adds ReXGradient, TAIXRay, PadChest" in message and "pass --init_new_heads_from" in message and not os.path.exists(refused_dir), message
         info = json.load(open(os.path.join(new, "args.json")))
         assert (info["init_new_heads_from"], info["gram_teacher_size"], info["global_crops_size"], info["no_gram"], info["data_set"]) == ("MIMIC", 64, 64, True, SEVEN)
+        assert (info["pre_resize"], info["decode_min_side"]) == (64, 64)  # the effective decode side: the squash size, not the crops' 1024
         ckpt = torch.load(os.path.join(new, "ckpt", "epoch_0001.pth"), map_location="cpu", weights_only=False)
         assert {k.split(".")[1] for k in ckpt["student"] if k.startswith("dino_head.")} == set(SEVEN) and ckpt["gram_teacher"] is None
         rows = open(os.path.join(new, "ssl_losses.csv")).read().splitlines()
@@ -278,6 +324,8 @@ def test_new_datasets_end_to_end():
         # --resume: the flag is locked (a checkpoint without the key reads as None), and the same line resumes
         message = raises(ValueError, go, config, new, SEVEN, "--resume", "--stop_after_epochs", "2", *extra[:-1], "random")
         assert "cannot --resume" in message and "init_new_heads_from: checkpoint 'MIMIC', now 'random'" in message, message
+        message = raises(ValueError, go, config, new, SEVEN, "--resume", "--stop_after_epochs", "2", *extra[:2], *extra[4:])  # without --pre_resize: locked too
+        assert "cannot --resume" in message and "pre_resize: checkpoint 64, now 0" in message, message
         summary, text = go(config, new, SEVEN, "--resume", "--stop_after_epochs", "2", *extra)
         assert summary["epoch"] == 2 and "resumed from" in text and "initialized from" not in text
         old = torch.load(source, map_location="cpu", weights_only=False)  # an older checkpoint: no such key in its args
@@ -335,7 +383,7 @@ def test_newdata512_script():
     expected = (["python", "-m", "torch.distributed.run", "--standalone", "--nproc-per-node", "4", "ssl_pretrain.py", "--device", "hpu"]
                 + [x for name in SEVEN for x in ("--data_set", name)]
                 + ["--pretrained_weights", "/workspace/weights/" + WEIGHT_NAME, "--batch_size_per_gpu", "64", "--workers", "16", "--seed", "100", "--output_dir", "/workspace/" + RUN, "--resume",
-                   "--global_crops_size", "512", "--local_crops_size", "224", "--gram_teacher_size", "512", "--batch_size_per_gpu", "8", "--lr", "0.001", "--min_lr", "0.001",
+                   "--global_crops_size", "512", "--local_crops_size", "224", "--gram_teacher_size", "512", "--pre_resize", "512", "--batch_size_per_gpu", "8", "--lr", "0.001", "--min_lr", "0.001",
                    "--epochs", "1000", "--stop_after_epochs", "5", "--warmup_epochs", "2", "--teacher_temp_warmup_epochs", "2",
                    "--drop_path_rate", "0.3", "--rope_rescale_coords", "2", "--untie_local_cls_norm", "--no_gram", "--cyclic_ark_teacher", "--heads", "per_dataset", "--no_lock_half_pass",
                    "--keep_all_checkpoints", "--init_from_checkpoint", INIT, "--init_new_heads_from", "MIMIC"])
@@ -351,6 +399,7 @@ def test_newdata512_script():
         assert (parsed.global_crops_size, parsed.local_crops_size, parsed.gram_teacher_size, parsed.no_gram, parsed.cyclic_ark_teacher, parsed.heads, parsed.lock_half_pass,
                 parsed.keep_all_checkpoints) == (512, 224, 512, True, True, "per_dataset", False, True)
         assert (parsed.init_from_checkpoint, parsed.init_new_heads_from, parsed.epochs, parsed.warmup_epochs, parsed.teacher_temp_warmup_epochs) == (INIT, "MIMIC", 1000, 2, 2)
+        assert parsed.pre_resize == 512  # the Ark loader convention: the whole image squashed to 512 x 512 before the crops
         assert (parsed.drop_path_rate, parsed.rope_rescale_coords, parsed.untie_local_cls_norm, parsed.no_lr_scaling) == (0.3, 2.0, True, False)
         assert parsed.lr == parsed.min_lr == 0.002 / lr_scaling_factor(256)  # the trainer scales it by 4 x sqrt(G / 1024): main_lr.txt exactly at G = 256
         # 2 cards, another batch and stop epoch: the cards and the LR adapt
@@ -372,7 +421,7 @@ def test_newdata512_script():
             assert result.returncode == 1 and argv is None and "ERROR" in result.stderr and name in result.stderr, (name, result.stderr)
         for name, value in (("main_lr.txt", "0"), ("main_lr.txt", "abc"), ("newdata512_stop_after.txt", "0"), ("newdata512_stop_after.txt", "2.5"), ("newdata512_stop_after.txt", "1001"),
                             ("newdata512_stop_after.txt", "18446744073709551617"), ("newdata512_batch_per_gpu.txt", "0"), ("newdata512_batch_per_gpu.txt", "abc"),
-                            ("newdata512_batch_per_gpu.txt", "12345")):
+                            ("newdata512_batch_per_gpu.txt", "08"), ("newdata512_batch_per_gpu.txt", "12345")):
             result, argv = launch(fake_repo(tempfile.mkdtemp(dir=tmp), dict(SETTINGS, **{name: value + "\n"})))
             assert result.returncode == 1 and argv is None and "ERROR" in result.stderr and name in result.stderr, (name, value, result.stderr)
         result, argv = launch(fake_repo(tempfile.mkdtemp(dir=tmp), dict(SETTINGS, **{"newdata512_stop_after.txt": "1000\n"})))

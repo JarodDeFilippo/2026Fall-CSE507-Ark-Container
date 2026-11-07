@@ -55,13 +55,14 @@ PadChest:
   train_list: dataset/PadChest/padchest_train.csv
   task_type: pretraining only
 
-# TAIXRay and ReXGradient: data_dir and list to be confirmed against the on-disk layout before the first launch (the lists are not written yet)
+# list built on Sol by base/dataset/TAIXRay/taix_unpack.sh
 TAIXRay:
-  data_dir: /scratch/jdefili4/datasets-new/TAIX-Ray/
-  train_list: dataset/TAIXRay/taix_train.csv
+  data_dir: /scratch/jdefili4/datasets-new/TAIX-Ray/png512/
+  train_list: /scratch/jdefili4/datasets-new/TAIX-Ray/taix_train.csv
   task_type: pretraining only
 
+# list built on Sol by base/dataset/ReXGradient/rex_extract.sh; the list stays on Sol: the data-use agreement forbids publishing a directory of the data
 ReXGradient:
   data_dir: /scratch/jdefili4/datasets-new/ReXGradient-160K/
-  train_list: dataset/ReXGradient/rexgradient_train.csv
+  train_list: /scratch/jdefili4/datasets-new/ReXGradient-160K/rexgradient_train.csv
   task_type: pretraining only

@@ -67,9 +67,9 @@ def image_paths(name, data_dir, list_file):
     return paths
 
 
-def build_dataset(names, datasets_config, transform, check_exists=True, decode_side=DECODE_MIN_SIDE):
+def build_dataset(names, datasets_config, transform, check_exists=True, decode_side=DECODE_MIN_SIDE, pre_resize=0):
     """Concatenated TRAIN-list images of `names`; datasets_config is the parsed datasets_config.yaml dict. decode_side: the JPEG draft
-    target (the transform's decode_min_side)."""
+    target (the transform's decode_min_side, or pre_resize when that is set); pre_resize: SSLImageDataset's."""
     paths = []
     for name in names:
         cfg = datasets_config[name]
@@ -83,17 +83,18 @@ def build_dataset(names, datasets_config, transform, check_exists=True, decode_s
         paths += found
     if check_exists:
         print(f"[ssl data] total: {len(paths)} images")
-    return SSLImageDataset(paths, transform, decode_side)
+    return SSLImageDataset(paths, transform, decode_side, pre_resize)
 
 
 class SSLImageDataset(Dataset):
     """Grayscale image -> transform(img). The () target is what Meta's datasets return (target_transform
     `lambda _: ()`) and what collate_data_and_cast expects (samples_list[i][0] is the crop dict)."""
 
-    def __init__(self, paths, transform, decode_side=DECODE_MIN_SIDE):
+    def __init__(self, paths, transform, decode_side=DECODE_MIN_SIDE, pre_resize=0):
         self.paths = paths
         self.transform = transform
         self.decode_side = decode_side
+        self.pre_resize = pre_resize
 
     def __len__(self):
         return len(self.paths)
@@ -111,6 +112,8 @@ class SSLImageDataset(Dataset):
                 img = Image.fromarray(np.zeros(a.shape, np.uint8) if hi == lo else ((a - lo) / (hi - lo) * 255).astype(np.uint8))  # uint8 2-D -> "L"
             else:
                 img = img.convert("L")
+        if self.pre_resize:  # the whole image squashed to a square before the random crops, as the Ark loader does (base/dataloader.py L125)
+            img = img.resize((self.pre_resize, self.pre_resize), Image.BICUBIC)
         return self.transform(img), ()
 
 

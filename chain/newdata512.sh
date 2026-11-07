@@ -5,8 +5,10 @@
 # --rope_rescale_coords 2 --untie_local_cls_norm, --no_gram, --cyclic_ark_teacher --heads per_dataset --no_lock_half_pass --keep_all_checkpoints) with these changes:
 #   crops: global 512, local 224 and --gram_teacher_size 512. --no_gram accepts a Gram size only when it equals the global size, which cuts the global crops at 512 with nothing to resize (the
 #       224 trunk cut them at 448 and resized to 224).
+#   pre-resize: --pre_resize 512 is the Ark loader convention (base/dataloader.py): the whole image squashed to 512x512, the random crops cut from that; the four-dataset runs cropped from a >= 1024 px decode instead.
 #   data: SSL_DATASETS (ssl_common.sh) names the seven sets, in the --data_set order that --resume locks; the cycle visits them largest first whatever that order is. Their image lists and directories
-#       are base/datasets_config.yaml's: PadChest's list is base/dataset/PadChest/padchest_train.csv, and TAIXRay and ReXGradient need their entries (data_dir, list) confirmed and their lists written first.
+#       are base/datasets_config.yaml's: PadChest's list is base/dataset/PadChest/padchest_train.csv, and TAIXRay's and ReXGradient's are written on Sol, before the first launch, by
+#       base/dataset/TAIXRay/taix_unpack.sh and base/dataset/ReXGradient/rex_extract.sh (sbatch each once).
 #   heads: the three new datasets' DINO and iBOT heads (student and EMA teacher) start as copies of MIMIC's pair from the checkpoint (--init_new_heads_from MIMIC); the trunk's four keep their own.
 #   schedule: --warmup_epochs 2 --teacher_temp_warmup_epochs 2. --init_from_checkpoint starts the optimizer and the schedule afresh at step 0 (and the trainer's default freezes the backbone for the
 #       first cycle). The checkpoint is read only when the run starts.
@@ -57,6 +59,6 @@ EFFECTIVE_LR=$(awk -v b="$BASE_LR" -v g="$G" 'BEGIN { printf "%g", b * 4 * sqrt(
 echo "run: $RUN (Ark teacher at 512 px, no Gram teacher: global crops 512 cut at 512, local 224; data sets $SSL_DATASETS; from $INIT with the new heads copied from MIMIC's; DINOv3 recipe: ${RECIPE[*]}; Ark teacher: ${ARK_FLAGS[*]}; stop after epoch $STOP_AFTER from chain/newdata512_stop_after.txt)"
 echo "LR: base $BASE_LR -> effective $EFFECTIVE_LR at global batch $G ($BATCH x $CARDS cards; the trainer's sqrt_wrt_1024 rule; constlr: $LR at $REF_BATCH)"
 
-ssl_launch "$RUN" --global_crops_size 512 --local_crops_size 224 --gram_teacher_size 512 --batch_size_per_gpu "$BATCH" \
+ssl_launch "$RUN" --global_crops_size 512 --local_crops_size 224 --gram_teacher_size 512 --pre_resize 512 --batch_size_per_gpu "$BATCH" \
   --lr "$BASE_LR" --min_lr "$BASE_LR" --epochs "$EPOCHS" --stop_after_epochs "$STOP_AFTER" --warmup_epochs 2 --teacher_temp_warmup_epochs 2 \
   "${RECIPE[@]}" --no_gram "${ARK_FLAGS[@]}" --init_from_checkpoint "$INIT" --init_new_heads_from MIMIC
