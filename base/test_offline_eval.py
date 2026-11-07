@@ -498,4 +498,13 @@ print("OK (e) test mode: a manifest with input_size 448 / img_resize 512 makes m
       "eval_d1_6.sh passes neither; a file the trainer did not write keeps the flag or 224 / 256; "
       "make_cycle0_weights.py carries the run's size into epoch_0000")
 
+# main's dataset check refuses an SSL-only entry (PadChest: task_type "pretraining only", no val_list) before any dataset or the engine is built
+sys.argv = ["main_ark.py", "--mode", "train", "--exp_name", "smoke", "--seed", "1", "--data_set", "PadChest", "--device", "cpu"]
+cwd = os.getcwd()
+os.chdir(HERE)  # main reads datasets_config.yaml from the working directory, base/
+try:
+    rejects(ValueError, lambda: main_ark.main(main_ark.get_args_parser()), "--data_set PadChest is an SSL-only (pretraining) entry")
+finally:
+    os.chdir(cwd)
+
 print("ALL OK")

@@ -10,7 +10,7 @@ from utils import get_config  # the container's base/utils.py
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(BASE)
-DATASETS = ("ChestXray14", "CheXpert", "MIMIC", "VinDrCXR")  # the four Ark names (ssl_dinov3.data.DATASET_NAMES)
+DATASETS = ("ChestXray14", "CheXpert", "MIMIC", "VinDrCXR")  # the four Ark names (the first four of ssl_dinov3.data.DATASET_NAMES)
 
 
 def dataset_entry(name, config=None):

@@ -60,6 +60,11 @@ if [[ -n "${DATA_BIND:-}" ]]; then
 elif [[ -d /data ]]; then
     args+=(--bind "/data:/data:ro")
 fi
+# EXTRA_BINDS: more mounts on top of the one above, as one apptainer --bind argument (a comma list of src[:dest[:ro]] works), so a run can mount a directory
+# such as /scratch/$USER/datasets-new (run_d1_8_newdata512_arkteacher_gaudi.sh) without giving up /data or having to rewrite DATA_BIND
+if [[ -n "${EXTRA_BINDS:-}" ]]; then
+    args+=(--bind "$EXTRA_BINDS")
+fi
 
 for var in HABANA_VISIBLE_MODULES HABANA_VISIBLE_DEVICES OMP_NUM_THREADS; do
     if [[ -n "${!var:-}" ]]; then

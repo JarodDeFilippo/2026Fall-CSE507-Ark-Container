@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Sourced by chain/pilot_a.sh, pilot_b.sh, main.sh, constlr.sh, hires.sh and run_d1_8s_timing_gaudi.sh: shared guards plus ssl_launch, which starts
-# base/ssl_pretrain.py on every card of the Slurm allocation (2 or 4), and read_setting, which main.sh, constlr.sh and hires.sh read their settings
-# files with. cwd must be the repo root. No SBATCH header: these phases run inside an allocation that someone else (the chain script)
+# Sourced by chain/pilot_a.sh, pilot_b.sh, main.sh, constlr.sh, hires.sh, newdata512.sh and run_d1_8s_timing_gaudi.sh: shared guards plus ssl_launch, which starts
+# base/ssl_pretrain.py on every card of the Slurm allocation (2 or 4), and read_setting, which main.sh, constlr.sh, hires.sh and newdata512.sh read their
+# settings files with. cwd must be the repo root. No SBATCH header: these phases run inside an allocation that someone else (the chain script)
 # already holds.
 set -euo pipefail
 export PT_HPU_LAZY_MODE=1
@@ -23,14 +23,18 @@ fi
 # gaudi.sh runs the container with --pwd /workspace/base, hence the relative ssl_pretrain.py. --resume is always passed: a
 # completed phase exits at once ("nothing to do"), a re-submitted chain continues where the last one stopped, and a first
 # run just starts from scratch. Flags in "$@" come last, so they win over the defaults above them.
+# SSL_DATASETS (space-separated dataset names, in this order) picks the --data_set flags; unset or empty, they are the four Stage A sets, exactly as every phase
+# has always launched them. Only chain/newdata512.sh sets it.
 ssl_launch() {
-  local run_name="$1" cards
+  local run_name="$1" cards names data_sets=() name
   shift
+  read -ra names <<< "${SSL_DATASETS:-VinDrCXR ChestXray14 MIMIC CheXpert}"  # read -ra: split on whitespace only, no glob expansion of a name
+  for name in "${names[@]}"; do data_sets+=(--data_set "$name"); done
   # one rank per allocated card, counted on the host as Ark's launch path does (ark_device_count): HABANA_VISIBLE_MODULES,
   # else HABANA_VISIBLE_DEVICES, else SLURM_JOB_GPUS, else ask the container. It is an argument, so --cleanenv drops nothing.
   cards=$(ark_device_count gaudi)
   exec ./gaudi.sh python -m torch.distributed.run --standalone --nproc-per-node "$cards" ssl_pretrain.py --device hpu \
-    --data_set VinDrCXR --data_set ChestXray14 --data_set MIMIC --data_set CheXpert \
+    "${data_sets[@]}" \
     --pretrained_weights "$WEIGHTS" --batch_size_per_gpu 64 --workers 16 --seed 100 \
     --output_dir "/workspace/$run_name" --resume "$@"
 }

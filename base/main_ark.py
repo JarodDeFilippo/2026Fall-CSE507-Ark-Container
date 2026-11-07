@@ -237,6 +237,8 @@ def main(args):
     datasets_config = get_config('datasets_config.yaml')
     for dataset in args.dataset_list:
         assert dataset in list(datasets_config.keys())
+        if datasets_config[dataset].get('task_type') == "pretraining only" or 'val_list' not in datasets_config[dataset]:
+            raise ValueError("--data_set {} is an SSL-only (pretraining) entry in datasets_config.yaml: main_ark.py cannot train or test on it".format(dataset))
 
     dataset_train_list = []
     dataset_val_list = []

@@ -47,3 +47,21 @@ MIMIC:
   diseases: ['Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Enlarged Cardiomediastinum', 'Fracture', 'Lung Lesion', 'Lung Opacity', 'No Finding', 'Pleural Effusion', 'Pleural Other', 'Pneumonia', 'Pneumothorax', 'Support Devices']
   test_diseases_name: ['Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Enlarged Cardiomediastinum', 'Fracture', 'Lung Lesion', 'Lung Opacity', 'No Finding', 'Pleural Effusion', 'Pleural Other', 'Pneumonia', 'Pneumothorax', 'Support Devices']
   task_type: multi-label classification
+
+# The three below are SSL pretraining only (chain/newdata512.sh): a train_list and nothing else, so no val_list, test_list or diseases. The lists are csvs with a header row
+# and the image path in column 0, joined to data_dir (ssl_dinov3/data.py image_paths).
+PadChest:
+  data_dir: /data/jliang12/jpang12/dataset/PadChest/image_zips/
+  train_list: dataset/PadChest/padchest_train.csv
+  task_type: pretraining only
+
+# TAIXRay and ReXGradient: data_dir and list to be confirmed against the on-disk layout before the first launch (the lists are not written yet)
+TAIXRay:
+  data_dir: /scratch/jdefili4/datasets-new/TAIX-Ray/
+  train_list: dataset/TAIXRay/taix_train.csv
+  task_type: pretraining only
+
+ReXGradient:
+  data_dir: /scratch/jdefili4/datasets-new/ReXGradient-160K/
+  train_list: dataset/ReXGradient/rexgradient_train.csv
+  task_type: pretraining only

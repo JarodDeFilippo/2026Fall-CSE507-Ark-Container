@@ -18,7 +18,7 @@ from torchvision.transforms import v2
 from dinov3.data.collate import collate_data_and_cast
 from dinov3.data.masking import MaskingGenerator
 
-DATASET_NAMES = ("VinDrCXR", "ChestXray14", "CheXpert", "MIMIC")
+DATASET_NAMES = ("VinDrCXR", "ChestXray14", "CheXpert", "MIMIC", "PadChest", "TAIXRay", "ReXGradient")  # the first four are Stage A's
 IMAGENET_MEAN = (0.485, 0.456, 0.406)  # Ark's `--normalization imagenet` values
 IMAGENET_STD = (0.229, 0.224, 0.225)
 # ponytail: caps JPEG decode cost (MIMIC/CheXpert are ~2-3k px) while keeping >= 1024 px, so 448 crops at scale 0.25
@@ -41,7 +41,8 @@ def decode_min_side(crop_side, min_scale, ratio):
 
 
 def image_paths(name, data_dir, list_file):
-    """Image paths of one dataset's list file, parsed as its class in base/dataloader.py does (labels dropped)."""
+    """Image paths of one dataset's list file, parsed as its class in base/dataloader.py does (labels dropped); PadChest, TAIXRay and ReXGradient have no
+    class there (they are pretraining-only): their lists are csvs with a header row and the image path in column 0."""
     if name not in DATASET_NAMES:
         raise ValueError(f"unknown dataset {name!r}; expected one of {DATASET_NAMES}")
     paths = []
@@ -57,7 +58,7 @@ def image_paths(name, data_dir, list_file):
             while line:
                 paths.append(os.path.join(data_dir, line.split()[0] + ".jpeg"))
                 line = f.readline()
-        else:  # CheXpert, MIMIC: csv with a header row, image path in column 0
+        else:  # CheXpert, MIMIC, PadChest, TAIXRay, ReXGradient: csv with a header row, image path in column 0
             reader = csv.reader(f)
             next(reader, None)
             for row in reader:
@@ -100,7 +101,16 @@ class SSLImageDataset(Dataset):
     def __getitem__(self, i):
         with Image.open(self.paths[i]) as img:
             img.draft("L", (self.decode_side, self.decode_side))  # JPEG: decode at 1/2, 1/4 or 1/8 size, >= decode_side; no-op for PNG
-            img = img.convert("L")
+            if img.mode in ("I;16", "I;16B", "I;16L", "I", "F"):
+                # PIL's convert("L") clips every value >= 255 of a 16-bit (or int32 / float) grey image to white, which turns a 12-16 bit radiograph into a black-and-white
+                # mask, and PadChest ships 16-bit PNGs. So rescale each image first, per-image min-max to 0..255 as base/dense/data.py dicom_to_uint8 does (a flat image
+                # is all 0), but dividing before the multiply: its 1/(hi - lo) * 255 scale leaves the brightest pixel at 254 for about a fifth of the possible maxima.
+                # The 8-bit modes (the four earlier datasets) keep convert("L") below, so their tensors are unchanged.
+                a = np.asarray(img, dtype=np.float64)
+                lo, hi = a.min(), a.max()
+                img = Image.fromarray(np.zeros(a.shape, np.uint8) if hi == lo else ((a - lo) / (hi - lo) * 255).astype(np.uint8))  # uint8 2-D -> "L"
+            else:
+                img = img.convert("L")
         return self.transform(img), ()
 
 

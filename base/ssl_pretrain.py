@@ -27,10 +27,12 @@ gradient, and the other heads' DDP modules see no forward that step (their grads
 
 --no_gram trains with no Gram teacher at all: none is built (build_models gram=False), moved to the device, loaded (--init_from_checkpoint
 included) or run; no Gram loss is computed, nothing is refreshed, and the batches carry no Gram crops (the global crops are still cut at
-2 x --global_crops_size and resized, so the student / teacher crops are the Gram runs'). An explicit --gram_weight, --gram_refresh_steps or
---gram_teacher_size is refused. The flag is locked on --resume, args.json records it, and the checkpoint's gram_teacher is None. ssl_losses.csv
-keeps all 15 columns and writes gram and gram_weight as 0.0 in every row, never blank: the DINO-X report builder parses them as numbers and
-counts a blank as unreadable.
+2 x --global_crops_size and resized, so the student / teacher crops are the Gram runs'). An explicit --gram_weight or --gram_refresh_steps is
+refused, and so is --gram_teacher_size but for one value, --global_crops_size itself: with no Gram teacher the size only sets what the global crops are
+cut at, and that value cuts them at the global size with nothing to resize (chain/newdata512.sh; recorded in args.json and locked on --resume like any crop
+size, and the default stays 2 x global, so every other run is unchanged). The flag is locked on --resume, args.json records it, and the checkpoint's
+gram_teacher is None. ssl_losses.csv keeps all 15 columns and writes gram and gram_weight as 0.0 in every row, never blank: the DINO-X report builder
+parses them as numbers and counts a blank as unreadable.
 
 --branch_from <no-Gram run>/ckpt/epoch_NNNN.pth starts a NEW run dir that continues that --no_gram run exactly, with the Gram teacher on: student,
 EMA teacher, optimizer, step, epoch and the python / numpy / torch RNG states are restored as a --resume of the trunk would restore them (same
@@ -112,6 +114,16 @@ its heads and passes (Codex r1 P2); outside it the flat image list is hashed as 
 reads as the mixed-batch defaults), recorded in args.json and matched by --branch_from: a Gram branch of a cyclic no-Gram trunk restores everything (all
 heads, the teacher blended at that cycle boundary, which the Gram teacher anchors to), and its absolute --gram_refresh_steps at cycle boundaries are
 K x epoch_length + i x epoch_length.
+
+--init_new_heads_from <dataset> (--init_from_checkpoint with --heads per_dataset only) starts a NEW run on more datasets than the checkpoint's own (chain/newdata512.sh):
+when --data_set is a strict superset of the checkpoint's, the student and the EMA teacher load with strict=False and the only keys allowed to be missing are the new
+datasets' dino_head.<d>.* and ibot_head.<d>.* (any other missing key, and any unexpected one, raises). The named dataset, one of the checkpoint's, then lends its DINO and
+iBOT head to each new dataset (the student's pair from the checkpoint's student, the teacher's from its teacher; one line names the new datasets and the source), or
+"random" leaves the new heads at their fresh init. Refused before anything is loaded: added datasets without the flag, the flag with equal data sets (nothing is new), a
+--data_set that drops one of the checkpoint's datasets, and a source that is not one of the checkpoint's; equal data sets without the flag load strictly, as before. The flag is
+set once, at the run's start: recorded in args.json, locked on --resume (a checkpoint without the key reads as None) and, like --init_from_checkpoint, free in a --branch_from
+comparison. (A Gram branch of a --gram_teacher_size = --global_crops_size run must pass the same --gram_teacher_size: the default, 2 x global, would cut its global crops
+differently from the trunk's.)
 """
 import argparse
 import csv
@@ -148,6 +160,7 @@ CSV_HEADER = ["step", "epoch", "dino_global", "dino_local", "koleo", "ibot", "gr
 LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "ibot_loss", "gram_loss")
 # what shapes the run: a --resume must match its checkpoint on these (the other flags may change between invocations).
 # init_from_checkpoint: a run started from one resumes only with the same one (not re-applied then); any other run's checkpoint is refused
+# init_new_heads_from: likewise (the new datasets' heads are started once, at the run's start; a checkpoint without the key reads as None)
 # no_gram: a no-Gram run resumes only as one (its checkpoint has no Gram teacher), and a Gram run never as one
 # branch_from: a branch resumes only as the same branch (its source is read only at its start); a trunk or any other run never as one
 # gram_teacher_from: likewise its Gram teacher's source (read only at the branch's start): a branch resumes only with the same one, or none if it had none
@@ -157,21 +170,22 @@ LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "i
 RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_lr_scaling", "warmup_epochs",
                 "weight_decay", "momentum_teacher", "teacher_temp_warmup_epochs", "gram_weight", "global_crops_size",
                 "local_crops_size", "gram_teacher_size", "gram_refresh_steps", "freeze_backbone_epochs", "local_crops_number",
-                "seed", "bf16", "world_size", "init_from_checkpoint", "no_gram", "branch_from", "drop_path_rate",
+                "seed", "bf16", "world_size", "init_from_checkpoint", "init_new_heads_from", "no_gram", "branch_from", "drop_path_rate",
                 "rope_rescale_coords", "untie_local_cls_norm", "cyclic_ark_teacher", "ark_teacher_momentum", "teacher_clean_view", "heads",
                 "lock_half_pass", "keep_all_checkpoints", "gram_teacher_from")
 # checkpoints written before the crop-size flags existed (pilots, main, constlr) were all trained at these
 CROP_DEFAULTS = dict(global_crops_size=224, local_crops_size=96, gram_teacher_size=448)
 # keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off, no --branch_from (nor
-# --gram_teacher_from), no recipe setting (drop path 0, no RoPE rescale, tied CLS norm), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads,
+# --gram_teacher_from), no --init_new_heads_from, no recipe setting (drop path 0, no RoPE rescale, tied CLS norm), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads,
 # no lock passes, the pruned checkpoint record)
 ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None, drop_path_rate=0.0, rope_rescale_coords=None, untie_local_cls_norm=False,
                     cyclic_ark_teacher=False, ark_teacher_momentum=None, teacher_clean_view=False, heads="shared", lock_half_pass=False,
-                    keep_all_checkpoints=False, gram_teacher_from=None)
+                    keep_all_checkpoints=False, gram_teacher_from=None, init_new_heads_from=None)
 # what a --branch_from start may differ from its source in (check_resume skips these): the Gram switch and knobs the branch turns on, the path itself,
-# the source's own init provenance (its full state is restored; a branch cannot pass --init_from_checkpoint, so it would always differ) and the Gram
-# teacher's own source (a no-Gram trunk has none)
-BRANCH_FREE = ("no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from", "init_from_checkpoint", "gram_teacher_from")
+# the source's own init provenance (its full state is restored; a branch cannot pass --init_from_checkpoint or --init_new_heads_from, so they would always differ)
+# and the Gram teacher's own source (a no-Gram trunk has none)
+BRANCH_FREE = ("no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from", "init_from_checkpoint", "init_new_heads_from",
+               "gram_teacher_from")
 BRANCH_SOURCE_KEYS = ("student", "teacher", "optimizer", "step", "epoch", "rng", "args", "world_size")  # a full epoch checkpoint (save_state)
 PATCH_SIZE = 16  # DINOV3_VITB16_KWARGS patch_size: every crop side must be a multiple of it
 DEFAULT_GRAM_REFRESH_STEPS = "10000,20000,30000"  # --gram_refresh_steps when not given (Meta's three refreshes); --no_gram: none
@@ -211,6 +225,10 @@ def parse_args(argv=None):
                    help="flat DINOv3 backbone .pth; required unless --init_from_checkpoint or --branch_from (which then win, with a warning)")
     p.add_argument("--init_from_checkpoint", default=None,
                    help="a full checkpoint (<run>/ckpt/epoch_NNNN.pth) to start a NEW run from: student + teacher, heads included")
+    p.add_argument("--init_new_heads_from", default=None, choices=(*DATASET_NAMES, "random"),
+                   help="--init_from_checkpoint with --heads per_dataset, for a --data_set that adds datasets to the checkpoint's (required then): the checkpoint's dataset "
+                        "whose DINO and iBOT heads each new dataset's pair starts as a copy of (student's from its student, teacher's from its teacher), or random: "
+                        "the fresh init. Refused otherwise")
     p.add_argument("--branch_from", default=None,
                    help="a --no_gram run's full checkpoint (<run>/ckpt/epoch_NNNN.pth) to continue exactly in a NEW run dir with the Gram teacher on, "
                         "anchored to its EMA teacher; needs --gram_refresh_steps (absolute global steps, each after the branch step)")
@@ -240,7 +258,8 @@ def parse_args(argv=None):
     p.add_argument("--gram_teacher_size", type=int, default=None,
                    help="default 2 x --global_crops_size (448 at the default 224): DINOv3's 2x Gram teacher, Sec. 4.3. Refused with --no_gram, "
                         "where it still resolves to 2 x global: it only sets the size the global crops are cut at before the resize to the "
-                        "global size, so the crops match the Gram runs'")
+                        "global size, so the crops match the Gram runs'. The one value --no_gram accepts is --global_crops_size itself: the crops are cut "
+                        "at the global size, with nothing to resize")
     p.add_argument("--gram_refresh_steps", type=parse_steps, default=None,
                    help=f"comma-separated global steps after which the Gram teacher is reloaded from the EMA teacher (default "
                         f"{DEFAULT_GRAM_REFRESH_STEPS}; none: no refresh). Refused with --no_gram, where there are none")
@@ -301,10 +320,17 @@ def parse_args(argv=None):
         if args.gram_refresh_steps is None:
             p.error("--branch_from needs --gram_refresh_steps: absolute global steps, each after the branch step (the launcher computes them, so the "
                     "list, which --resume locks, is the same on every resubmit); none: no refresh")
+    if args.init_new_heads_from is not None:  # it starts the heads of datasets an --init_from_checkpoint file has none for, which only per-dataset heads can lack
+        if args.init_from_checkpoint is None:
+            p.error("--init_new_heads_from needs --init_from_checkpoint (it starts the heads of datasets the checkpoint has none for)")
+        if args.heads != "per_dataset":
+            p.error("--init_new_heads_from needs --heads per_dataset (shared heads are one pair for every dataset: there is no head to add or copy)")
     if args.no_gram:  # no Gram teacher: the Gram knobs have nothing to act on, so an explicit one is a mistake, not a no-op
         for name, why in (("gram_weight", "there is no Gram loss to weight"), ("gram_refresh_steps", "there is no Gram teacher to refresh"),
-                          ("gram_teacher_size", "there is no Gram teacher to size; the global crops are cut at 2 x --global_crops_size")):
-            if getattr(args, name) is not None:
+                          ("gram_teacher_size", "there is no Gram teacher to size; the global crops are cut at 2 x --global_crops_size, or at --global_crops_size "
+                                                "itself when --gram_teacher_size is that value")):
+            # --gram_teacher_size equal to --global_crops_size is the one accepted value: with no Gram teacher it is only the size the global crops are cut at
+            if getattr(args, name) is not None and not (name == "gram_teacher_size" and args.gram_teacher_size == args.global_crops_size):
                 p.error(f"--{name} cannot be combined with --no_gram ({why})")
         args.gram_weight, args.gram_refresh_steps = 0.0, []
     else:
@@ -465,6 +491,47 @@ def load_gram_teacher_source(args, src, epoch_length):
     return {k: v for k, v in gram_src["teacher"].items() if k.startswith("backbone.")}, gram_src["epoch"]
 
 
+def load_init_state(student, teacher, init, args):
+    """--init_from_checkpoint: the checkpoint's student and EMA teacher (heads included) into the fresh models, strictly. The one exception is --heads per_dataset with a
+    --data_set that adds datasets to the checkpoint's (--init_new_heads_from): their heads are not in the file, so both load with strict=False, any unexpected key and
+    any missing key but their dino_head.<d>.* / ibot_head.<d>.* raises, and the source dataset's DINO and iBOT head then goes into each of them (the student's pair from
+    the checkpoint's student, the teacher's from its teacher; "random": they keep their fresh init). Returns the new datasets ([] for the strict load). A data set / flag
+    combination that does not fit raises ValueError before anything is loaded."""
+    was = dict(ARG_DEFAULTS, **init["args"])
+    source, old = args.init_new_heads_from, list(was["data_set"])
+    new, dropped = [d for d in args.data_set if d not in old], [d for d in old if d not in args.data_set]
+    if source is not None and was["heads"] != "per_dataset":
+        raise ValueError(f"--init_new_heads_from {source}: the checkpoint has shared heads (one pair for every dataset), so it has no head to copy to a new dataset")
+    if not (args.heads == "per_dataset" and was["heads"] == "per_dataset" and (new or dropped or source is not None)):  # nothing to add: the strict load, as before
+        student.load_state_dict(init["student"], strict=True)
+        teacher.load_state_dict(init["teacher"], strict=True)
+        return []
+    if source not in (None, "random") and source not in old:
+        raise ValueError(f"--init_new_heads_from {source} is not a dataset of the checkpoint ({', '.join(old)}): it has no head of that name to copy")
+    if dropped:
+        raise ValueError(f"--data_set lacks {', '.join(dropped)}, which the checkpoint has heads for: a run initialized from it keeps every one of its datasets")
+    if not new:
+        raise ValueError(f"--init_new_heads_from {source} with the checkpoint's own data sets ({', '.join(old)}): no dataset is new, so there is no head to start")
+    if source is None:
+        raise ValueError(f"--data_set adds {', '.join(new)} to the checkpoint's {', '.join(old)}: pass --init_new_heads_from <one of the checkpoint's datasets> "
+                         "to start their heads as copies of its heads, or random to keep their fresh init")
+    heads = ("dino_head", "ibot_head")
+    new_keys = tuple(f"{head}.{d}." for d in new for head in heads)
+    for what, module in (("student", student), ("teacher", teacher)):
+        loaded = module.load_state_dict(init[what], strict=False)
+        stray = [k for k in loaded.missing_keys if not k.startswith(new_keys)]
+        if loaded.unexpected_keys or stray:
+            raise ValueError(f"the checkpoint's {what} does not fit this run: unexpected keys {loaded.unexpected_keys}, missing keys other than the new datasets' "
+                             f"({', '.join(new)}) heads {stray}")
+        if source != "random":
+            for head in heads:
+                prefix = f"{head}.{source}."
+                head_state = {k[len(prefix):]: v for k, v in init[what].items() if k.startswith(prefix)}
+                for d in new:
+                    module[head][d].load_state_dict(head_state, strict=True)
+    return new
+
+
 def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exists=True):
     """Train (or resume) as args say; returns dict(step, epoch, gram_refreshes, peak_lr, epoch_length). The keyword
     arguments are the test seam: a tiny ViT / heads, an in-memory datasets config, no image-existence check."""
@@ -536,16 +603,20 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
         if not {"student", "teacher", "gram_teacher", "args"} <= set(init):
             raise ValueError(f"--init_from_checkpoint {args.init_from_checkpoint} is not a full checkpoint (student, teacher, "
                              "gram_teacher, args); an export/teacher_backbone_*.pth holds the backbone only")
-        student.load_state_dict(init["student"], strict=True)
-        teacher.load_state_dict(init["teacher"], strict=True)
+        new_heads = load_init_state(student, teacher, init, args)
         # DINOv3 re-anchors the Gram teacher to the previous stage's EMA teacher (not to that stage's own, older Gram teacher)
         if gram_teacher is not None:  # --no_gram: nothing to anchor
             gram_teacher.load_state_dict({k: v for k, v in init["teacher"].items() if k.startswith("backbone.")}, strict=True)
         gram_init_note = "no Gram teacher (--no_gram)" if args.no_gram else "Gram teacher <- its EMA teacher backbone"
         was = dict(CROP_DEFAULTS, **init["args"])
+        loaded_note = "loaded strictly" if not new_heads else "loaded strictly but for the new datasets' heads (below)"
         say(f"initialized from {args.init_from_checkpoint}: its step {init.get('step')}, epoch {init.get('epoch')}, crops global "
             f"{was['global_crops_size']} / local {was['local_crops_size']} / Gram teacher {was['gram_teacher_size']}; student and "
-            f"teacher (heads included) loaded strictly, {gram_init_note}; fresh optimizer, step 0")
+            f"teacher (heads included) {loaded_note}, {gram_init_note}; fresh optimizer, step 0")
+        if new_heads:
+            heads_note = ("keep their random init" if args.init_new_heads_from == "random" else
+                          f"start as copies of {args.init_new_heads_from}'s (student's from the checkpoint's student, teacher's from its teacher)")
+            say(f"new heads: {', '.join(new_heads)} (not among the checkpoint's {', '.join(was['data_set'])}): their DINO and iBOT heads {heads_note}")
         del init
     student, teacher = student.to(device), teacher.to(device)
     if gram_teacher is not None:
@@ -570,8 +641,9 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                                     local_crops_size=args.local_crops_size, gram_teacher_crops_size=args.gram_teacher_size,
                                     emit_gram_teacher_crops=not args.no_gram, teacher_no_distortions=args.teacher_clean_view)
     decode_side = transform.decode_min_side  # follows the crop sizes: 1024 for 224 / 96 / 448 (as before), 2368 for 512 / 224 / 1024
-    gram_crops_note = (f"no Gram teacher (global crops cut at {args.gram_teacher_size} and resized to {args.global_crops_size}, as in the "
-                       "Gram runs)" if args.no_gram else f"Gram teacher {args.gram_teacher_size}")
+    cut_note = (f"global crops cut at {args.global_crops_size}, no resize" if args.gram_teacher_size == args.global_crops_size else
+                f"global crops cut at {args.gram_teacher_size} and resized to {args.global_crops_size}, as in the Gram runs")
+    gram_crops_note = f"no Gram teacher ({cut_note})" if args.no_gram else f"Gram teacher {args.gram_teacher_size}"
     say(f"crops: global {args.global_crops_size}, local {args.local_crops_size} (x{args.local_crops_number}), "
         f"{gram_crops_note}; JPEG decode min side {decode_side}")
     if datasets_config is None:

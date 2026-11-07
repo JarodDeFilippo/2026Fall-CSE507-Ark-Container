@@ -30,6 +30,7 @@ from ssl_dinov3.meta import SSLMetaArch
 from ssl_dinov3.model import build_models, export_backbone
 from ssl_dinov3.optim import build_schedules, lr_scaling_factor
 
+STAGE_A_NAMES = DATASET_NAMES[:4]  # VinDrCXR, ChestXray14, CheXpert, MIMIC: the sets this file's synthetic data and the real lists cover; test_newdata.py checks PadChest, TAIXRay and ReXGradient
 BASE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(BASE)
 os.chdir(BASE)  # datasets_config.yaml and dataset/ lists are relative to base/
@@ -91,7 +92,7 @@ def fresh_meta():
 
 
 # (a) static shapes -------------------------------------------------------------------------------------------------
-dataset = build_dataset(list(DATASET_NAMES), CFG, DataAugmentationCXR(), check_exists=True)  # gram teacher crops 448
+dataset = build_dataset(list(STAGE_A_NAMES), CFG, DataAugmentationCXR(), check_exists=True)  # gram teacher crops 448
 assert len(dataset) == 12
 collate = make_collate_fn()
 batches = [collate([dataset[i] for i in range(4 * j, 4 * j + 4)]) for j in range(3)]
@@ -119,7 +120,7 @@ print("OK (b) meta step: total %.4f, %s; gram (448 teacher crops, step 0) = %.5f
 
 # (c) Gram is exactly 0 when nothing differs between student and Gram teacher -------------------------------------------
 meta_c = fresh_meta()  # Gram teacher == student backbone at init
-dataset_224 = build_dataset(list(DATASET_NAMES), CFG, DataAugmentationCXR(gram_teacher_crops_size=224), check_exists=False)
+dataset_224 = build_dataset(list(STAGE_A_NAMES), CFG, DataAugmentationCXR(gram_teacher_crops_size=224), check_exists=False)
 samples = [dataset_224[i] for i in range(4)]
 for crops, _ in samples:
     crops["gram_teacher_crops"] = crops["global_crops"]  # the very same tensors the student sees
@@ -784,7 +785,7 @@ def gram_code_forbidden():  # SSLMetaArch's Gram forward and refresh, and GramLo
 assert dist.is_initialized()  # the trainer runs above leave their world-size-1 group up, which SSLMetaArch's Sinkhorn-Knopp needs
 ng_student, ng_teacher, ng_gram = ng_seeded(build_models, TINY_VIT, None, TINY_HEADS, gram=False)
 meta_ng = SSLMetaArch(ng_student, ng_teacher, None, n_local_crops=8).train()
-ng_dataset = build_dataset(list(DATASET_NAMES), CFG, DataAugmentationCXR(emit_gram_teacher_crops=False), check_exists=False)
+ng_dataset = build_dataset(list(STAGE_A_NAMES), CFG, DataAugmentationCXR(emit_gram_teacher_crops=False), check_exists=False)
 ng_batch = make_collate_fn()([ng_dataset[i] for i in range(4)])
 assert ng_gram is None and meta_ng.gram_teacher is None and meta_ng.gram_loss is None
 assert "collated_gram_teacher_crops" not in ng_batch and tuple(ng_batch["collated_global_crops"].shape) == (8, 3, 224, 224)
@@ -923,7 +924,8 @@ print("OK (s) --no_gram --init_from_checkpoint: a Gram run's full checkpoint loa
 # parse: --branch_from stands in for --pretrained_weights, needs --gram_refresh_steps (none allowed: an anchor that never refreshes) and refuses --no_gram / --init_from_checkpoint
 PB = lambda *extra: ssl_pretrain.parse_args(["--data_set", "MIMIC", "--output_dir", "o", "--branch_from", "x.pth"] + list(extra))
 assert P().branch_from is None and ssl_pretrain.ARG_DEFAULTS["branch_from"] is None and "branch_from" in ssl_pretrain.RESUME_MATCH
-assert set(ssl_pretrain.BRANCH_FREE) == {"no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from", "init_from_checkpoint", "gram_teacher_from"}
+assert set(ssl_pretrain.BRANCH_FREE) == {"no_gram", "gram_weight", "gram_refresh_steps", "gram_teacher_size", "branch_from", "init_from_checkpoint", "init_new_heads_from",
+                                         "gram_teacher_from"}
 branch_parsed = PB("--gram_refresh_steps", "5")  # no --pretrained_weights
 assert (branch_parsed.branch_from, branch_parsed.pretrained_weights, branch_parsed.no_gram, branch_parsed.gram_weight, branch_parsed.gram_teacher_size,
         branch_parsed.gram_refresh_steps) == ("x.pth", None, False, 2.0, 448, [5])
@@ -3710,7 +3712,7 @@ except ImportError as error:
 else:
     from utils import get_config
     real_config, total = get_config("datasets_config.yaml"), 0
-    for name in DATASET_NAMES:
+    for name in STAGE_A_NAMES:
         cfg = real_config[name]
         ark_list = dataloader.dict_dataloarder[name](images_path=cfg["data_dir"], file_path=cfg["train_list"]).img_list
         ours = ssl_data.image_paths(name, cfg["data_dir"], cfg["train_list"])
