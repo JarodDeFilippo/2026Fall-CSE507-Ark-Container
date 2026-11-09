@@ -1,4 +1,5 @@
-"""Ported additions to the lab's embedding linear probe (main_linearprobing.py): dataset modules for ChestXray14, CheXpert, MIMIC and VinDrCXR over B2's cached embeddings.
+"""Ported additions to the lab's embedding linear probe (main_linearprobing.py): dataset modules for ChestXray14, CheXpert, MIMIC and VinDrCXR over B2's cached embeddings,
+and for the opt-in CANDIDPTX (CANDID-PTX pneumothorax, one label per image, from dense/data.py's CandidPTXImages: an image is positive when any of its rows has a mask).
 
 The shipped script has dataset modules for ChestDR and VinDrCXRAll only, whose embeddings are one .npy file per image. These stand in for them, with the same interface
 (train_set / test_set, train_dataloader() / test_dataloader(), the same DataLoader settings) and three named ports:
@@ -18,8 +19,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from ark_finetune import dataloader as official
-from ark_finetune.dataset_lists import dataset_entry
+from ark_finetune.dataset_lists import dataset_class, dataset_entry
 from ark_finetune.embedding_mode import check_aligned, chexpert_label, feature_dim, plain_label, read_meta, read_paths, split_files
 
 
@@ -35,7 +35,7 @@ def scored_columns(name):
 
 def test_labels(name, images_path, test_file, keep=None):
     """The test labels [N, C] that the probe serves for dataset `name`: the official class's parse of the test list (MIMIC: uncertain_label="Ones"), the first `keep` entries of a smoke cache."""
-    parsed = getattr(official, name)(images_path=images_path, file_path=test_file, augment=None, **EMBEDDING_MODULES[name].TEST_KWARGS)
+    parsed = dataset_class(name)(images_path=images_path, file_path=test_file, augment=None, **EMBEDDING_MODULES[name].TEST_KWARGS)
     return np.array(parsed.img_label[:keep], dtype=np.float64)
 
 
@@ -96,7 +96,7 @@ class EmbeddingDataloaderModule(Dataset):
         print('#test:  ', len(self.test_set))
 
     def _split(self, emb_path, split, images_path, file_path, keep, dim, **kwargs):
-        parsed = getattr(official, self.NAME)(images_path=images_path, file_path=file_path, augment=None, **kwargs)  # the official parse; no transform: no image is read
+        parsed = dataset_class(self.NAME)(images_path=images_path, file_path=file_path, augment=None, **kwargs)  # the official parse; no transform: no image is read
         if keep is not None:
             parsed.img_list, parsed.img_label = parsed.img_list[:keep], parsed.img_label[:keep]
         npy, paths = split_files(emb_path, split)
@@ -131,4 +131,8 @@ class VinDrCXR_DataloaderModule(EmbeddingDataloaderModule):
     NAME = "VinDrCXR"  # the 6-label global lists the arms use (VinDrCXR_{train,test}_pe_global_one.txt)
 
 
-EMBEDDING_MODULES = {module.NAME: module for module in (ChestXray14_DataloaderModule, CheXpert_DataloaderModule, MIMIC_DataloaderModule, VinDrCXR_DataloaderModule)}
+class CANDIDPTX_DataloaderModule(EmbeddingDataloaderModule):
+    NAME = "CANDIDPTX"  # opt-in (--datasets CANDIDPTX): the dense probe's train and test lists, one image per item, [1] when any of its rows has a mask
+
+
+EMBEDDING_MODULES = {module.NAME: module for module in (ChestXray14_DataloaderModule, CheXpert_DataloaderModule, MIMIC_DataloaderModule, VinDrCXR_DataloaderModule, CANDIDPTX_DataloaderModule)}

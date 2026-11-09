@@ -26,13 +26,18 @@ def dicom_to_uint8(path):
     return ((a - lo) * (1 / (hi - lo) * 255)).astype('uint8')
 
 
+def has_mask(rle):
+    """False for the RLE of an image with no mask, "-1" or blank (the CANDID-PTX lists write " -1", with a leading space), True otherwise."""
+    return rle.strip() not in ("", "-1")
+
+
 def rle2mask(rle, width, height):
     """uint8 mask [height, width] in {0, 1} from a SIIM-style RLE: "start length start length ...", each start counted from the end of the
     previous run, pixels numbered down the columns. width is the number of columns and height the number of rows; "-1" or blank is no mask.
     Foundation X+'s rle2mask (datasets_medical.py:1977-1991) decodes the same way, but its caller passes (rows, columns), which transposes
     a non-square image."""
     mask = np.zeros(width * height, dtype=np.uint8)
-    if rle.strip() not in ("", "-1"):
+    if has_mask(rle):
         runs = [int(x) for x in rle.split()]
         position = 0
         for start, length in zip(runs[0::2], runs[1::2]):
@@ -108,6 +113,27 @@ class CandidPTX(_SegDataset):
         # ponytail: every access decodes its DICOM again; cache the resized images if the loader ever starves the GPU
         a = dicom_to_uint8(os.path.join(self.root, uid))
         return np.repeat(a[..., None], 3, axis=-1), rle2mask(rle, width=a.shape[1], height=a.shape[0])
+
+
+class CandidPTXImages(Dataset):
+    """CANDID-PTX as one binary label per image, for the linear probe (ark_finetune, --datasets CANDIDPTX). The list is read by CandidPTX, so the images are the dense
+    probe's; an image with several rows is one item, at its first row, labelled [1] (pneumothorax) when any of its rows has a mask, [0] when none has. The interface is
+    the official Finetuning classes' (ark_finetune/dataloader.py): img_list (root/uid), img_label, augment (a torchvision transform of a PIL image, or None), items (image, label)."""
+
+    def __init__(self, images_path, file_path, augment):
+        positive = {}
+        for uid, rle in CandidPTX(images_path, file_path, mode="test").items:
+            positive[uid] = positive.get(uid, False) or has_mask(rle)
+        self.img_list = [os.path.join(images_path, uid) for uid in positive]
+        self.img_label = [[int(p)] for p in positive.values()]
+        self.augment = augment
+
+    def __getitem__(self, index):
+        image = Image.fromarray(dicom_to_uint8(self.img_list[index])).convert("RGB")  # the dense probe's DICOM read, gray on three channels as the official classes open an image
+        return (image if self.augment is None else self.augment(image)), torch.FloatTensor(self.img_label[index])
+
+    def __len__(self):
+        return len(self.img_list)
 
 
 class JSRTLung(_SegDataset):

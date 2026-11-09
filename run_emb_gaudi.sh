@@ -40,6 +40,10 @@
 # The fit always covers all four datasets, from the metadata the extractor wrote (--max_images included): --datasets is for finishing an extraction a dead job left half done (delete that dataset's
 # directory under embeddings/<tag>/ first, as the refusal says), and the job should then be the first to fit this tag. To redo one dataset's fit by hand, remove its JSON and
 # results/<tag>/probe/<dataset> and run:  ./gaudi.sh python -m ark_linearprobe.run_linearprobe --tag <tag> --datasets <dataset>
+# CANDIDPTX (CANDID-PTX pneumothorax, one label: present = a non-empty mask; the dense probe's train and test images, base/dense/data.py) is a fifth --datasets name, extracted and fit only when named, never by
+# default. This job's fit and its results preflight cover the four only, so probe it as two jobs under a tag of its own, whose results/<tag>/ holds CANDIDPTX alone (results of the four under a tag stop
+# any new extraction for it): ARK_EMB_NO_FIT=1 sbatch run_emb_gaudi.sh <tag>_candidptx <model> <weights> <normalization> --datasets CANDIDPTX, then sbatch run_emb_fit_class.sh <tag>_candidptx --datasets CANDIDPTX
+# (on the class lane: ./submit_probe_class.sh <tag>_candidptx <model> <weights> <normalization> --datasets CANDIDPTX).
 # The maintenance reservation (Oct 12 08:00 to Oct 15 15:00) means Slurm will not start a job whose limit crosses it: a job that cannot end before Oct 12 08:00 waits until Oct 15 15:00.
 # ARK_EMB_INPUT_SIZE (environment, default 224): the center crop the backbone embeds at, with the resize before it = round(size x 8/7) (224 -> 256, 448 -> 512,
 # 512 -> 585), passed as the extractor's --input_size / --img_resize and recorded in meta.json (transform.crop / transform.resize; the fit refuses a tag whose

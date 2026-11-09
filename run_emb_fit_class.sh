@@ -16,9 +16,11 @@
 # the wrapper); htc's limit is 4 h, so a longer -t runs on public only.
 # usage: sbatch run_emb_fit_class.sh <tag> [--datasets NAME...]
 #   <tag>        the backbone tag the embeddings were extracted under: letters, digits, . _ - only (as in run_emb_class.sh).
-#   --datasets   the only option: a non-empty subset of ChestXray14 CheXpert MIMIC VinDrCXR, each at most once; without it all four. Anything else exits 2 before anything runs.
+#   --datasets   the only option: a non-empty subset of ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX, each at most once; without it the four, never CANDIDPTX (CANDID-PTX pneumothorax, one label, the dense
+#                probe's train and test images: fit only when named, so every four-dataset mean stays as it was). Anything else exits 2 before anything runs.
 #   e.g. sbatch run_emb_fit_class.sh nogram_e0060
 #        sbatch -t 04:00:00 run_emb_fit_class.sh nogram_e0060 --datasets MIMIC
+#        sbatch -t 00:30:00 run_emb_fit_class.sh nogram_e0060_candidptx --datasets CANDIDPTX
 # Checks, in this order, each a stop that names its cause: (1) the arguments, and ARK_EMB_FIT_RESUME below (exit 2); (2) results that already exist for a dataset to be fit: results/<tag>/<dataset>.json or results/<tag>/probe/<dataset>, the two paths run_linearprobe refuses
 # and run_emb_class.sh checks before its extraction (exit 1; ARK_EMB_FIT_RESUME=1 replaces this stop by the resume rule); (3) the cache of every dataset to be fit, embeddings/<tag>/<dataset>/meta.json, which the extractor writes last, so it is there only once that
 # dataset's extraction has finished (exit 1, naming each missing one; run_linearprobe then checks all the cache's files itself). A failed fit exits 1 after the others have finished, as in run_emb_class.sh; the job log ends with the PROBE lines of results/<tag>/*.log.
@@ -36,15 +38,15 @@ TAG_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'   # the tag is a directory name: no path s
 datasets=(ChestXray14 CheXpert MIMIC VinDrCXR)
 member() { local word; for word in "${@:2}"; do [[ $word == "$1" ]] && return 0; done; return 1; }   # member WORD LIST...: WORD is one of LIST
 if [[ $# -lt 1 || ! $1 =~ $TAG_RE || ( $# -gt 1 && ( $2 != --datasets || $# -lt 3 ) ) ]]; then
-  echo "Usage: sbatch run_emb_fit_class.sh <tag: letters, digits, . _ - only> [--datasets NAME...]   (NAME: ChestXray14 CheXpert MIMIC VinDrCXR, each at most once)" >&2
+  echo "Usage: sbatch run_emb_fit_class.sh <tag: letters, digits, . _ - only> [--datasets NAME...]   (NAME: ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX, each at most once)" >&2
   exit 2
 fi
 TAG=$1
 if [[ $# -gt 1 ]]; then
   chosen=()
   for name in "${@:3}"; do
-    if ! member "$name" "${datasets[@]}"; then
-      echo "ERROR: '$name' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR)" >&2
+    if ! member "$name" "${datasets[@]}" CANDIDPTX; then   # CANDIDPTX: accepted when named, never in the default
+      echo "ERROR: '$name' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX)" >&2
       exit 2
     fi
     if member "$name" "${chosen[@]}"; then

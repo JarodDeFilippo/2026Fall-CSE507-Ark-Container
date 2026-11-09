@@ -288,6 +288,36 @@ print("OK (data): rle2mask puts the runs down the columns of a (height, width) m
       "no-comma line refused) return float32 (3, S, S) / (1, S, S) {0, 1} items in test and train mode, equal to a plain cv2 resize + normalize; normalization comes last; "
       "the train mask follows the geometric augmentation; --seed (torch's seed) fixes the augmentation draws")
 
+# CandidPTXImages, the linear probe's CANDIDPTX: the dense list's images, each once at its first row, [1] when any of its rows has a mask; " -1" (the lists' leading space) and blank are none
+from ark_finetune.dataset_lists import dataset_entry
+
+assert [data.has_mask(r) for r in (" -1", "-1", "", "  ", " 0 3", "4 1")] == [False, False, False, False, True, True]
+with tempfile.TemporaryDirectory() as candid_root:
+    # u2 has two mask rows, u6 a " -1" row and then a mask row, u4 is "-1" without the space; the blank line is skipped, as CandidPTX skips it
+    lines = ["u1, -1", "u2, 0 3", "u3, -1", "u2, 9 2", "", "u4,-1", "u5, 4 1", "u6, -1", "u6, 2 2"]
+    for split in ("train", "test"):  # the probe's two splits, each a list of the dense probe's own format
+        listing = os.path.join(candid_root, split + ".txt")
+        with open(listing, "w") as f:
+            f.write("\n".join(lines if split == "train" else lines[:4]) + "\n")
+        images = data.CandidPTXImages(candid_root, listing, augment=None)
+        dense_uids = [uid for uid, _ in data.CandidPTX(candid_root, listing, mode=split).items]
+        assert images.img_list == [os.path.join(candid_root, uid) for uid in dict.fromkeys(dense_uids)], split  # the dense probe's images of the split, each once, in list order
+    assert len(dense_uids) == 4 and images.img_list == [os.path.join(candid_root, u) for u in ("u1", "u2", "u3")] and images.img_label == [[0], [1], [0]]  # test: u2's two mask rows are one positive
+    images = data.CandidPTXImages(candid_root, os.path.join(candid_root, "train.txt"), augment=None)
+    assert images.img_list == [os.path.join(candid_root, u) for u in ("u1", "u2", "u3", "u4", "u5", "u6")] and images.img_label == [[0], [1], [0], [0], [1], [1]] and len(images) == 6
+    pixels = {path: rng.integers(1000, 3000, (40, 48)).astype(np.uint16) for path in images.img_list}
+    transform = build_transform_classification("imagenet", crop_size=32, resize=36, mode="valid")
+    with fake_dcmread(pixels):
+        img, label = data.CandidPTXImages(candid_root, os.path.join(candid_root, "train.txt"), augment=transform)[1]
+        gray = data.dicom_to_uint8(os.path.join(candid_root, "u2"))
+        assert img.shape == (3, 32, 32) and torch.equal(img, transform(Image.fromarray(np.repeat(gray[..., None], 3, axis=-1))))  # the dense probe's read, then the linear probe's transform
+        assert label.dtype == torch.float32 and label.tolist() == [1.0] and images[0][1].tolist() == [0.0]
+# the probe's CANDIDPTX entry is the dense registry's: its image root and its train and test lists (val unused), one class
+entry = dataset_entry("CANDIDPTX")
+assert entry == {"data_dir": data.DATASETS["candidptx"]["root"], "train_list": data.DATASETS["candidptx"]["lists"]["train"], "test_list": data.DATASETS["candidptx"]["lists"]["test"], "diseases": ["Pneumothorax"]}
+print("OK (data): CandidPTXImages (the linear probe's CANDIDPTX) holds the dense list's images once each, in order, labelled [1] when any row has a mask (two mask rows = one positive; ' -1', '-1' and "
+      "blank = [0]), reads the DICOM as the dense probe does through the probe's transform; dataset_entry('CANDIDPTX') is the dense registry's root and train / test lists")
+
 # (seg_probe) the training / evaluation entry point: a random-init ViT-B/16 at 64 px on a synthetic JSRT set, four iterations ----------------------------
 import copy
 import errno

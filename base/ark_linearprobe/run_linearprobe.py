@@ -4,6 +4,7 @@ For one backbone tag it runs the vendored main() once per dataset, on the CPU, w
 batch 512, 100 epochs, CosineAnnealingLR(T_max=1000, eta_min=1) stepped per epoch (eta_min is above the base lr, so the lr RISES: 1e-4 at epoch 0, 0.00626 at epoch 50, 0.02409 at epoch 99),
 --runs 10 independent runs, and in every run the epoch with the best TEST mAUC is the one reported (the script has no validation split; early stopping is commented out in it).
 It trains on the full official train list of the dataset and is scored on its official test list (CheXpert: the 5 competition findings), with the metrics of the script's utils.py.
+CANDIDPTX (CANDID-PTX pneumothorax, one label: the mAUC is its AUC; the dense probe's train and test images) is fit only when --datasets names it; the default stays the four.
 Only the columns with both a positive and a negative example among the test images it is scored on count: the others are dropped and recorded (a smoke cache can make a column single-valued).
 It writes, for each dataset,
   <results_root>/<tag>/<dataset>.json    per run the best test epoch (0-based, as the script prints it), its mAUC and per-class AUCs; mean and s.d. over the runs; the weights and the
@@ -32,7 +33,7 @@ import time
 import numpy as np
 import torch
 
-from ark_finetune.dataset_lists import DATASETS, REPO, dataset_entry
+from ark_finetune.dataset_lists import DATASETS, NAMES, REPO, dataset_entry
 from ark_finetune.embedding_mode import SPLITS, feature_dim, read_meta, split_files
 from . import main_linearprobing
 from .embedding_datasets import evaluable_columns, test_labels
@@ -54,7 +55,7 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}")
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="The lab's embedding linear probe on cached embeddings", allow_abbrev=False)
     p.add_argument("--tag", required=True, help="the backbone tag the embeddings were extracted under")
-    p.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    p.add_argument("--datasets", nargs="+", choices=NAMES, default=list(DATASETS))
     p.add_argument("--embeddings_root", default=os.path.join(REPO, "embeddings"))
     p.add_argument("--results_root", default=os.path.join(REPO, "results"))
     p.add_argument("--runs", type=int, default=10, help="the script's --runs (its default is 1): independent runs per dataset")
@@ -97,7 +98,7 @@ def raydino_train_overlap(meta):
 def check_provenance(embeddings_root, tag):
     """Refuse unless every dataset cache under the tag that has a meta.json (whichever datasets are being fit: the wrapper fits one per process) was extracted from the same backbone the same way:
     the PROVENANCE fields of their meta.json are identical (the sha256 of the weights file included, which must be a digest). Returns {dataset: meta}."""
-    metas = {name: read_meta(os.path.join(embeddings_root, tag, name)) for name in DATASETS if os.path.isfile(os.path.join(embeddings_root, tag, name, "meta.json"))}
+    metas = {name: read_meta(os.path.join(embeddings_root, tag, name)) for name in NAMES if os.path.isfile(os.path.join(embeddings_root, tag, name, "meta.json"))}
     for field, keys in PROVENANCE:
         values = {}
         for name, meta in metas.items():

@@ -4,7 +4,7 @@
 # the A100 idle, and the class QOS counts the requested -t of running GPU jobs against its GPU-minute cap (run_emb_class.sh). The lab's own probe is fit-only by construction, so this split is the native shape.
 # NOT an sbatch script: run it on the login node (it refuses inside a Slurm job). It submits, prints one line and exits; nothing is left running here.
 # usage: ./submit_probe_class.sh <tag> <model> <in-container weights path under /workspace> <imagenet|chestx-ray|none|raddino> [--datasets NAME...]
-#   the first four are run_emb_gaudi.sh's <tag> <model> <weights> <normalization> (see there for the contract); --datasets is the only option and goes to both jobs (NAME: ChestXray14 CheXpert MIMIC VinDrCXR). The smoke form (--max_images)
+#   the first four are run_emb_gaudi.sh's <tag> <model> <weights> <normalization> (see there for the contract); --datasets is the only option and goes to both jobs (NAME: ChestXray14 CheXpert MIMIC VinDrCXR, or CANDIDPTX, CANDID-PTX pneumothorax, only when named and under a tag of its own: run_emb_gaudi.sh's header). The smoke form (--max_images)
 #   and the per-dataset split of a long Swin-L extraction are not here: run run_emb_class.sh directly (run_emb_gaudi.sh's header describes them).
 #   e.g. ./submit_probe_class.sh stock_dinov3 vit_base_dinov3 /workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth imagenet
 #        ./submit_probe_class.sh nogram_e0060 vit_base_dinov3 /workspace/ssl_dinov3_cxr_constlr_nogram_seed_100/export/teacher_backbone_epoch_0060.pth imagenet

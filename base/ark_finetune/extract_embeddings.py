@@ -6,7 +6,8 @@ embeds with generate_embeddings' default after_proj=True (the 1376-d projector o
 The images go through the vendored official transform
 (build_transform_classification, mode "valid"): resize to 256 and center-crop 224 with no augmentation, for both splits: ONE embedding per image, as the lab's embedding linear probe
 (ark_linearprobe/) expects. There is no validation split: the probe has none. Lists and data directories are base/datasets_config.yaml's, the splits every arm uses
-(the full official train list of each dataset, VinDrCXR's 15,000 included, and its official test list; dataset_lists.py).
+(the full official train list of each dataset, VinDrCXR's 15,000 included, and its official test list; dataset_lists.py). CANDIDPTX (CANDID-PTX pneumothorax, the dense probe's train and
+test images, one label) is extracted only when --datasets names it; the default stays the four.
 The backbone is built by the container's build_omni_model from --model, passed through as it is, so any ViT model name base/models.py knows works. The Swin names (swin_base, swin_large, swin_large_384,
 swin_large_768) are Ark+ checkpoints (.pth.tar): they load the TEACHER weights through build_omni_model_from_checkpoint (see load_backbone), and a Swin is built for ONE input size, so --input_size must be
 it (run_emb_gaudi.sh: ARK_EMB_INPUT_SIZE) and main() refuses otherwise. The width of the vectors is the built backbone's (model.num_features), and meta.json records it as feature_dim.
@@ -44,7 +45,7 @@ from accelerator import Accelerator
 from models import ArkSwinTransformer, build_omni_model, build_omni_model_from_checkpoint
 
 from . import dataloader
-from .dataset_lists import BASE, DATASETS, REPO, dataset_entry
+from .dataset_lists import BASE, DATASETS, NAMES, REPO, dataset_class, dataset_entry
 from .embedding_mode import EMBEDDING_DIM, SPLITS, split_files, write_paths
 
 NORMALIZATIONS = ("imagenet", "chestx-ray", "none", "raddino")
@@ -57,7 +58,7 @@ def parse_args(argv=None):
     p.add_argument("--model", required=True, help="base/models.py's model name, e.g. vit_base_dinov3 (passed through); swin_base, swin_large, swin_large_384 and swin_large_768 embed the TEACHER of an Ark+ .pth.tar")
     p.add_argument("--weights", required=True, help="the backbone's weights file, as the container's builder loads it: the stock .pth, a Stage A export/teacher_backbone_epoch_NNNN.pth, or (Swin names) an Ark+ .pth.tar")
     p.add_argument("--normalization", required=True, choices=NORMALIZATIONS)
-    p.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    p.add_argument("--datasets", nargs="+", choices=NAMES, default=list(DATASETS))
     p.add_argument("--embeddings_root", default=os.path.join(REPO, "embeddings"))
     p.add_argument("--input_size", type=int, default=224)
     p.add_argument("--img_resize", type=int, default=256)
@@ -169,7 +170,7 @@ def build_splits(name, args):
     splits = {}
     for split in SPLITS:
         transform = dataloader.build_transform_classification(normalize=args.normalization, crop_size=args.input_size, resize=args.img_resize, mode="valid")
-        splits[split] = getattr(dataloader, name)(images_path=entry["data_dir"], file_path=entry[split + "_list"], augment=transform)
+        splits[split] = dataset_class(name)(images_path=entry["data_dir"], file_path=entry[split + "_list"], augment=transform)
     return entry, splits
 
 

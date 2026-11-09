@@ -1345,6 +1345,10 @@ try:
         # argparse takes an abbreviation for the option it abbreviates: run_emb_gaudi.sh therefore allow-lists what may follow <normalization> instead of listing the options it owns (j)
         abbreviated = extract_embeddings.parse_args(["--tag", "ok", "--model", "m", "--weights", weights, "--normalization", "imagenet", "--emb", os.path.join(tmp, "elsewhere")])
         assert abbreviated.embeddings_root == os.path.join(tmp, "elsewhere")
+        # CANDIDPTX is opt-in: both parsers default to the four and take it only when named
+        assert abbreviated.datasets == list(NAMES) == list(dataset_lists.DATASETS) and run_linearprobe.parse_args(["--tag", "ok"]).datasets == list(NAMES)
+        assert extract_embeddings.parse_args(["--tag", "ok", "--model", "m", "--weights", weights, "--normalization", "imagenet", "--datasets", "CANDIDPTX"]).datasets == ["CANDIDPTX"]
+        assert run_linearprobe.parse_args(["--tag", "ok", "--datasets", "MIMIC", "CANDIDPTX"]).datasets == ["MIMIC", "CANDIDPTX"]
 
         # (i) extractor -> runner: the cache the extractor wrote is what the probe reads (paths, meta, shapes) in all four list formats
         run_linearprobe.dataset_entry = lambda name: entries[name]
@@ -1371,6 +1375,55 @@ try:
             run_linearprobe.dataset_entry = stock_entry
         print("OK (i) extractor -> runner on the four list formats: the probe reads the extractor's cache (meta, paths, shapes) for 2 runs, the smoke cache (3 per split) runs the whole pipeline, "
               "and a vit_base_raddino cache is flagged rad_dino_pretraining_overlap=train+val+test on ChestXray14")
+
+        # (i1) CANDIDPTX, opt-in, extractor -> runner: lists in the dense probe's format ("uid, rle", "-1" = no mask; t3 has a second mask row), stand-in DICOMs read by dense/data.py, one label
+        from dense import data as dense_data
+        candid = os.path.join(tmp, "candid")
+        os.makedirs(candid)
+        candid_rows = {"train": ["t{}, {}".format(i, "0 3" if i % 3 == 0 else "-1") for i in range(7)] + ["t3, 9 2"], "test": ["s{}, {}".format(i, "4 1" if i % 2 else "-1") for i in range(6)]}
+        candid_entry = entries["CANDIDPTX"] = {"data_dir": candid, "diseases": ["Pneumothorax"]}
+        dicoms = {}
+        for split, rows in candid_rows.items():
+            candid_entry[split + "_list"] = os.path.join(candid, split + ".txt")
+            with open(candid_entry[split + "_list"], "w") as f:
+                f.write("\n".join(rows) + "\n")
+            for row in rows:
+                dicoms[os.path.join(candid, row.split(",")[0])] = np.random.RandomState(len(dicoms)).randint(0, 4096, (40, 48)).astype(np.uint16)
+        stock_dcmread = dense_data.dicom.dcmread
+        dense_data.dicom.dcmread = lambda path: SimpleNamespace(pixel_array=dicoms[path])
+        run_linearprobe.dataset_entry = lambda name: entries[name]
+        try:
+            _, out, _ = extract("tiny", "--datasets", "CANDIDPTX")  # beside the four caches of tag tiny, which stay as they are
+            folder = os.path.join(root, "tiny", "CANDIDPTX")
+            assert sorted(os.listdir(folder)) == CACHE_FILES and re.fullmatch(r"EMB tiny CANDIDPTX: train 7 / test 6, dim 1536, \d+s\n", out), out
+            transform = dataloader.build_transform_classification(normalize="imagenet", crop_size=32, resize=36, mode="valid")
+            for split, n in (("train", 7), ("test", 6)):
+                npy, paths = embedding_mode.split_files(folder, split)
+                listed = list(dict.fromkeys(os.path.join(candid, row.split(",")[0]) for row in candid_rows[split]))  # each image once, in list order
+                assert embedding_mode.read_paths(paths) == listed and len(listed) == n, split
+                with torch.no_grad():
+                    expected = np.concatenate([reference.generate_embeddings(transform(Image.fromarray(dense_data.dicom_to_uint8(p)).convert("RGB"))[None], after_proj=False).numpy() for p in listed])
+                assert np.allclose(np.load(npy), expected.astype(np.float16), atol=2e-3, rtol=2e-3), split
+            meta = json.load(open(os.path.join(folder, "meta.json")))
+            assert meta["dataset"] == "CANDIDPTX" and meta["counts"] == {"train": 7, "test": 6} and meta["transform"] == json.load(open(os.path.join(root, "tiny", "MIMIC", "meta.json")))["transform"]
+            module, _, _ = quiet(lambda: embedding_datasets.CANDIDPTX_DataloaderModule(folder, entries["CANDIDPTX"]["train_list"], entries["CANDIDPTX"]["test_list"], candid, num_workers=0))
+            assert module.train_set.parsed.img_label == [[1], [0], [0], [1], [0], [0], [1]] and module.test_set.parsed.img_label == [[0], [1], [0], [1], [0], [1]] and module.test_columns is None
+            assert module.train_set[3][1].tolist() == [1.0] and module.train_set[3][0].shape == (1536,)
+            with short_epochs(2):
+                out, _ = run_fit("tiny", root, res_root, "--datasets", "CANDIDPTX", "--runs", "2")  # the four's results under tiny do not stop it; their caches and this one pass the provenance check together
+            result = load_result(res_root, "tiny", "CANDIDPTX")
+            assert result["classes"] == ["Pneumothorax"] and result["n"] == {"train": 7, "test": 6} and result["dropped_columns"] == [] and result["warnings"] == [] and len(result["per_run"]) == 2
+            assert all(r["test_mAUC"] == r["test_AUC"]["Pneumothorax"] for r in result["per_run"]) and result["test_AUC_mean"]["Pneumothorax"] == result["test_mAUC_mean"]  # one label: the mean is its AUROC
+            assert re.search(r"^PROBE tiny CANDIDPTX: test mAUC \d\.\d{4} \(\d\.\d{4}\) over 2 runs, best epoch on test \(as shipped\)", out, re.M), out
+            clone_cache(root, "tiny", "ptx_mixed", "CANDIDPTX")
+            clone_cache(root, "tiny", "ptx_mixed", "MIMIC", normalization="raddino")
+            rejects(RuntimeError, lambda: run_fit("ptx_mixed", root, res_root, "--datasets", "CANDIDPTX", "--runs", "1"), "normalization differs")  # one tag is one backbone, CANDIDPTX included
+        finally:
+            dense_data.dicom.dcmread = stock_dcmread
+            run_linearprobe.dataset_entry = stock_entry
+            del entries["CANDIDPTX"]
+        print("OK (i1) CANDIDPTX through the extractor and the runner, only when named: one embedding per image (an image's second mask row adds none), each the probe's transform of the dense probe's DICOM read "
+              "through the reference ViT; labels [1] when any row has a mask; one class, whose AUROC is the mAUC; the PROBE line; a CANDIDPTX cache under a tag is held to the tag's provenance")
 
         # (i2) RayDINO, a ViT-L/16: 2048-d through the extractor and the runner. The stand-in has the real width (build_omni_model fixes encoder_features=2048 for vit_large_raydino), four blocks and 32 px, and
         # its file is in DINOv2's block_chunks layout, as Meta's is (2 chunks of 2 blocks here): the loader renames the block keys and says so on stderr. Everything after it is 2048 wide
@@ -1407,8 +1460,19 @@ try:
                 # a cache whose arrays are not as wide as its meta says is refused by the dataset module, naming both widths
                 clone_cache(root, "raytiny", "raywrong", "MIMIC", feature_dim=1536)
                 rejects(ValueError, lambda: run_fit("raywrong", root, res_root, "--datasets", "MIMIC", "--runs", "1"), "float16 [7, 2048] (float16 [7, 1536] expected)")
+                # CANDIDPTX through the same ViT-L, under a tag of its own (i1's lists and stand-in DICOMs): 2048 wide end to end
+                entries["CANDIDPTX"] = candid_entry
+                dense_data.dicom.dcmread = lambda path: SimpleNamespace(pixel_array=dicoms[path])
+                quiet(lambda: extract_embeddings.main(["--tag", "raytiny_candidptx", "--normalization", "imagenet", "--model", "vit_large_raydino", "--weights", ray_weights, "--datasets", "CANDIDPTX"] + base_cli[4:]))
+                with short_epochs(2):
+                    run_fit("raytiny_candidptx", root, res_root, "--datasets", "CANDIDPTX", "--runs", "1")
+                ptx = load_result(res_root, "raytiny_candidptx", "CANDIDPTX")
+                assert ptx["classes"] == ["Pneumothorax"] and ptx["n"] == {"train": 7, "test": 6} and "float64 nn.Linear on the 2048-d embedding" in ptx["protocol"] and ptx["model"] == "vit_large_raydino", ptx
+                assert sorted(os.listdir(os.path.join(root, "raytiny_candidptx"))) == ["CANDIDPTX"] and sorted(os.listdir(os.path.join(res_root, "raytiny_candidptx"))) == ["CANDIDPTX.json", "probe"]
             finally:
                 run_linearprobe.dataset_entry = stock_entry
+                dense_data.dicom.dcmread = stock_dcmread
+                entries.pop("CANDIDPTX", None)
             # RayDINO's corpus holds the TRAIN splits of ChestXray14, CheXpert and MIMIC (its Table 2) and none of their test lists, and not VinDr-CXR: no test-set overlap, so the dagger flag stays null for
             # all four datasets; the train-split overlap is the JSON's separate, informational field
             ray_note = "CheXpert, MIMIC-CXR, ChestX-ray14 training splits (RayDINO Table 2); VinDr-CXR not in its corpus"
@@ -1427,7 +1491,8 @@ try:
             models.DINOV2_VITL16_KWARGS = stock_ray_kwargs
         print("OK (i2) RayDINO: a vit_large_raydino file in DINOv2's block_chunks layout is summarised (one line: key count, non-block keys with shapes, first and last block key, layout) and renamed on load (one notice), both on stderr, the extractor writes float16 (N, 2048) caches equal to the chunked model's embeddings with "
               "feature_dim 2048 in every meta.json and 'dim 2048' on every EMB line, the runner fits a 2048-wide probe head (protocol text, ckpt weight shape) for 2 runs on all four datasets; the JSON carries "
-              "pretraining_overlap_train, its flags.rad_dino_pretraining_overlap stays null (no test-set overlap), and other models carry no such field; a meta that disagrees with its arrays is refused")
+              "pretraining_overlap_train, its flags.rad_dino_pretraining_overlap stays null (no test-set overlap), and other models carry no such field; a meta that disagrees with its arrays is refused; "
+              "CANDIDPTX goes through the same ViT-L, 2048 wide, under a tag that holds it alone")
 
         # (i3) the Ark+ Swin teacher: a swin_* name loads checkpoint['teacher'], the lab's convention for the encoder of an Ark checkpoint, never checkpoint['state_dict'] (the student, which build_omni_model would read into a Swin with no
         # key guard), and embeds before the projector: 1024-d for swin_base. The stand-in is the lab's own model in its checkpoint layout (every key under 'module.', the teacher beside the student) with a projector and two heads, at
@@ -1856,7 +1921,7 @@ for text in REUSED:
 print("OK (j) drift guard, three scripts: run_emb_fit_class.sh repeats {} lines of the shared block verbatim (TAG_RE=, datasets=(, the cd to ARK_ROOT, the loop that fills taken with the two paths run_linearprobe refuses); "
       "its header is {} (no --gres, no constraint, no GPU); submit_probe_class.sh: bash -n, mode 755, no #SBATCH line".format(sum(t.count("\n") + 1 for t in REUSED), " ".join(fit_header)))
 
-FIT_USAGE = "Usage: sbatch run_emb_fit_class.sh <tag: letters, digits, . _ - only> [--datasets NAME...]   (NAME: ChestXray14 CheXpert MIMIC VinDrCXR, each at most once)"
+FIT_USAGE = "Usage: sbatch run_emb_fit_class.sh <tag: letters, digits, . _ - only> [--datasets NAME...]   (NAME: ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX, each at most once)"
 CACHES = tuple("embeddings/stock/{}/meta.json".format(d) for d in NAMES)  # a dataset's cache as the extractor leaves it: meta.json is the file it writes last
 FIT_CALL = FIT[CLASS_WRAPPER]  # the fit's one call, through nvidia.sh (the class image), OMP_NUM_THREADS=1 inside the container
 
@@ -1886,6 +1951,8 @@ done, calls, _, results = run_fit(["stock", "--datasets", "MIMIC", "CheXpert"], 
 assert done.returncode == 0 and sorted(calls) == fits("stock", ("CheXpert", "MIMIC")) and results == ["CheXpert.log", "MIMIC.log"], (done, calls, results)
 done, calls, _, results = run_fit(["stock", "--datasets", "VinDrCXR"], files=CACHES[3:] + ("embeddings/other/MIMIC/meta.json",))
 assert done.returncode == 0 and calls == fits("stock", ("VinDrCXR",)) and results == ["VinDrCXR.log"], (done, calls, results)
+done, calls, _, results = run_fit(["stock_candidptx", "--datasets", "CANDIDPTX"], files=("embeddings/stock_candidptx/CANDIDPTX/meta.json",))  # opt-in: fit when named, never by default (the four above)
+assert done.returncode == 0 and calls == fits("stock_candidptx", ("CANDIDPTX",)) and results == ["CANDIDPTX.log"], (done, calls, results)
 # a failed fit: exit 1 after the other three have finished, the failure named with its log
 done, calls, _, results = run_fit(["stock"], FAIL_FIT="MIMIC")
 assert done.returncode == 1 and len(calls) == 4 and "ERROR: fit MIMIC failed (see results/stock/MIMIC.log)" in done.stderr and all("fit {}: done".format(d) in done.stdout for d in NAMES if d != "MIMIC"), (done, calls)
@@ -1897,7 +1964,7 @@ for bad in ([], ["../x"], ["a b"], ["-x"], [""], ["--check"], ["--datasets", "MI
     for files in (CACHES, (), CACHES + ("results/stock/MIMIC.json",)):
         done, calls, _, _, tree = run_fit(bad, files=files, snapshot=True)
         assert done.returncode == 2 and done.stderr == FIT_USAGE + "\n" and done.stdout == "" and calls is None and tree == seeded(files), (bad, files, done)
-for extra, message in ((["--datasets", "MIMC"], "ERROR: 'MIMC' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR)\n"), (["--datasets", "mimic"], "ERROR: 'mimic' is not a dataset of the probe"),
+for extra, message in ((["--datasets", "MIMC"], "ERROR: 'MIMC' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX)\n"), (["--datasets", "mimic"], "ERROR: 'mimic' is not a dataset of the probe"),
                        (["--datasets", "ChestXray14 CheXpert"], "ERROR: 'ChestXray14 CheXpert' is not a dataset of the probe"), (["--datasets", "MIMIC", "--workers", "4"], "ERROR: '--workers' is not a dataset of the probe"),
                        (["--datasets", "MIMIC", "MIMIC"], "ERROR: --datasets lists MIMIC twice\n"), (["--datasets", "CheXpert", "MIMIC", "CheXpert"], "ERROR: --datasets lists CheXpert twice\n")):
     for files in (CACHES, ()):
@@ -1985,7 +2052,7 @@ print("OK (j) run_emb_fit_class.sh resume rule (ARK_EMB_FIT_RESUME=1): a dataset
       "nothing started -> a fresh fit; a missing cache stops it before anything is removed; --datasets limits what is looked at; one failed fit exits 1 after the others")
 
 # --check, the first argument: the arguments and results checks, no cache check, nothing run, written or removed, and silence on success (submit_probe_class.sh prints one line of its own)
-for args in (["--check", "stock"], ["--check", "stock", "--datasets", "MIMIC", "CheXpert"]):
+for args in (["--check", "stock"], ["--check", "stock", "--datasets", "MIMIC", "CheXpert"], ["--check", "stock", "--datasets", "CANDIDPTX"]):
     done, calls, _, results, tree = run_fit(args, files=(), snapshot=True)  # no caches: the extraction has not run yet when the wrapper asks
     assert done.returncode == 0 and done.stdout == "" and done.stderr == "" and calls is None and results is None and tree == {}, (args, done)
 done, calls, _, _, tree = run_fit(["--check", "stock"], files=CACHES + RESUME_SEED, snapshot=True, ARK_EMB_FIT_RESUME="1")  # resume mode: nothing is removed
@@ -2002,8 +2069,9 @@ print("OK (j) run_emb_fit_class.sh --check: silent exit 0 without the caches, wi
 # run_emb_class.sh --check, the first argument: the shared block's checks (usage, extras, ARK_EMB_*, weights, results), then exit 0 with no extraction, no fit and no output
 done, calls, card_check, results, tree = run_wrapper(["--check"] + base, wrapper=CLASS_WRAPPER, snapshot=True)
 assert done.returncode == 0 and done.stdout == "" and done.stderr == "" and calls is None and results is None and tree == {STOCK_HOST: "x"}, done
-done, calls, _, results = run_wrapper(["--check"] + base + ["--datasets", "MIMIC", "CheXpert"], wrapper=CLASS_WRAPPER, ARK_EMB_INPUT_SIZE="512", ARK_EMB_NO_FIT="1")
-assert done.returncode == 0 and done.stdout == "" and done.stderr == "" and calls is None and results is None, done
+for datasets in (["MIMIC", "CheXpert"], ["CANDIDPTX"]):
+    done, calls, _, results = run_wrapper(["--check"] + base + ["--datasets"] + datasets, wrapper=CLASS_WRAPPER, ARK_EMB_INPUT_SIZE="512", ARK_EMB_NO_FIT="1")
+    assert done.returncode == 0 and done.stdout == "" and done.stderr == "" and calls is None and results is None, (datasets, done)
 for args, kwargs, code, message in ((["--check"], {}, 2, USAGE + "\n"), (["--check"] + base[:3], {}, 2, USAGE + "\n"), (["--check", "../x"] + base[1:], {}, 2, USAGE + "\n"), (["--check"] + base + ["--tag", "other"], {}, 2, "ERROR: --tag: not accepted after <normalization>."),
                                     (["--check"] + base, dict(files=()), 1, "ERROR: weights not found at ./" + STOCK_HOST), (["--check"] + base, dict(files=(STOCK_HOST, "results/stock/CheXpert.json")), 1, "ERROR: results already exist for tag stock: results/stock/CheXpert.json;"),
                                     (["--check"] + base, dict(ARK_EMB_INPUT_SIZE="12345"), 2, "ERROR: ARK_EMB_INPUT_SIZE='12345'"), (["--check"] + base, dict(ARK_EMB_NO_FIT="yes"), 2, "ERROR: ARK_EMB_NO_FIT='yes' must be unset, empty or 1\n")):
@@ -2073,6 +2141,10 @@ done, sbatch, scancel, calls = run_submit(base + ["--datasets", "MIMIC", "CheXpe
 assert done.returncode == 0 and done.stdout == "probe stock: extraction 1001, fit 1002 (afterok)\n" and scancel == [] and calls is None, (done, scancel, calls)
 assert sbatch[0] == ("NO_FIT=1 INPUT_SIZE=512 RESUME=unset", ["--parsable", "-J", "probe-stock-x", "-p", "public,htc", "-q", "class", "--constraint=a100_80", "-t", "2:00:00", "run_emb_class.sh"] + base + ["--datasets", "MIMIC", "CheXpert"]), sbatch[0]
 assert sbatch[1] == ("NO_FIT=yes INPUT_SIZE=512 RESUME=unset", ["--parsable", "-J", "probe-stock-fit", "-t", "1-00:00:00", "--dependency=afterok:1001", "run_emb_fit_class.sh", "stock", "--datasets", "MIMIC", "CheXpert"]), sbatch[1]
+done, sbatch, scancel, calls = run_submit(["stock_candidptx"] + base[1:] + ["--datasets", "CANDIDPTX"], ARK_EMB_INPUT_SIZE="512", PROBE_X_CONSTRAINT="a100_80")  # CANDIDPTX, named, under a tag of its own
+assert done.returncode == 0 and done.stdout == "probe stock_candidptx: extraction 1001, fit 1002 (afterok)\n" and scancel == [] and calls is None, (done, scancel, calls)
+assert sbatch == [("NO_FIT=1 INPUT_SIZE=512 RESUME=unset", ["--parsable", "-J", "probe-stock_candidptx-x", "-p", "public,htc", "-q", "class", "--constraint=a100_80", "-t", "01:15:00", "run_emb_class.sh", "stock_candidptx"] + base[1:] + ["--datasets", "CANDIDPTX"]),
+                  ("NO_FIT=unset INPUT_SIZE=512 RESUME=unset", ["--parsable", "-J", "probe-stock_candidptx-fit", "-t", "03:00:00", "--dependency=afterok:1001", "run_emb_fit_class.sh", "stock_candidptx", "--datasets", "CANDIDPTX"])], sbatch
 done, sbatch, scancel, calls = run_submit(base, PROBE_X_TIME="", PROBE_X_CONSTRAINT="", PROBE_FIT_TIME="")  # empty is unset: the defaults
 assert done.returncode == 0 and [argv for _, argv in sbatch] == [X_DEFAULT, FIT_DEFAULT], sbatch
 # PROBE_ACCOUNT: both jobs get -A <it>, right after their -J pair. Unset (the runs above: X_DEFAULT and FIT_DEFAULT have no -A) or empty, there is no -A at all and the launchers' own #SBATCH -A applies. The value is one argument, whatever it holds
@@ -2101,8 +2173,8 @@ print("OK (j) submit_probe_class.sh: the extraction line 'ARK_EMB_NO_FIT=1 sbatc
 CHECK_REFUSED = "submit_probe_class.sh: a launcher's check refused the arguments (exit {}); nothing was submitted\n"
 for args, files, env, code, stderr in ((base, (), {}, 1, None), (base[:3] + ["caffe"], (STOCK_HOST,), {}, 2, USAGE + "\n"), (["../x"] + base[1:], (STOCK_HOST,), {}, 2, USAGE + "\n"), (["stock", "vit_base_dinov3", "weights/x.pth", "imagenet"], (STOCK_HOST,), {}, 2, USAGE + "\n"),
                                        (base, (STOCK_HOST,), dict(ARK_EMB_INPUT_SIZE="12345"), 2, None), (base, (STOCK_HOST,), dict(ARK_EMB_INPUT_SIZE="0512"), 2, None),
-                                       (base + ["--datasets"], (STOCK_HOST,), {}, 2, FIT_USAGE + "\n"), (base + ["--datasets", "MIMC"], (STOCK_HOST,), {}, 2, "ERROR: 'MIMC' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR)\n"),
-                                       (base + ["--datasets", "MIMIC", "MIMIC"], (STOCK_HOST,), {}, 2, "ERROR: --datasets lists MIMIC twice\n"), (base + ["--datasets", "MIMIC", "--max_images", "5"], (STOCK_HOST,), {}, 2, "ERROR: '--max_images' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR)\n")):
+                                       (base + ["--datasets"], (STOCK_HOST,), {}, 2, FIT_USAGE + "\n"), (base + ["--datasets", "MIMC"], (STOCK_HOST,), {}, 2, "ERROR: 'MIMC' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX)\n"),
+                                       (base + ["--datasets", "MIMIC", "MIMIC"], (STOCK_HOST,), {}, 2, "ERROR: --datasets lists MIMIC twice\n"), (base + ["--datasets", "MIMIC", "--max_images", "5"], (STOCK_HOST,), {}, 2, "ERROR: '--max_images' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX)\n")):
     done, sbatch, scancel, calls = run_submit(args, files=files, **env)
     assert done.returncode == code and sbatch == [] and scancel == [] and calls is None and done.stdout == "", (args, env, done)
     assert done.stderr.endswith(CHECK_REFUSED.format(code)) and (stderr is None or done.stderr == stderr + CHECK_REFUSED.format(code)), (args, env, done.stderr)
@@ -2112,6 +2184,8 @@ for name in NAMES:  # results that exist for the tag: the same preflight as the 
         done, sbatch, scancel, calls = run_submit(base, files=(STOCK_HOST, os.path.join(blocking, "log.txt") if not blocking.endswith(".json") else blocking))
         assert done.returncode == 1 and sbatch == [] and scancel == [] and calls is None and done.stdout == "", (blocking, done)
         assert "ERROR: results already exist for tag stock: {}; refusing to start the extraction".format(blocking) in done.stderr and done.stderr.endswith(CHECK_REFUSED.format(1)), (blocking, done.stderr)
+done, sbatch, scancel, calls = run_submit(base + ["--datasets", "CANDIDPTX"], files=(STOCK_HOST, "results/stock/MIMIC.json"))  # the four's results stop any extraction for their tag: CANDIDPTX takes a tag of its own
+assert done.returncode == 1 and sbatch == [] and "ERROR: results already exist for tag stock: results/stock/MIMIC.json;" in done.stderr, done
 done, sbatch, scancel, calls = run_submit(base, files=(STOCK_HOST, "results/stock/CheXpert.json"), ARK_EMB_FIT_RESUME="1")  # an inherited resume switch does not make an existing result acceptable
 assert done.returncode == 1 and sbatch == [] and "results already exist for tag stock" in done.stderr, done
 for args in ([], base[:3], base + ["--max_images", "5"], base + ["--workers", "4"], base + ["--tag", "x"], base + ["--datasets=MIMIC"]):
