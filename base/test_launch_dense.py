@@ -49,6 +49,10 @@ with tempfile.TemporaryDirectory() as tmp:
     assert job_script(absent, "--seed", "0") in launch(["--check"] + BASE + ["--seed", "0"], absent).stdout  # an explicit seed 0 is passed on
     done = launch(["--check"] + BASE + ["--seed", "1", "--runs", "3"], absent)  # --runs follows --seed, and the job script carries both
     assert done.returncode == 0 and job_script(absent, "--seed", "1", "--runs", "3") in done.stdout, done.stdout
+    done = launch(["--check"] + BASE + ["--size", "512", "--seed", "0", "--runs", "10"], absent)  # --size follows --runs in the job script, whichever order the options were given in
+    assert done.returncode == 0 and job_script(absent, "--seed", "0", "--runs", "10", "--size", "512") in done.stdout, done.stdout
+    assert launch(["--check"] + BASE + ["--runs", "10", "--seed", "0", "--size", "512"], absent).stdout == done.stdout
+    assert "--size" not in launch(["--check"] + BASE + ["--iters", "10", "--seed", "3", "--runs", "2"], absent).stdout  # without --size nothing is passed: seg_probe's 224 applies
     done = launch(["--check", "jsrt_lung", "raydino", "vit_large_raydino", "/workspace/weights/xray_dino_vitl16_pretrained-ad31c2b0.pth", "imagenet"], absent, DENSE_TIME="00:45:00", DENSE_ACCOUNT="class_x")
     assert done.returncode == 0 and "-A class_x -p" in done.stdout and "-t 00:45:00 -J dense-raydino-jsrt_lung" in done.stdout, done.stdout
 
@@ -63,7 +67,9 @@ with tempfile.TemporaryDirectory() as tmp:
                (BASE + ["--iters"], "--iters takes"), (BASE + ["--iters", "0"], "--iters takes"), (BASE + ["--iters", "5", "--iters", "6"], "--iters takes"),
                (BASE + ["--runs", "0"], "--runs takes"), (BASE + ["--runs", "1", "--runs", "2"], "--runs takes"),
                (BASE + ["--seed", "-1"], "--seed takes"), (BASE + ["--seed", "1", "--seed", "2"], "--seed takes"),
-               (BASE + ["--seed", "007"], "--seed takes"), (BASE + ["--seed", "1000000000"], "--seed takes")]  # seg_probe names the folder seed<int>: 007 and 7 would be one run
+               (BASE + ["--seed", "007"], "--seed takes"), (BASE + ["--seed", "1000000000"], "--seed takes"),  # seg_probe names the folder seed<int>: 007 and 7 would be one run
+               (BASE + ["--size"], "--size takes"), (BASE + ["--size", "0"], "--size takes"), (BASE + ["--size", "0512"], "--size takes"), (BASE + ["--size", "512px"], "--size takes"),
+               (BASE + ["--size", "12345"], "--size takes"), (BASE + ["--size", "512", "--size", "512"], "--size takes")]
     for args, reason in refused:
         for form in ([], ["--check"]):
             done = launch(form + args, absent)
