@@ -4,7 +4,7 @@
 # the A100 idle, and the class QOS counts the requested -t of running GPU jobs against its GPU-minute cap (run_emb_class.sh). The lab's own probe is fit-only by construction, so this split is the native shape.
 # NOT an sbatch script: run it on the login node (it refuses inside a Slurm job). It submits, prints one line and exits; nothing is left running here.
 # usage: ./submit_probe_class.sh <tag> <model> <in-container weights path under /workspace> <imagenet|chestx-ray|none|raddino> [--datasets NAME...]
-#   the first four are run_emb_gaudi.sh's <tag> <model> <weights> <normalization> (see there for the contract); --datasets is the only option and goes to both jobs (NAME: ChestXray14 CheXpert MIMIC VinDrCXR, or CANDIDPTX, CANDID-PTX pneumothorax, only when named and under a tag of its own: run_emb_gaudi.sh's header). The smoke form (--max_images)
+#   the first four are run_emb_gaudi.sh's <tag> <model> <weights> <normalization> (see there for the contract); --datasets is the only option and goes to both jobs (NAME: ChestXray14 CheXpert MIMIC VinDrCXR, or CANDIDPTX, CANDID-PTX pneumothorax, or TAIXRAY, TAIX-Ray, only when named and under a tag of its own: run_emb_gaudi.sh's header). The smoke form (--max_images)
 #   and the per-dataset split of a long Swin-L extraction are not here: run run_emb_class.sh directly (run_emb_gaudi.sh's header describes them).
 #   e.g. ./submit_probe_class.sh stock_dinov3 vit_base_dinov3 /workspace/weights/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth imagenet
 #        ./submit_probe_class.sh nogram_e0060 vit_base_dinov3 /workspace/ssl_dinov3_cxr_constlr_nogram_seed_100/export/teacher_backbone_epoch_0060.pth imagenet
@@ -23,6 +23,10 @@
 #   PROBE_FIT_TIME (the fit's -t, default 03:00:00, see run_emb_fit_class.sh); PROBE_ACCOUNT (the Slurm account of both jobs, -A right after each -J; unset or empty = no -A, so the launchers' own #SBATCH -A applies, class_cse49478170fall2026; it must carry the class QOS,
 #   so the lab account grp_jliang12 is not a substitute; an account sbatch refuses fails the first submission and nothing is queued): a group member in another class account runs
 #   PROBE_ACCOUNT=class_bme50769722fall2026 ./submit_probe_class.sh <tag> <model> <weights> <normalization>
+#   DATA_BIND (nvidia.sh's mount list, which replaces its default /data mount) is not touched here; set in the environment of this command it reaches both jobs, as ARK_EMB_INPUT_SIZE does. --datasets TAIXRAY needs it, because TAIX-Ray's images and label
+#   files are where base/datasets_config.yaml's TAIXRay entry puts them, /scratch/jdefili4/datasets-new/TAIX-Ray as shipped (one user's scratch, owner-only: the README says what another user does), which no launcher mounts by default
+#   (run_emb_gaudi.sh's header has the reason):
+#   DATA_BIND="/data:/data:ro,/scratch/jdefili4/datasets-new:/scratch/jdefili4/datasets-new:ro" ARK_EMB_INPUT_SIZE=512 PROBE_X_TIME=01:00:00 PROBE_FIT_TIME=02:00:00 ./submit_probe_class.sh <tag>_taixray <model> <weights> <normalization> --datasets TAIXRAY
 #   ARK_EMB_FIT_RESUME is unset here: a pair is always a fresh fit (to finish a fit that stopped half way, submit run_emb_fit_class.sh alone with it set).
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1   # the repo root: the launchers sit here and sbatch is given their names
 if [[ -n ${SLURM_JOB_ID:-} ]]; then

@@ -5,11 +5,13 @@ Run from base/:  python -m ark_finetune.test_ark_finetune   (or python ark_finet
 (b) the real list files of the four datasets parse with the vendored official classes (counts printed)
 (c) full official train lists and no validation split: VinDrCXR's 15,000, no 90/10 files, no val_list anywhere
 (d) the four dataset modules against the official classes: labels, embeddings, the alignment guard, smoke truncation, CheXpert's 5 scored findings
+(d4) TAIXRAY (opt-in): the label files of taix_unpack_eval.sh as eight binary findings (grade > 0) with the raw grades kept, every refusal (a label file of another split than the one asked for included), the 16-bit PNG read equal to the SSL trainer's, the 8-bit datasets' read unchanged
 (e) the probe as shipped: defaults, float64, sigmoid + BCELoss, Adam, batch 512, shuffled train loader, the lr that RISES (1e-4 -> 0.00626 at epoch 50 -> 0.02409 at epoch 99), CPU only
 (f) best epoch on TEST per run: the peak epoch is the one reported, ties keep the earlier, a run without a defined mAUC is refused
 (g) the runner: 10 runs, seeds, the JSON and its cross-checks, flags, refusals and the preflight order, the JSON written whole or not at all
 (h) the extractor on tiny synthetic images and a tiny ViT (train and test only, one center crop each), and the normalization presets
 (i) extractor -> runner on the four official list formats
+(i1b) TAIXRAY through the extractor and the runner: 16-bit PNGs, label files in taix_unpack_eval.sh's format, the raw grades cached, eight AUCs, the val file never read, the train and test files swapped refused
 (i3) the Ark+ Swin teacher through the extractor: a lab-style checkpoint's TEACHER (not its student) is embedded before the projector, 1024-d for swin_base; a model that does not fit the file (embed_dim, window, input size),
      a file with no teacher or with a missing block weight, a model name the loader does not build, a ViT's file under a swin name, and a crop that is not the Swin's size are refused; a file with no attn_mask buffers
      loads and says its input size is unverified
@@ -51,9 +53,10 @@ from PIL import Image
 import models
 from accelerator import Accelerator
 from models import ArkViT, ArkViTDinoV2, DINOV2_VITL16_KWARGS, DINOV3_VITB16_KWARGS
+from ssl_dinov3.data import SSLImageDataset
 from ssl_dinov3.model import export_backbone
 from utils import get_config
-from ark_finetune import dataloader, dataset_lists, embedding_mode, extract_embeddings
+from ark_finetune import dataloader, dataset_lists, embedding_mode, extract_embeddings, taixray
 from ark_linearprobe import embedding_datasets, main_linearprobing, run_linearprobe
 from ark_linearprobe import utils as lp_utils
 
@@ -456,6 +459,213 @@ with tempfile.TemporaryDirectory() as tmp:
     assert embedding_datasets.evaluable_columns("ChestXray14", np.array([[0] * 14, [1] * 14])) == (None, [])  # everything scoreable: the shipped path, columns=None
     print("OK (d3) scoring needs both classes: of the columns a dataset is scored on (CheXpert: its 5 findings first), those that are all positive or all negative among the evaluated test images are dropped "
           "and recorded (the shipped test() gives the all-positive one a NaN AUC and so a NaN mAUC), the rest are scored; a dataset with no column left, or no test image, is refused with a message before anything is fitted")
+
+
+# (d4) TAIXRAY, opt-in: taix_unpack_eval.sh's label files read as eight binary findings with the raw grades kept; the 16-bit PNGs read with the SSL trainer's rule; the 8-bit datasets read as before -----------------
+# the header of taix_unpack_eval.sh (["Path"] + COLS, lines 38-41 and 138) and its row shape (csv.writer's CRLF rows, a null an empty field), typed out here and not taken from the code under test
+TAIX_HEADER = ["Path", "UID", "Split", "Fold", "PatientID", "PhysicianID", "StudyDate", "Age", "Sex", "HeartSize", "PulmonaryCongestion", "PleuralEffusion_Right", "PleuralEffusion_Left",
+               "PulmonaryOpacities_Right", "PulmonaryOpacities_Left", "Atelectasis_Right", "Atelectasis_Left"]
+TAIX_TOP = dict(zip(TAIX_HEADER[9:], (3, 4, 4, 4, 4, 4, 4, 4)))  # the highest grade of each finding: HeartSize 0-3, the other seven 0-4
+TAIX_ORDER = ["HeartSize", "PulmonaryCongestion", "PleuralEffusion_Left", "PleuralEffusion_Right", "PulmonaryOpacities_Left", "PulmonaryOpacities_Right", "Atelectasis_Left", "Atelectasis_Right"]  # the probe's outputs: Left before Right (the file lists Right first)
+TAIX_PROTOCOL = ("TAIX-Ray: 8 binary findings (present = grade above 0; HeartSize graded 0-3, the other seven 0-4), official train split for training, official test split for scoring, "
+                 "the val split is not used, test mAUC = mean AUROC over the 8")
+# the folder a container has to mount to read TAIX-Ray from a data_dir: the one that holds the TAIX-Ray folder, the data_dir's grandparent (datasets-new). For TAIXRAY that data_dir is the TAIXRay entry's in datasets_config.yaml (the SSL
+# trainer's), read from the file here, so what the README, the launcher headers and the error hint say is held to the file and not to a copy of it
+taix_mount_of = lambda data_dir: os.path.dirname(os.path.dirname(os.path.normpath(data_dir)))
+TAIX_MOUNT = taix_mount_of(real_config["TAIXRay"]["data_dir"])  # /scratch/jdefili4/datasets-new as shipped
+TAIX_BIND = "/data:/data:ro,{0}:{0}:ro".format(TAIX_MOUNT)  # DATA_BIND replaces nvidia.sh's /data mount, so /data is listed again
+
+
+def taix_grades(n, shift=0):
+    """n rows of {finding: grade}: row i's finding k (in the file's column order) is (i + k + shift) mod (its highest grade + 1), so with 10 rows every finding takes each of its grades and no two columns agree throughout."""
+    return [{f: (i + k + shift) % (TAIX_TOP[f] + 1) for k, f in enumerate(TAIX_HEADER[9:])} for i in range(n)]
+
+
+def write_taix_labels(path, grades, split="train", prefix="u", header=None, mutate=None):
+    """A label file as taix_unpack_eval.sh writes it: the header, then per row Path (<prefix><i>.png), UID, Split, Fold, PatientID, PhysicianID (null), StudyDate, Age (null on odd rows), Sex and the grades in the file's
+    column order. `header` replaces the header, `mutate(rows)` edits the rows before they are written."""
+    rows = [["{}{}.png".format(prefix, i), "{}{}".format(prefix, i), split, i % 5, "patient{}".format(i), None, "2020-01-0{}".format(1 + i % 9), None if i % 2 else 61.0, "F" if i % 2 else "M"]
+            + [g[f] for f in TAIX_HEADER[9:]] for i, g in enumerate(grades)]
+    if mutate:
+        mutate(rows)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)  # as the script: a None is an empty field, rows end in \r\n
+        writer.writerow(TAIX_HEADER if header is None else header)
+        writer.writerows(rows)
+    return path
+
+
+def taixray_unit_checks(tmp):
+    png = os.path.join(tmp, "png512")
+    os.makedirs(png)
+    grades = taix_grades(10)
+    train_file = write_taix_labels(os.path.join(tmp, "taix_train_labels.csv"), grades)
+    load = lambda path=train_file, images=png, augment=None, split="train": quiet(lambda: taixray.TAIXRayImages(images, path, augment, split=split))  # (dataset, stdout, stderr)
+    dataset, _, err = load()
+    expected = [[g[f] for f in TAIX_ORDER] for g in grades]
+    assert dataset_lists.NAMES == dataset_lists.DATASETS + ("CANDIDPTX", "TAIXRAY") and dataset_lists.dataset_class("TAIXRAY") is taixray.TAIXRayImages
+    assert embedding_datasets.EMBEDDING_MODULES["TAIXRAY"].NAME == "TAIXRAY" and issubclass(embedding_datasets.EMBEDDING_MODULES["TAIXRAY"], embedding_datasets.EmbeddingDataloaderModule)
+    assert taixray.FINDINGS == tuple(TAIX_ORDER) and [taixray.GRADE_MAX[f] for f in TAIX_ORDER] == [TAIX_TOP[f] for f in TAIX_ORDER]
+    assert len(dataset) == 10 and dataset.img_list == [os.path.join(png, "u{}.png".format(i)) for i in range(10)] and dataset.augment is None
+    assert dataset.grades.dtype == np.int8 and dataset.grades.tolist() == expected  # the raw grades, the columns found by name (the file lists Right first) and held in the probe's order
+    assert {g for row in expected for g in row} == {0, 1, 2, 3, 4} and {row[0] for row in expected} == {0, 1, 2, 3}  # the fixture uses every grade, and HeartSize stops at 3
+    assert dataset.img_label == [[int(grade > 0) for grade in row] for row in expected] and all(type(v) is int for row in dataset.img_label for v in row)  # present = grade above 0, in all eight columns
+    # the binarisation by scale, one finding at a time: HeartSize 0 normal -> 0 and 1 borderline, 2 enlarged, 3 massively enlarged -> 1; the others 0 none -> 0 and 1 questionable up to 4 severe -> 1; only that column
+    singles = [(f, g) for f in TAIX_ORDER for g in range(TAIX_TOP[f] + 1)]
+    only = write_taix_labels(os.path.join(tmp, "singles.csv"), [dict({x: 0 for x in TAIX_ORDER}, **{f: g}) for f, g in singles])
+    assert len(singles) == 4 + 7 * 5
+    for (f, g), label in zip(singles, load(only)[0].img_label):
+        assert label == [int(g > 0 and x == f) for x in TAIX_ORDER], (f, g, label)
+    floated = write_taix_labels(os.path.join(tmp, "floated.csv"), grades, mutate=lambda rows: [row.__setitem__(slice(9, None), ["{}.0".format(v) for v in row[9:]]) for row in rows])
+    assert load(floated)[0].grades.tolist() == expected  # a source column that was a float one is written 2.0: the same grade
+    blanked, lines = os.path.join(tmp, "blanked.csv"), open(train_file, newline="").read().split("\r\n")  # the script's CRLF rows
+    with open(blanked, "w", newline="") as f:
+        f.write("\r\n".join(lines[:4] + [""] + lines[4:]))
+    assert load(blanked)[0].grades.tolist() == expected  # a blank line inside the file is skipped, as the official classes skip one
+    # the size warning names both numbers, per split; a file of the official size says nothing
+    assert err == "TAIXRAY: WARNING {}: expected 137593 rows for the train split (the data descriptor's Table 2), found 10\n".format(train_file), err
+    message = load(write_taix_labels(os.path.join(tmp, "test.csv"), grades, split="test"), split="test")[2]
+    assert "expected 42928 rows for the test split" in message and message.endswith("found 10\n"), message
+    big = write_taix_labels(os.path.join(tmp, "taix_test_labels.csv"), taix_grades(42928, shift=3), split="test")
+    biggest, _, err = load(big, split="test")
+    assert err == "" and len(biggest) == 42928 and biggest.grades.shape == (42928, 8)
+    # refusals, each before any image is read: a missing label file, a header without the expected columns, a grade out of range or not whole, a short row, a Path that is not a file name, rows of two splits, no rows
+    nowhere = os.path.join(tmp, "nowhere.csv")
+    message = rejects(FileNotFoundError, lambda: load(nowhere), "TAIXRAY label file {} not found".format(nowhere))
+    bind_for = lambda images: 'DATA_BIND="/data:/data:ro,{0}:{0}:ro"'.format(taix_mount_of(images))  # what the hint says for an images directory: the bind that mounts the folder holding its parent
+    assert bind_for(png) in message and "taix_unpack_eval.sh" in message and "$USER" not in message
+    bad = os.path.join(tmp, "bad.csv")
+    renamed = lambda old, new: [new if c == old else c for c in TAIX_HEADER]
+    for header, named in ((TAIX_HEADER[:-1], "['Atelectasis_Left']"), (TAIX_HEADER[1:], "['Path']"), (renamed("Split", "split"), "['Split']"), (renamed("HeartSize", "Heart size"), "['HeartSize']"),
+                          (renamed("PleuralEffusion_Left", "PleuralEffusion_L"), "['PleuralEffusion_Left']"), ([], "['Path', 'Split', 'HeartSize', ")):
+        rejects(ValueError, lambda: load(write_taix_labels(bad, grades, header=header)), "{}: the header lacks the columns {}".format(bad, named))
+    open(bad, "w").close()  # an empty file has no header
+    rejects(ValueError, lambda: load(bad), "{}: the header lacks the columns ['Path', 'Split', 'HeartSize', ".format(bad))
+
+    def cell(finding, text):
+        def put(rows):
+            rows[4][TAIX_HEADER.index(finding)] = text  # row 4 is line 6: the header is line 1
+        return put
+
+    for finding, text in (("HeartSize", "4"), ("HeartSize", "9"), ("PleuralEffusion_Left", "5"), ("Atelectasis_Right", "-1"), ("PulmonaryCongestion", "1.5"), ("PulmonaryOpacities_Left", "abc"),
+                          ("PulmonaryOpacities_Right", ""), ("Atelectasis_Left", "nan"), ("HeartSize", "2.5"), ("PleuralEffusion_Right", "3.00"), ("PulmonaryCongestion", "1e0"), ("HeartSize", " 1"), ("HeartSize", "True")):
+        rejects(ValueError, lambda: load(write_taix_labels(bad, grades, mutate=cell(finding, text))), "{} line 6: {} grade {!r} is not a whole number from 0 to {}".format(bad, finding, text, TAIX_TOP[finding]))
+    rejects(ValueError, lambda: load(write_taix_labels(bad, grades, mutate=lambda rows: rows.__setitem__(2, rows[2][:-1]))), "{} line 4: 16 fields, the header has 17".format(bad))
+    for name in ("sub/u1.png", ""):
+        rejects(ValueError, lambda: load(write_taix_labels(bad, grades, mutate=lambda rows: rows[1].__setitem__(0, name))), "{} line 3: Path {!r} is not a bare file name".format(bad, name))
+    rejects(ValueError, lambda: load(write_taix_labels(bad, grades, mutate=lambda rows: rows[3].__setitem__(2, "val"))), "{}: its Split column holds ['train', 'val'], but a label file holds one of train/val/test alone".format(bad))
+    rejects(ValueError, lambda: load(write_taix_labels(bad, grades, split="validation")), "its Split column holds ['validation']")
+    rejects(ValueError, lambda: load(write_taix_labels(bad, [])), "{}: no rows".format(bad))
+    # a transform means the images will be read: all of them must be there, found with one listing of the directory, before the first is opened; augment=None (the fit's parse) touches neither an image nor the directory
+    rng = np.random.RandomState(0)
+    for i in range(10):
+        Image.fromarray(rng.randint(0, 4096, (37, 53)).astype(np.uint16)).save(os.path.join(png, "u{}.png".format(i)))
+    keep = lambda image: image
+    assert len(load(augment=keep)[0]) == 10
+    os.rename(os.path.join(png, "u7.png"), os.path.join(tmp, "u7.png"))
+    message = rejects(FileNotFoundError, lambda: load(augment=keep), "TAIXRAY: 1 of the 10 listed images are not in {} (first ['u7.png'])".format(png))
+    assert bind_for(png) in message and "$USER" not in message
+    nodir = os.path.join(tmp, "no_such_images_dir")
+    message = rejects(FileNotFoundError, lambda: load(images=nodir, augment=keep), "TAIXRAY images directory {} cannot be listed".format(nodir))
+    assert bind_for(nodir) in message and "$USER" not in message
+    assert len(load(images=nodir)[0]) == 10
+    os.rename(os.path.join(tmp, "u7.png"), os.path.join(png, "u7.png"))
+    # the split asked for is the caller's, never the file name's. A label file of another split is refused, naming the file, both splits and the line of its first row, before the images directory is looked at: the train and
+    # test files swapped or misnamed cannot train the probe on the test images and score it on the train ones. The val file is no split of the probe's, and no caller can leave the split out
+    swap = os.path.join(tmp, "swap")
+    os.makedirs(swap)
+    named_train = write_taix_labels(os.path.join(swap, "taix_train_labels.csv"), taix_grades(10, shift=1), split="test", prefix="v")  # the file called train holds the test rows ...
+    named_test = write_taix_labels(os.path.join(swap, "taix_test_labels.csv"), grades, split="train")  # ... and the one called test holds the train rows
+    for path, asked, found in ((named_train, "train", "test"), (named_test, "test", "train")):
+        message = rejects(ValueError, lambda: load(path, split=asked), "{} line 2: its Split is '{}', but the '{}' split was asked for".format(path, found, asked))
+        assert "swapped or misnamed" in message
+        rejects(ValueError, lambda: load(path, images=nodir, augment=keep, split=asked), "its Split is '{}', but the '{}' split was asked for".format(found, asked))  # not the missing images directory: this comes first
+    assert load(named_train, split="test")[0].grades.shape == (10, 8) and load(named_test, split="train")[0].grades.tolist() == expected  # the same files asked for the split they hold: the name plays no part
+    val_file = write_taix_labels(os.path.join(tmp, "taix_val_labels.csv"), grades, split="val", prefix="w")
+    for asked in ("train", "test"):  # the val file given as the train or the test list
+        rejects(ValueError, lambda: load(val_file, split=asked), "{} line 2: its Split is 'val', but the '{}' split was asked for".format(val_file, asked))
+    for asked in ("val", "validation", "", None):  # and val is not a split that can be asked for
+        rejects(ValueError, lambda: load(val_file, split=asked), "TAIXRAY split {!r}: the probe reads train and test only, never the val split".format(asked))
+    rejects(TypeError, lambda: taixray.TAIXRayImages(png, train_file, None), "split")  # no default, and keyword only
+    rejects(TypeError, lambda: taixray.TAIXRayImages(png, train_file, None, "train"), "positional")
+    rejects(ValueError, lambda: quiet(lambda: embedding_datasets.test_labels("TAIXRAY", png, named_test)), "its Split is 'train', but the 'test' split was asked for")  # the fit's test labels ask for the test split
+    assert quiet(lambda: embedding_datasets.test_labels("TAIXRAY", png, named_train))[0].shape == (10, 8)
+    assert dataset_lists.dataset_kwargs("TAIXRAY", "train") == {"split": "train"} and dataset_lists.dataset_kwargs("TAIXRAY", "test") == {"split": "test"}
+    assert all(dataset_lists.dataset_kwargs(n, s) == {} for n in NAMES + ("CANDIDPTX",) for s in ("train", "test"))  # the four and CANDIDPTX are built with the keywords they always were
+    # the 16-bit read: the SSL trainer's rule (per-image min-max to 0-255), the same array as the trainer's own read of the file and as the rule written out, and not what PIL's convert("L") gives
+    hot = rng.randint(0, 1001, (37, 53)).astype(np.uint16)
+    hot[3, 5] = 4095  # 12-bit content in a 16-bit PNG, most of the range unused and one hot pixel: the stretch is set by it, as the trainer's is
+    bulk = rng.randint(0, 4096, (37, 53)).astype(np.uint16)
+    bulk[0, :2] = 0, 4095
+    flat = np.full((37, 53), 1234, np.uint16)
+    eight = rng.randint(0, 256, (37, 53), dtype=np.uint8)
+    for name, array in (("hot", hot), ("bulk", bulk), ("flat", flat), ("eight", eight)):
+        Image.fromarray(array).save(os.path.join(png, name + ".png"))
+    modes = [Image.open(os.path.join(png, name + ".png")).mode for name in ("hot", "bulk", "flat", "eight")]
+    assert modes[0] in ("I;16", "I") and modes[:3] == [modes[0]] * 3 and modes[3] == "L"
+
+    def stretch(a):
+        a = a.astype(np.float64)
+        return np.zeros(a.shape, np.uint8) if a.max() == a.min() else ((a - a.min()) / (a.max() - a.min()) * 255).astype(np.uint8)  # the trainer's rule written out: divide, then multiply
+
+    trainer = lambda path: np.asarray(SSLImageDataset([path], lambda image: image)[0][0])  # the SSL trainer's own read, through its dataset class
+    for name, array in (("hot", hot), ("bulk", bulk), ("flat", flat)):
+        path = os.path.join(png, name + ".png")
+        ours, clipped = np.asarray(taixray.grey_read(path)), np.asarray(Image.open(path).convert("L"))
+        assert ours.dtype == np.uint8 and ours.shape == array.shape and np.array_equal(ours, trainer(path)) and np.array_equal(ours, stretch(array)), name
+        if name == "flat":
+            assert not ours.any()  # a flat image is all 0, as the trainer's
+            continue
+        assert (ours.min(), ours.max()) == (0, 255) and (ours == 255).mean() < 0.02, name  # stretched over the whole range, nothing clipped
+        assert (clipped == 255).mean() > 0.5 and not np.array_equal(ours, clipped), name  # convert("L") turns every value of 255 or more white: not what the trainer saw
+        if name == "hot":
+            assert ours[3, 5] == 255 and np.sort(ours.ravel())[-2] <= 62  # the outlier sets the scale, 1000 / 4095 of it at most: no percentile clip crept in
+    # an item: the grey on three channels, the float32 label; an 8-bit image is read as the official classes read any 8-bit image
+    decode = write_taix_labels(os.path.join(tmp, "decode.csv"), taix_grades(4), mutate=lambda rows: [row.__setitem__(0, name + ".png") for row, name in zip(rows, ("hot", "bulk", "flat", "eight"))])
+    reads = load(decode)[0]
+    for i, name in enumerate(("hot", "bulk", "flat", "eight")):
+        image, label = reads[i]
+        grey = np.asarray(taixray.grey_read(os.path.join(png, name + ".png")))
+        assert image.mode == "RGB" and np.array_equal(np.asarray(image), np.repeat(grey[..., None], 3, axis=-1)), name
+        assert label.dtype == torch.float32 and label.tolist() == [float(v) for v in reads.img_label[i]], name
+    eight_path = os.path.join(png, "eight.png")
+    assert np.array_equal(np.asarray(reads[3][0]), np.asarray(Image.open(eight_path).convert("RGB"))) and taixray.grey_read(eight_path).tobytes() == eight.tobytes()
+    # the four 8-bit datasets are read as before: dataset_class hands back the vendored official class itself, and its item is the plain convert("RGB") of the file
+    data8 = {name: make_dataset(tmp, name, {"train": 3, "test": 3}, images=True) for name in NAMES}
+    for name in NAMES:
+        assert dataset_lists.dataset_class(name) is getattr(dataloader, name), name
+        official = official_dataset(name, data8[name], "train")
+        for i in range(len(official)):
+            image = official[i][0]
+            assert image.mode == "RGB" and np.array_equal(np.asarray(image), np.asarray(Image.open(official.img_list[i]).convert("RGB"))), (name, i)
+    # the entry: the SSL trainer's TAIXRay entry gives the images directory and where the label files are; it is not changed, and no val file is named
+    entry = dataset_lists.dataset_entry("TAIXRAY")
+    ssl_entry = real_config["TAIXRay"]
+    folder = os.path.dirname(ssl_entry["train_list"])
+    assert entry == {"data_dir": ssl_entry["data_dir"], "train_list": os.path.join(folder, "taix_train_labels.csv"), "test_list": os.path.join(folder, "taix_test_labels.csv"), "diseases": TAIX_ORDER}, entry
+    assert "val_list" not in entry and "taix_val_labels.csv" not in str(entry) and set(ssl_entry) == {"data_dir", "train_list", "task_type"} and ssl_entry["train_list"].endswith("/taix_train.csv")
+    given = {"TAIXRay": {"data_dir": "/x/png512/", "train_list": "/x/taix_train.csv", "task_type": "pretraining only"}}
+    assert dataset_lists.dataset_entry("TAIXRAY", given) == {"data_dir": "/x/png512/", "train_list": "/x/taix_train_labels.csv", "test_list": "/x/taix_test_labels.csv", "diseases": TAIX_ORDER}
+    given["TAIXRay"]["train_list"] = "dataset/TAIXRay/taix_train.csv"  # a relative list is relative to base/, as the others'
+    assert dataset_lists.dataset_entry("TAIXRAY", given)["train_list"] == os.path.join(BASE, "dataset", "TAIXRay", "taix_train_labels.csv")
+    # the bind the errors print is worked out from the images directory the caller gave (the entry's data_dir in a real run) and is not written out: the yaml's own entry gives the yaml's folder, any other entry gives its own
+    shipped_hint = taixray.mount_hint(real_config["TAIXRay"]["data_dir"])
+    assert 'DATA_BIND="{}"'.format(TAIX_BIND) in shipped_hint and "$USER" not in shipped_hint
+    for owner in ("nobody_x", "nobody_y"):
+        given = {"TAIXRay": {"data_dir": "/scratch/{}/datasets-new/TAIX-Ray/png512/".format(owner), "train_list": "/scratch/{}/datasets-new/TAIX-Ray/taix_train.csv".format(owner), "task_type": "pretraining only"}}
+        theirs = dataset_lists.dataset_entry("TAIXRAY", given)
+        message = rejects(FileNotFoundError, lambda: load(theirs["train_list"], images=theirs["data_dir"]), "TAIXRAY label file /scratch/{}/datasets-new/TAIX-Ray/taix_train_labels.csv not found".format(owner))
+        assert 'DATA_BIND="/data:/data:ro,/scratch/{0}/datasets-new:/scratch/{0}/datasets-new:ro"'.format(owner) in message and "jdefili4" not in message and "$USER" not in message, message
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    taixray_unit_checks(tmp)
+print("OK (d4) TAIXRAY (opt-in): taix_unpack_eval.sh's label files give 8 binary findings (grade above 0: HeartSize 0-3 and the other seven 0-4 on every step of their scales), the columns found by name and held "
+      "Left before Right, the raw grades kept as int8 (2.0 as well as 2, a blank line skipped); a label file of another split than the one asked for (the train and test files swapped, whatever they are called, or the val file; "
+      "no default for the split, val not askable) is refused with the file, both splits and the line, before the images directory is looked at; a missing file, a header without the columns, a grade out of range or not whole, a short row, a bad Path, mixed splits, no rows, and a missing image "
+      "or directory (with a transform) are refused with the cause named, a size off the official one is a WARNING naming both numbers; a 16-bit PNG is read as the SSL trainer's own dataset reads it (per-image min-max, the "
+      "hot-pixel and flat cases included) and not as convert('L') clips it; an 8-bit one as the official classes read it; the four datasets still get the vendored classes; the entry comes from the SSL TAIXRay entry, "
+      "which is unchanged, and names no val file")
 
 
 # (e) the probe as shipped ---------------------------------------------------------------------------------------------------
@@ -1338,7 +1548,8 @@ try:
         # CLI errors
         for bad, expected in ((["--tag", "../x"], "letters, digits"), (["--tag", "a b"], "letters, digits"), (["--tag", "ok", "--max_images", "0"], "--max_images must be at least 1"),
                               (["--tag", "ok", "--weights", os.path.join(tmp, "missing.pth")], "is not a file"), (["--tag", "ok", "--datasets", "Shenzhen"], "invalid choice"),
-                              (["--tag", "ok", "--datasets", "MIMIC", "MIMIC"], "lists a dataset twice")):
+                              (["--tag", "ok", "--datasets", "TAIXRay"], "invalid choice"), (["--tag", "ok", "--datasets", "taixray"], "invalid choice"), (["--tag", "ok", "--datasets", "TAIX-Ray"], "invalid choice"),
+                              (["--tag", "ok", "--datasets", "TAIXRAY", "TAIXRAY"], "lists a dataset twice"), (["--tag", "ok", "--datasets", "MIMIC", "MIMIC"], "lists a dataset twice")):
             argv = ["--model", "m", "--weights", weights, "--normalization", "imagenet", "--embeddings_root", root] + bad
             _, _, usage = quiet(lambda: rejects(SystemExit, lambda: extract_embeddings.parse_args(argv)))
             assert expected in usage, (bad, usage)
@@ -1349,6 +1560,13 @@ try:
         assert abbreviated.datasets == list(NAMES) == list(dataset_lists.DATASETS) and run_linearprobe.parse_args(["--tag", "ok"]).datasets == list(NAMES)
         assert extract_embeddings.parse_args(["--tag", "ok", "--model", "m", "--weights", weights, "--normalization", "imagenet", "--datasets", "CANDIDPTX"]).datasets == ["CANDIDPTX"]
         assert run_linearprobe.parse_args(["--tag", "ok", "--datasets", "MIMIC", "CANDIDPTX"]).datasets == ["MIMIC", "CANDIDPTX"]
+        # so is TAIXRAY: named, never by default, and only in this spelling (the SSL trainer's own name for it, TAIXRay, is not one of the probe's)
+        assert extract_embeddings.parse_args(["--tag", "ok", "--model", "m", "--weights", weights, "--normalization", "imagenet", "--datasets", "TAIXRAY"]).datasets == ["TAIXRAY"]
+        assert run_linearprobe.parse_args(["--tag", "ok", "--datasets", "TAIXRAY"]).datasets == ["TAIXRAY"] and "TAIXRAY" not in abbreviated.datasets
+        assert run_linearprobe.parse_args(["--tag", "ok", "--datasets", "MIMIC", "CANDIDPTX", "TAIXRAY"]).datasets == ["MIMIC", "CANDIDPTX", "TAIXRAY"]
+        for wrong in ("TAIXRay", "taixray", "TAIX-Ray", "TAIX", "CANDIDPTX2"):
+            _, _, usage = quiet(lambda: rejects(SystemExit, lambda: run_linearprobe.parse_args(["--tag", "ok", "--datasets", wrong])))
+            assert "invalid choice: '{}'".format(wrong) in usage and "TAIXRAY" in usage.split("invalid choice")[1], (wrong, usage)  # the refusal lists TAIXRAY among the choices (quoted or not, by Python version)
 
         # (i) extractor -> runner: the cache the extractor wrote is what the probe reads (paths, meta, shapes) in all four list formats
         run_linearprobe.dataset_entry = lambda name: entries[name]
@@ -1424,6 +1642,101 @@ try:
             del entries["CANDIDPTX"]
         print("OK (i1) CANDIDPTX through the extractor and the runner, only when named: one embedding per image (an image's second mask row adds none), each the probe's transform of the dense probe's DICOM read "
               "through the reference ViT; labels [1] when any row has a mask; one class, whose AUROC is the mAUC; the PROBE line; a CANDIDPTX cache under a tag is held to the tag's provenance")
+
+        # (i1b) TAIXRAY, opt-in, extractor -> runner: label files in taix_unpack_eval.sh's format, 16-bit PNGs (12-bit content, the first of each split with a hot pixel) in png512/, and a val label file that is not a label file at all,
+        # which the probe must never read
+        taix = os.path.join(tmp, "taix")
+        taix_png = os.path.join(taix, "png512")
+        os.makedirs(taix_png)
+        taix_sizes, taix_stems = {"train": 7, "test": 6}, {"train": "tr", "test": "te"}
+        taix_grades_of = {"train": taix_grades(7), "test": taix_grades(6, shift=1)}
+        taix_entry = entries["TAIXRAY"] = {"data_dir": taix_png + os.sep, "train_list": os.path.join(taix, "taix_train_labels.csv"), "test_list": os.path.join(taix, "taix_test_labels.csv"), "diseases": TAIX_ORDER}
+        taix_rng = np.random.RandomState(7)
+        for split, n in taix_sizes.items():
+            write_taix_labels(taix_entry[split + "_list"], taix_grades_of[split], split=split, prefix=taix_stems[split])
+            for i in range(n):
+                pixels = taix_rng.randint(0, 4096 if i else 1000, (40, 52)).astype(np.uint16)  # 12-bit content in a 16-bit PNG; the first image has most of the range unused and one hot pixel
+                if i == 0:
+                    pixels[2, 3] = 4095
+                Image.fromarray(pixels).save(os.path.join(taix_png, "{}{}.png".format(taix_stems[split], i)))
+        with open(os.path.join(taix, "taix_val_labels.csv"), "w") as f:
+            f.write("this is not a label file\n")
+        run_linearprobe.dataset_entry = lambda name: entries[name]
+        try:
+            _, out, _ = extract("tiny", "--datasets", "TAIXRAY")  # beside the other caches of tag tiny
+            folder = os.path.join(root, "tiny", "TAIXRAY")
+            assert sorted(os.listdir(folder)) == sorted(CACHE_FILES + ["train_grades.npy", "test_grades.npy"]) and re.fullmatch(r"EMB tiny TAIXRAY: train 7 / test 6, dim 1536, \d+s\n", out), out
+            transform = dataloader.build_transform_classification(normalize="imagenet", crop_size=32, resize=36, mode="valid")
+            for split, n in taix_sizes.items():
+                npy, paths = embedding_mode.split_files(folder, split)
+                listed = [os.path.join(taix_png, "{}{}.png".format(taix_stems[split], i)) for i in range(n)]
+                assert embedding_mode.read_paths(paths) == listed, split
+                with torch.no_grad():  # each image as the SSL trainer's own dataset reads it, gray on three channels, through the probe's transform and the reference ViT
+                    expected = np.concatenate([reference.generate_embeddings(transform(SSLImageDataset([p], lambda image: image)[0][0].convert("RGB"))[None], after_proj=False).numpy() for p in listed])
+                assert np.allclose(np.load(npy), expected.astype(np.float16), atol=2e-3, rtol=2e-3), split
+                stored = np.load(embedding_mode.grades_file(folder, split))  # the raw grades: row i is img_list[i], the columns are meta.json's grade_columns
+                assert stored.dtype == np.int8 and stored.tolist() == [[g[f] for f in TAIX_ORDER] for g in taix_grades_of[split]], split
+            meta = json.load(open(os.path.join(folder, "meta.json")))
+            mimic_meta = json.load(open(os.path.join(root, "tiny", "MIMIC", "meta.json")))
+            assert meta["dataset"] == "TAIXRAY" and meta["counts"] == taix_sizes and meta["grade_columns"] == TAIX_ORDER and meta["data_dir"] == taix_entry["data_dir"] and meta["transform"] == mimic_meta["transform"]
+            assert "grade_columns" not in mimic_meta and not [f for f in os.listdir(os.path.join(root, "tiny", "MIMIC")) if "grades" in f]  # the four have neither
+            module, _, _ = quiet(lambda: embedding_datasets.TAIXRAY_DataloaderModule(folder, taix_entry["train_list"], taix_entry["test_list"], taix_png, num_workers=0))
+            for split in ("train", "test"):  # the labels the fit serves are the stored grades above 0, row for row
+                assert getattr(module, split + "_set").parsed.img_label == (np.load(embedding_mode.grades_file(folder, split)) > 0).astype(int).tolist(), split
+            assert module.test_columns is None and module.dropped_columns == [] and module.train_set[3][1].tolist() == [float(taix_grades_of["train"][3][f] > 0) for f in TAIX_ORDER]
+            with short_epochs(2):
+                out, _ = run_fit("tiny", root, res_root, "--datasets", "TAIXRAY", "--runs", "2")  # the four's results under tiny do not stop it; their caches and this one pass the provenance check together
+            result = load_result(res_root, "tiny", "TAIXRAY")
+            assert result["classes"] == TAIX_ORDER and result["n"] == taix_sizes and result["dropped_columns"] == [] and result["warnings"] == [] and len(result["per_run"]) == 2
+            assert result["protocol"] == protocol_of(2, runs=2) + "; " + TAIX_PROTOCOL and result["flags"]["rad_dino_pretraining_overlap"] is None
+            assert all(list(r["test_AUC"]) == TAIX_ORDER and abs(r["test_mAUC"] - np.mean(list(r["test_AUC"].values()))) < 1e-12 for r in result["per_run"])  # the mAUC is the mean of the eight per-finding AUCs
+            assert list(result["test_AUC_mean"]) == TAIX_ORDER == list(result["test_AUC_std"])
+            assert re.search(r"^PROBE tiny TAIXRAY: test mAUC \d\.\d{4} \(\d\.\d{4}\) over 2 runs, best epoch on test \(as shipped\)", out, re.M), out
+            clone_cache(root, "tiny", "taix_mixed", "TAIXRAY")
+            clone_cache(root, "tiny", "taix_mixed", "MIMIC", normalization="raddino")
+            rejects(RuntimeError, lambda: run_fit("taix_mixed", root, res_root, "--datasets", "TAIXRAY", "--runs", "1"), "normalization differs")  # one tag is one backbone, TAIXRAY included
+            # a smoke cache (--max_images 3) holds the first 3 rows of each split, the grades too
+            extract("taix_smoke", "--datasets", "TAIXRAY", "--max_images", "3")
+            smoke_dir = os.path.join(root, "taix_smoke", "TAIXRAY")
+            for split in taix_sizes:
+                assert np.load(embedding_mode.grades_file(smoke_dir, split)).tolist() == [[g[f] for f in TAIX_ORDER] for g in taix_grades_of[split][:3]], split
+                assert len(embedding_mode.read_paths(embedding_mode.split_files(smoke_dir, split)[1])) == len(np.load(embedding_mode.split_files(smoke_dir, split)[0])) == 3, split
+            assert json.load(open(os.path.join(smoke_dir, "meta.json")))["max_images"] == 3
+            # the train and test label files swapped, as a rename of the two would leave them (here the entry's two lists exchanged): refused, naming the file, both splits and the line, before an image is opened, the weights
+            # are hashed, the model is loaded or any cache directory exists; the fit and the dataset module refuse the same swap before they fit or write anything. The spies fire in a normal run and in none of the refused ones
+            seen = []
+            stock_calls = (extract_embeddings.load_backbone, extract_embeddings.sha256_file, taixray.grey_read)
+            extract_embeddings.load_backbone = lambda *a, **k: seen.append("model") or stock_calls[0](*a, **k)
+            extract_embeddings.sha256_file = lambda *a, **k: seen.append("weights") or stock_calls[1](*a, **k)
+            taixray.grey_read = lambda *a, **k: seen.append("image") or stock_calls[2](*a, **k)
+            swapped = dict(taix_entry, train_list=taix_entry["test_list"], test_list=taix_entry["train_list"])
+            try:
+                extract("taix_spied", "--datasets", "TAIXRAY", "--max_images", "2")
+                assert sorted(set(seen)) == ["image", "model", "weights"], seen
+                del seen[:]
+                entries["TAIXRAY"] = swapped
+                message = rejects(ValueError, lambda: extract("taix_swapped", "--datasets", "TAIXRAY"), "{} line 2: its Split is 'test', but the 'train' split was asked for".format(taix_entry["test_list"]))
+                assert "swapped or misnamed" in message and seen == [] and not os.path.exists(os.path.join(root, "taix_swapped")), (message, seen)
+                clone_cache(root, "tiny", "taix_swapfit", "TAIXRAY")  # a finished cache under a tag with no results: only the swapped lists are wrong
+                rejects(ValueError, lambda: run_fit("taix_swapfit", root, res_root, "--datasets", "TAIXRAY", "--runs", "1"), "{} line 2: its Split is 'train', but the 'test' split was asked for".format(taix_entry["train_list"]))
+                assert not os.path.exists(os.path.join(res_root, "taix_swapfit"))
+                rejects(ValueError, lambda: quiet(lambda: embedding_datasets.TAIXRAY_DataloaderModule(folder, swapped["train_list"], swapped["test_list"], taix_png, num_workers=0)),
+                        "{} line 2: its Split is 'test', but the 'train' split was asked for".format(taix_entry["test_list"]))
+            finally:
+                extract_embeddings.load_backbone, extract_embeddings.sha256_file, taixray.grey_read = stock_calls
+                entries["TAIXRAY"] = taix_entry
+            # a listed image that is not there stops the extraction before the model loads and before any cache directory exists
+            os.rename(os.path.join(taix_png, "te3.png"), os.path.join(tmp, "te3.png"))
+            rejects(FileNotFoundError, lambda: extract("taix_gone", "--datasets", "TAIXRAY"), "TAIXRAY: 1 of the 6 listed images are not in {} (first ['te3.png'])".format(taix_png + os.sep))
+            assert not os.path.exists(os.path.join(root, "taix_gone"))
+            os.rename(os.path.join(tmp, "te3.png"), os.path.join(taix_png, "te3.png"))
+        finally:
+            run_linearprobe.dataset_entry = stock_entry
+            del entries["TAIXRAY"]
+        print("OK (i1b) TAIXRAY through the extractor and the runner, only when named: one embedding per image, each the probe's transform of the SSL trainer's own read of the 16-bit PNG through the reference ViT; the raw grades "
+              "cached beside it (int8, row i = img_list[i], columns in meta.json's grade_columns) and above 0 the labels the fit serves; 8 classes, whose AUCs the mAUC averages, the protocol text saying the val split is unused; "
+              "the val label file (garbage here) never read; a TAIXRAY cache is held to the tag's provenance; the train and test label files swapped are refused by the extractor, the fit and the dataset module, naming the file, "
+              "both splits and the line, before an image is opened, the weights hashed or the model loaded; a missing image stops the extraction before the model loads")
 
         # (i2) RayDINO, a ViT-L/16: 2048-d through the extractor and the runner. The stand-in has the real width (build_omni_model fixes encoder_features=2048 for vit_large_raydino), four blocks and 32 px, and
         # its file is in DINOv2's block_chunks layout, as Meta's is (2 chunks of 2 blocks here): the loader renames the block keys and says so on stderr. Everything after it is 2048 wide
@@ -1921,7 +2234,7 @@ for text in REUSED:
 print("OK (j) drift guard, three scripts: run_emb_fit_class.sh repeats {} lines of the shared block verbatim (TAG_RE=, datasets=(, the cd to ARK_ROOT, the loop that fills taken with the two paths run_linearprobe refuses); "
       "its header is {} (no --gres, no constraint, no GPU); submit_probe_class.sh: bash -n, mode 755, no #SBATCH line".format(sum(t.count("\n") + 1 for t in REUSED), " ".join(fit_header)))
 
-FIT_USAGE = "Usage: sbatch run_emb_fit_class.sh <tag: letters, digits, . _ - only> [--datasets NAME...]   (NAME: ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX, each at most once)"
+FIT_USAGE = "Usage: sbatch run_emb_fit_class.sh <tag: letters, digits, . _ - only> [--datasets NAME...]   (NAME: ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX TAIXRAY, each at most once)"
 CACHES = tuple("embeddings/stock/{}/meta.json".format(d) for d in NAMES)  # a dataset's cache as the extractor leaves it: meta.json is the file it writes last
 FIT_CALL = FIT[CLASS_WRAPPER]  # the fit's one call, through nvidia.sh (the class image), OMP_NUM_THREADS=1 inside the container
 
@@ -1953,6 +2266,12 @@ done, calls, _, results = run_fit(["stock", "--datasets", "VinDrCXR"], files=CAC
 assert done.returncode == 0 and calls == fits("stock", ("VinDrCXR",)) and results == ["VinDrCXR.log"], (done, calls, results)
 done, calls, _, results = run_fit(["stock_candidptx", "--datasets", "CANDIDPTX"], files=("embeddings/stock_candidptx/CANDIDPTX/meta.json",))  # opt-in: fit when named, never by default (the four above)
 assert done.returncode == 0 and calls == fits("stock_candidptx", ("CANDIDPTX",)) and results == ["CANDIDPTX.log"], (done, calls, results)
+done, calls, _, results = run_fit(["stock_taixray", "--datasets", "TAIXRAY"], files=("embeddings/stock_taixray/TAIXRAY/meta.json",))  # TAIXRAY too: fit when named, never by default
+assert done.returncode == 0 and calls == fits("stock_taixray", ("TAIXRAY",)) and results == ["TAIXRAY.log"], (done, calls, results)
+done, calls, _, results = run_fit(["stock_both", "--datasets", "CANDIDPTX", "TAIXRAY"], files=("embeddings/stock_both/CANDIDPTX/meta.json", "embeddings/stock_both/TAIXRAY/meta.json"))
+assert done.returncode == 0 and sorted(calls) == fits("stock_both", ("CANDIDPTX", "TAIXRAY")) and results == ["CANDIDPTX.log", "TAIXRAY.log"], (done, calls, results)
+done, calls, _, _, tree = run_fit(["stock_taixray", "--datasets", "TAIXRAY"], files=(), snapshot=True)  # its cache is the one that counts: meta.json under TAIXRAY, named in the refusal
+assert done.returncode == 1 and calls is None and tree == {} and done.stderr.startswith("ERROR: no embeddings for tag stock_taixray: embeddings/stock_taixray/TAIXRAY/meta.json missing;"), done
 # a failed fit: exit 1 after the other three have finished, the failure named with its log
 done, calls, _, results = run_fit(["stock"], FAIL_FIT="MIMIC")
 assert done.returncode == 1 and len(calls) == 4 and "ERROR: fit MIMIC failed (see results/stock/MIMIC.log)" in done.stderr and all("fit {}: done".format(d) in done.stdout for d in NAMES if d != "MIMIC"), (done, calls)
@@ -1964,7 +2283,8 @@ for bad in ([], ["../x"], ["a b"], ["-x"], [""], ["--check"], ["--datasets", "MI
     for files in (CACHES, (), CACHES + ("results/stock/MIMIC.json",)):
         done, calls, _, _, tree = run_fit(bad, files=files, snapshot=True)
         assert done.returncode == 2 and done.stderr == FIT_USAGE + "\n" and done.stdout == "" and calls is None and tree == seeded(files), (bad, files, done)
-for extra, message in ((["--datasets", "MIMC"], "ERROR: 'MIMC' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX)\n"), (["--datasets", "mimic"], "ERROR: 'mimic' is not a dataset of the probe"),
+for extra, message in ((["--datasets", "MIMC"], "ERROR: 'MIMC' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX TAIXRAY)\n"), (["--datasets", "mimic"], "ERROR: 'mimic' is not a dataset of the probe"),
+                       (["--datasets", "taixray"], "ERROR: 'taixray' is not a dataset of the probe"), (["--datasets", "TAIXRay"], "ERROR: 'TAIXRay' is not a dataset of the probe"), (["--datasets", "TAIXRAY", "TAIXRAY"], "ERROR: --datasets lists TAIXRAY twice\n"),
                        (["--datasets", "ChestXray14 CheXpert"], "ERROR: 'ChestXray14 CheXpert' is not a dataset of the probe"), (["--datasets", "MIMIC", "--workers", "4"], "ERROR: '--workers' is not a dataset of the probe"),
                        (["--datasets", "MIMIC", "MIMIC"], "ERROR: --datasets lists MIMIC twice\n"), (["--datasets", "CheXpert", "MIMIC", "CheXpert"], "ERROR: --datasets lists CheXpert twice\n")):
     for files in (CACHES, ()):
@@ -2052,7 +2372,7 @@ print("OK (j) run_emb_fit_class.sh resume rule (ARK_EMB_FIT_RESUME=1): a dataset
       "nothing started -> a fresh fit; a missing cache stops it before anything is removed; --datasets limits what is looked at; one failed fit exits 1 after the others")
 
 # --check, the first argument: the arguments and results checks, no cache check, nothing run, written or removed, and silence on success (submit_probe_class.sh prints one line of its own)
-for args in (["--check", "stock"], ["--check", "stock", "--datasets", "MIMIC", "CheXpert"], ["--check", "stock", "--datasets", "CANDIDPTX"]):
+for args in (["--check", "stock"], ["--check", "stock", "--datasets", "MIMIC", "CheXpert"], ["--check", "stock", "--datasets", "CANDIDPTX"], ["--check", "stock", "--datasets", "TAIXRAY"]):
     done, calls, _, results, tree = run_fit(args, files=(), snapshot=True)  # no caches: the extraction has not run yet when the wrapper asks
     assert done.returncode == 0 and done.stdout == "" and done.stderr == "" and calls is None and results is None and tree == {}, (args, done)
 done, calls, _, _, tree = run_fit(["--check", "stock"], files=CACHES + RESUME_SEED, snapshot=True, ARK_EMB_FIT_RESUME="1")  # resume mode: nothing is removed
@@ -2069,7 +2389,7 @@ print("OK (j) run_emb_fit_class.sh --check: silent exit 0 without the caches, wi
 # run_emb_class.sh --check, the first argument: the shared block's checks (usage, extras, ARK_EMB_*, weights, results), then exit 0 with no extraction, no fit and no output
 done, calls, card_check, results, tree = run_wrapper(["--check"] + base, wrapper=CLASS_WRAPPER, snapshot=True)
 assert done.returncode == 0 and done.stdout == "" and done.stderr == "" and calls is None and results is None and tree == {STOCK_HOST: "x"}, done
-for datasets in (["MIMIC", "CheXpert"], ["CANDIDPTX"]):
+for datasets in (["MIMIC", "CheXpert"], ["CANDIDPTX"], ["TAIXRAY"]):
     done, calls, _, results = run_wrapper(["--check"] + base + ["--datasets"] + datasets, wrapper=CLASS_WRAPPER, ARK_EMB_INPUT_SIZE="512", ARK_EMB_NO_FIT="1")
     assert done.returncode == 0 and done.stdout == "" and done.stderr == "" and calls is None and results is None, (datasets, done)
 for args, kwargs, code, message in ((["--check"], {}, 2, USAGE + "\n"), (["--check"] + base[:3], {}, 2, USAGE + "\n"), (["--check", "../x"] + base[1:], {}, 2, USAGE + "\n"), (["--check"] + base + ["--tag", "other"], {}, 2, "ERROR: --tag: not accepted after <normalization>."),
@@ -2145,6 +2465,26 @@ done, sbatch, scancel, calls = run_submit(["stock_candidptx"] + base[1:] + ["--d
 assert done.returncode == 0 and done.stdout == "probe stock_candidptx: extraction 1001, fit 1002 (afterok)\n" and scancel == [] and calls is None, (done, scancel, calls)
 assert sbatch == [("NO_FIT=1 INPUT_SIZE=512 RESUME=unset", ["--parsable", "-J", "probe-stock_candidptx-x", "-p", "public,htc", "-q", "class", "--constraint=a100_80", "-t", "01:15:00", "run_emb_class.sh", "stock_candidptx"] + base[1:] + ["--datasets", "CANDIDPTX"]),
                   ("NO_FIT=unset INPUT_SIZE=512 RESUME=unset", ["--parsable", "-J", "probe-stock_candidptx-fit", "-t", "03:00:00", "--dependency=afterok:1001", "run_emb_fit_class.sh", "stock_candidptx", "--datasets", "CANDIDPTX"])], sbatch
+# TAIXRAY at a 512 px crop, as the README gives the command: the whole line is in the README, it passes the launchers' checks (the tag, the weights path under /workspace, the name), and both jobs get the limits it sets.
+# The mount is DATA_BIND in the submitting shell's environment: this wrapper does not touch it, so sbatch hands it to both jobs as it hands them ARK_EMB_INPUT_SIZE (a stub sbatch cannot show an environment, Slurm's default --export=ALL does)
+TAIX_TAG, TAIX_WEIGHTS = "newdata512_e0010_512px_taixray", "ssl_dinov3_cxr_newdata512_arkteacher_seed_100/export/teacher_backbone_epoch_0010.pth"
+TAIX_ARGS = [TAIX_TAG, "vit_base_dinov3", "/workspace/" + TAIX_WEIGHTS, "imagenet", "--datasets", "TAIXRAY"]
+TAIX_LINE = ('DATA_BIND="' + TAIX_BIND + '" ARK_EMB_INPUT_SIZE=512 PROBE_X_TIME=01:00:00 PROBE_FIT_TIME=02:00:00 ./submit_probe_class.sh ' + " ".join(TAIX_ARGS))
+with open(os.path.join(REPO, "README.md")) as f:
+    readme_text = f.read()
+assert TAIX_LINE in readme_text.splitlines()  # a line of its own in a code block
+# The bind it gives is the one the TAIXRay entry of datasets_config.yaml needs (TAIX_MOUNT, worked out from the yaml in (d4)): every DATA_BIND="..." in the README and in the launcher headers is that one, written out and never $USER's,
+# so an entry moved to another folder (another user's copy, say) without the documentation, or the documentation changed without the entry, fails here
+documented = {name: re.findall(r'DATA_BIND="([^"]*)"', text) for name, text in (("README.md", readme_text), ("run_emb_gaudi.sh", wrapper_text), ("run_emb_fit_class.sh", fit_text), ("submit_probe_class.sh", submit_text))}
+assert all(found and set(found) == {TAIX_BIND} for found in documented.values()), (TAIX_BIND, documented)
+assert not [name for name, text in (("README.md", readme_text), ("run_emb_gaudi.sh", wrapper_text), ("run_emb_fit_class.sh", fit_text), ("submit_probe_class.sh", submit_text)) if "$USER/datasets-new" in text]
+assert 'DATA_BIND="{}"'.format(TAIX_BIND) in taixray.mount_hint(real_config["TAIXRay"]["data_dir"])  # and the hint a job stops with says the same
+for needle in (os.path.dirname(os.path.normpath(real_config["TAIXRay"]["data_dir"])), "owner-only", "`base/dataset/TAIXRay/taix_unpack.sh`", "`taix_unpack_eval.sh`", "the `TAIXRay` entry's `data_dir` and `train_list`"):  # and what another group member is told: whose folder it is, what to unpack and what to point
+    assert needle in readme_text, needle
+done, sbatch, scancel, calls = run_submit(TAIX_ARGS, files=(TAIX_WEIGHTS,), ARK_EMB_INPUT_SIZE="512", PROBE_X_TIME="01:00:00", PROBE_FIT_TIME="02:00:00", DATA_BIND=TAIX_BIND)
+assert done.returncode == 0 and done.stdout == "probe {}: extraction 1001, fit 1002 (afterok)\n".format(TAIX_TAG) and done.stderr == "" and scancel == [] and calls is None, (done, scancel, calls)
+assert sbatch == [("NO_FIT=1 INPUT_SIZE=512 RESUME=unset", ["--parsable", "-J", "probe-{}-x".format(TAIX_TAG), "-p", "public,htc", "-q", "class", "--constraint=a100", "-t", "01:00:00", "run_emb_class.sh"] + TAIX_ARGS),
+                  ("NO_FIT=unset INPUT_SIZE=512 RESUME=unset", ["--parsable", "-J", "probe-{}-fit".format(TAIX_TAG), "-t", "02:00:00", "--dependency=afterok:1001", "run_emb_fit_class.sh", TAIX_TAG, "--datasets", "TAIXRAY"])], sbatch
 done, sbatch, scancel, calls = run_submit(base, PROBE_X_TIME="", PROBE_X_CONSTRAINT="", PROBE_FIT_TIME="")  # empty is unset: the defaults
 assert done.returncode == 0 and [argv for _, argv in sbatch] == [X_DEFAULT, FIT_DEFAULT], sbatch
 # PROBE_ACCOUNT: both jobs get -A <it>, right after their -J pair. Unset (the runs above: X_DEFAULT and FIT_DEFAULT have no -A) or empty, there is no -A at all and the launchers' own #SBATCH -A applies. The value is one argument, whatever it holds
@@ -2173,8 +2513,9 @@ print("OK (j) submit_probe_class.sh: the extraction line 'ARK_EMB_NO_FIT=1 sbatc
 CHECK_REFUSED = "submit_probe_class.sh: a launcher's check refused the arguments (exit {}); nothing was submitted\n"
 for args, files, env, code, stderr in ((base, (), {}, 1, None), (base[:3] + ["caffe"], (STOCK_HOST,), {}, 2, USAGE + "\n"), (["../x"] + base[1:], (STOCK_HOST,), {}, 2, USAGE + "\n"), (["stock", "vit_base_dinov3", "weights/x.pth", "imagenet"], (STOCK_HOST,), {}, 2, USAGE + "\n"),
                                        (base, (STOCK_HOST,), dict(ARK_EMB_INPUT_SIZE="12345"), 2, None), (base, (STOCK_HOST,), dict(ARK_EMB_INPUT_SIZE="0512"), 2, None),
-                                       (base + ["--datasets"], (STOCK_HOST,), {}, 2, FIT_USAGE + "\n"), (base + ["--datasets", "MIMC"], (STOCK_HOST,), {}, 2, "ERROR: 'MIMC' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX)\n"),
-                                       (base + ["--datasets", "MIMIC", "MIMIC"], (STOCK_HOST,), {}, 2, "ERROR: --datasets lists MIMIC twice\n"), (base + ["--datasets", "MIMIC", "--max_images", "5"], (STOCK_HOST,), {}, 2, "ERROR: '--max_images' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX)\n")):
+                                       (base + ["--datasets"], (STOCK_HOST,), {}, 2, FIT_USAGE + "\n"), (base + ["--datasets", "MIMC"], (STOCK_HOST,), {}, 2, "ERROR: 'MIMC' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX TAIXRAY)\n"),
+                                       (base + ["--datasets", "TAIXRay"], (STOCK_HOST,), {}, 2, "ERROR: 'TAIXRay' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX TAIXRAY)\n"),
+                                       (base + ["--datasets", "MIMIC", "MIMIC"], (STOCK_HOST,), {}, 2, "ERROR: --datasets lists MIMIC twice\n"), (base + ["--datasets", "MIMIC", "--max_images", "5"], (STOCK_HOST,), {}, 2, "ERROR: '--max_images' is not a dataset of the probe (ChestXray14 CheXpert MIMIC VinDrCXR CANDIDPTX TAIXRAY)\n")):
     done, sbatch, scancel, calls = run_submit(args, files=files, **env)
     assert done.returncode == code and sbatch == [] and scancel == [] and calls is None and done.stdout == "", (args, env, done)
     assert done.stderr.endswith(CHECK_REFUSED.format(code)) and (stderr is None or done.stderr == stderr + CHECK_REFUSED.format(code)), (args, env, done.stderr)
@@ -2184,8 +2525,9 @@ for name in NAMES:  # results that exist for the tag: the same preflight as the 
         done, sbatch, scancel, calls = run_submit(base, files=(STOCK_HOST, os.path.join(blocking, "log.txt") if not blocking.endswith(".json") else blocking))
         assert done.returncode == 1 and sbatch == [] and scancel == [] and calls is None and done.stdout == "", (blocking, done)
         assert "ERROR: results already exist for tag stock: {}; refusing to start the extraction".format(blocking) in done.stderr and done.stderr.endswith(CHECK_REFUSED.format(1)), (blocking, done.stderr)
-done, sbatch, scancel, calls = run_submit(base + ["--datasets", "CANDIDPTX"], files=(STOCK_HOST, "results/stock/MIMIC.json"))  # the four's results stop any extraction for their tag: CANDIDPTX takes a tag of its own
-assert done.returncode == 1 and sbatch == [] and "ERROR: results already exist for tag stock: results/stock/MIMIC.json;" in done.stderr, done
+for opt_in in ("CANDIDPTX", "TAIXRAY"):
+    done, sbatch, scancel, calls = run_submit(base + ["--datasets", opt_in], files=(STOCK_HOST, "results/stock/MIMIC.json"))  # the four's results stop any extraction for their tag: CANDIDPTX and TAIXRAY take a tag of their own
+    assert done.returncode == 1 and sbatch == [] and "ERROR: results already exist for tag stock: results/stock/MIMIC.json;" in done.stderr, (opt_in, done)
 done, sbatch, scancel, calls = run_submit(base, files=(STOCK_HOST, "results/stock/CheXpert.json"), ARK_EMB_FIT_RESUME="1")  # an inherited resume switch does not make an existing result acceptable
 assert done.returncode == 1 and sbatch == [] and "results already exist for tag stock" in done.stderr, done
 for args in ([], base[:3], base + ["--max_images", "5"], base + ["--workers", "4"], base + ["--tag", "x"], base + ["--datasets=MIMIC"]):

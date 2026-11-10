@@ -44,6 +44,14 @@
 # default. This job's fit and its results preflight cover the four only, so probe it as two jobs under a tag of its own, whose results/<tag>/ holds CANDIDPTX alone (results of the four under a tag stop
 # any new extraction for it): ARK_EMB_NO_FIT=1 sbatch run_emb_gaudi.sh <tag>_candidptx <model> <weights> <normalization> --datasets CANDIDPTX, then sbatch run_emb_fit_class.sh <tag>_candidptx --datasets CANDIDPTX
 # (on the class lane: ./submit_probe_class.sh <tag>_candidptx <model> <weights> <normalization> --datasets CANDIDPTX).
+# TAIXRAY (TAIX-Ray, eight binary findings per image, each present when its grade is above 0; the official train and test splits, the val split unused; base/ark_finetune/taixray.py) is a sixth --datasets name, handled like CANDIDPTX: extracted and fit
+# only when named, never by default, as two jobs under a tag of its own (<tag>_taixray). Its 16-bit PNGs are read with the SSL trainer's rule (per-image min-max, not PIL's clipping convert("L")), and the extractor also caches the raw grades
+# ({train,test}_grades.npy). Its images and label files are where base/datasets_config.yaml's TAIXRay entry puts them, /scratch/jdefili4/datasets-new/TAIX-Ray as shipped, which neither gaudi.sh nor nvidia.sh mounts by default: put
+# DATA_BIND="/data:/data:ro,/scratch/jdefili4/datasets-new:/scratch/jdefili4/datasets-new:ro" in the environment of the submit command (both launchers read DATA_BIND, it replaces their /data mount, so /data is listed again; gaudi.sh's
+# EXTRA_BINDS is not read by nvidia.sh, which the fit job runs through). sbatch passes it to the job, and submit_probe_class.sh to both of its jobs. That location is one user's scratch, owner-only: another user points the entry's
+# data_dir and train_list at a copy of their own and binds that folder instead (README). Without the mount the job stops in seconds, naming the missing label file and the bind. On the class lane, at a 512 px crop (the time limits
+# are estimates, see the README):
+#   DATA_BIND="/data:/data:ro,/scratch/jdefili4/datasets-new:/scratch/jdefili4/datasets-new:ro" ARK_EMB_INPUT_SIZE=512 PROBE_X_TIME=01:00:00 PROBE_FIT_TIME=02:00:00 ./submit_probe_class.sh <tag>_taixray <model> <weights> <normalization> --datasets TAIXRAY
 # The maintenance reservation (Oct 12 08:00 to Oct 15 15:00) means Slurm will not start a job whose limit crosses it: a job that cannot end before Oct 12 08:00 waits until Oct 15 15:00.
 # ARK_EMB_INPUT_SIZE (environment, default 224): the center crop the backbone embeds at, with the resize before it = round(size x 8/7) (224 -> 256, 448 -> 512,
 # 512 -> 585), passed as the extractor's --input_size / --img_resize and recorded in meta.json (transform.crop / transform.resize; the fit refuses a tag whose

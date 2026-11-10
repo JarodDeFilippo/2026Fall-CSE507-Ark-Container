@@ -7,7 +7,9 @@ The images go through the vendored official transform
 (build_transform_classification, mode "valid"): resize to 256 and center-crop 224 with no augmentation, for both splits: ONE embedding per image, as the lab's embedding linear probe
 (ark_linearprobe/) expects. There is no validation split: the probe has none. Lists and data directories are base/datasets_config.yaml's, the splits every arm uses
 (the full official train list of each dataset, VinDrCXR's 15,000 included, and its official test list; dataset_lists.py). CANDIDPTX (CANDID-PTX pneumothorax, the dense probe's train and
-test images, one label) is extracted only when --datasets names it; the default stays the four.
+test images, one label) is extracted only when --datasets names it; the default stays the four. So is TAIXRAY (TAIX-Ray, the official train and test splits, eight binary findings; taixray.py): its 16-bit
+PNGs are read with the SSL trainer's rule, all of them are checked to exist before the model loads, a label file that is not the split it is read as (train and test swapped) is refused there too, and the raw grades are
+cached beside the embeddings (see below).
 The backbone is built by the container's build_omni_model from --model, passed through as it is, so any ViT model name base/models.py knows works. The Swin names (swin_base, swin_large, swin_large_384,
 swin_large_768) are Ark+ checkpoints (.pth.tar): they load the TEACHER weights through build_omni_model_from_checkpoint (see load_backbone), and a Swin is built for ONE input size, so --input_size must be
 it (run_emb_gaudi.sh: ARK_EMB_INPUT_SIZE) and main() refuses otherwise. The width of the vectors is the built backbone's (model.num_features), and meta.json records it as feature_dim.
@@ -18,8 +20,8 @@ Run from base/ (sbatch run_emb_gaudi.sh <tag> <model> <in-container weights path
 
 Per dataset it writes <embeddings_root>/<tag>/<dataset>/{train,test}.npy (float16, [N, 1536 (ViT-B or Swin-L), 2048 (ViT-L) or 1024 (Swin-B)]), {split}_paths.txt (the
 dataset's img_list, one path per line, row i of the .npy being img_list[i]) and, last, meta.json (tag, model, weights path, size and sha256, normalization, transform,
-counts, timings, device). It refuses to overwrite a file that exists, before it loads the model: to redo a dataset (or finish after a job that died in the
-middle of one), delete its directory and run again with --datasets.
+counts, timings, device). A dataset with graded labels (TAIXRAY) also gets {train,test}_grades.npy (int8, [N, 8], the raw grades of the same rows) and grade_columns in meta.json. It refuses to overwrite a
+file that exists, before it loads the model: to redo a dataset (or finish after a job that died in the middle of one), delete its directory and run again with --datasets.
 
 stdout is one "EMB ..." line per dataset; progress and diagnostics go to stderr: a line at the start and end of each phase (model load, extract <dataset> <split>)
 and, while extracting, one per 20 batches with the images/s and the device the features are on. The run refuses (RuntimeError) if the parameters or the features
@@ -45,8 +47,8 @@ from accelerator import Accelerator
 from models import ArkSwinTransformer, build_omni_model, build_omni_model_from_checkpoint
 
 from . import dataloader
-from .dataset_lists import BASE, DATASETS, NAMES, REPO, dataset_class, dataset_entry
-from .embedding_mode import EMBEDDING_DIM, SPLITS, split_files, write_paths
+from .dataset_lists import BASE, DATASETS, NAMES, REPO, dataset_class, dataset_entry, dataset_kwargs
+from .embedding_mode import EMBEDDING_DIM, SPLITS, grades_file, split_files, write_paths
 
 NORMALIZATIONS = ("imagenet", "chestx-ray", "none", "raddino")
 TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")  # the tag is a directory name: no path separators, no spaces
@@ -170,7 +172,7 @@ def build_splits(name, args):
     splits = {}
     for split in SPLITS:
         transform = dataloader.build_transform_classification(normalize=args.normalization, crop_size=args.input_size, resize=args.img_resize, mode="valid")
-        splits[split] = dataset_class(name)(images_path=entry["data_dir"], file_path=entry[split + "_list"], augment=transform)
+        splits[split] = dataset_class(name)(images_path=entry["data_dir"], file_path=entry[split + "_list"], augment=transform, **dataset_kwargs(name, split))
     return entry, splits
 
 
@@ -207,6 +209,9 @@ def main(argv=None):
             with open(npy, "xb") as f:  # "x": never overwrites
                 np.save(f, features)
             write_paths(paths, dataset.img_list[:keep])
+            if hasattr(dataset, "grades"):  # TAIXRAY: the raw grades of the same rows, for an ordinal probe later
+                with open(grades_file(out_dirs[name], split), "xb") as f:
+                    np.save(f, dataset.grades[:keep])
             counts[split], seconds[split], shapes[split] = keep, round(time.time() - began, 1), list(features.shape)
             transforms[split] = [type(t).__name__ for t in dataset.augment.transforms]
         meta = {
@@ -217,6 +222,8 @@ def main(argv=None):
             "seconds": seconds, "device": accelerator.name, "torch": torch.__version__, "workers": args.workers, "batch_size": args.batch_size,
             "created_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+        if hasattr(splits["train"], "grades"):
+            meta["grade_columns"] = entry["diseases"]  # the columns of {train,test}_grades.npy
         with open(os.path.join(out_dirs[name], "meta.json"), "x") as f:
             json.dump(meta, f, indent=2, allow_nan=False)
         print("EMB {} {}: train {} / test {}, dim {}, {:.0f}s".format(args.tag, name, counts["train"], counts["test"], dim, sum(seconds.values())))

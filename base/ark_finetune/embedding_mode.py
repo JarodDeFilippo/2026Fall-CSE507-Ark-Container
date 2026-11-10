@@ -3,7 +3,7 @@ and the label rules of the official Finetuning dataset classes that the cached r
 (The file kept its name from the Finetuning-loop embedding mode it first served; the fit now runs the lab's Linearprobing script instead, see ark_linearprobe/NOTICE.)
 
 The cache is one directory per backbone tag and dataset: {train,test}.npy (float16, [N, 1536 (ViT-B or Swin-L), 2048 (ViT-L), 2560 (ViT-H+), 8192 (ViT-7B) or 1024 (Swin-B)]: ONE center-crop embedding per image, test included), {split}_paths.txt (the dataset's
-img_list, one path per line) and meta.json. There is no validation split: the probe has none (it picks its best epoch on test). A dataset module refuses to serve embeddings whose
+img_list, one path per line) and meta.json; a dataset whose labels are graded (TAIXRAY) also has {split}_grades.npy (see grades_file). There is no validation split: the probe has none (it picks its best epoch on test). A dataset module refuses to serve embeddings whose
 path list is not exactly its own img_list: row i of the cache is only meaningful for img_list[i].
 
 The labels are the official Finetuning dataset classes' (ark_finetune/dataloader.py): the module parses a list with the official class, and a row's label is what the official
@@ -38,6 +38,12 @@ def feature_dim(meta):
 def split_files(embeddings_dir, split):
     """(the split's .npy, its paths file) in a dataset's cache directory."""
     return os.path.join(embeddings_dir, split + ".npy"), os.path.join(embeddings_dir, split + "_paths.txt")
+
+
+def grades_file(embeddings_dir, split):
+    """The split's raw grades beside its embeddings, for a dataset whose labels are graded (TAIXRAY: HeartSize 0-3, the other seven findings 0-4): int8 [N, C], row i the grades of img_list[i], columns in the dataset's class order
+    (meta.json grade_columns). The binary labels the fit serves are these grades above 0; an ordinal probe can read them without extracting again."""
+    return os.path.join(embeddings_dir, split + "_grades.npy")
 
 
 def write_paths(path, paths):

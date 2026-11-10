@@ -5,6 +5,7 @@ batch 512, 100 epochs, CosineAnnealingLR(T_max=1000, eta_min=1) stepped per epoc
 --runs 10 independent runs, and in every run the epoch with the best TEST mAUC is the one reported (the script has no validation split; early stopping is commented out in it).
 It trains on the full official train list of the dataset and is scored on its official test list (CheXpert: the 5 competition findings), with the metrics of the script's utils.py.
 CANDIDPTX (CANDID-PTX pneumothorax, one label: the mAUC is its AUC; the dense probe's train and test images) is fit only when --datasets names it; the default stays the four.
+So is TAIXRAY (TAIX-Ray, eight binary findings, present when the grade is above 0: the mAUC is the mean of their eight AUCs, each also in the JSON; the official train and test splits, the val split unused).
 Only the columns with both a positive and a negative example among the test images it is scored on count: the others are dropped and recorded (a smoke cache can make a column single-valued).
 It writes, for each dataset,
   <results_root>/<tag>/<dataset>.json    per run the best test epoch (0-based, as the script prints it), its mAUC and per-class AUCs; mean and s.d. over the runs; the weights and the
@@ -40,6 +41,8 @@ from .embedding_datasets import evaluable_columns, test_labels
 
 EXP_NAME = "b2"  # the script's --exp_name; with --arch <tag> it names the run directory linear_eval/<dataset>/<tag>/b2
 SELECTION = "best epoch on test (as shipped)"
+DATASET_PROTOCOL = {"TAIXRAY": "TAIX-Ray: 8 binary findings (present = grade above 0; HeartSize graded 0-3, the other seven 0-4), official train split for training, official test split for scoring, "
+                               "the val split is not used, test mAUC = mean AUROC over the 8"}  # what a dataset adds to the protocol text; the four have nothing to add
 AS_SHIPPED = {"optimizer": "adam", "lr": 1e-4, "epochs": 100, "batch_size": 512, "multiclass": False, "mode": "train", "few_shot": -1, "device": "cpu"}  # the shipped script's settings, as its parser has them
 RAD_DINO_OVERLAP = {"ChestXray14": "train+val+test"}  # RAD-DINO's pretraining data holds all of ChestXray14. CheXpert's overlap was its valid split only, which the probe does not use;
                                                        # MIMIC train is in it, but MIMIC test is clean: a flag on the JSON, not a correction
@@ -139,6 +142,8 @@ def protocol_text(options, meta):
             "CosineAnnealingLR(T_max=1000, eta_min=1) stepped per epoch (the lr rises), {} runs seeded {}..{}, device {}; full train list, official test list, best epoch on test".format(
                 options.emb_dim, "CrossEntropyLoss" if options.multiclass else "sigmoid + BCELoss", options.optimizer, options.lr, options.batch_size, options.epochs, options.runs,
                 options.seed, options.seed + options.runs - 1, options.device))
+    if options.dataset in DATASET_PROTOCOL:
+        text += "; " + DATASET_PROTOCOL[options.dataset]
     if meta.get("max_images") is not None:
         text += "; SMOKE cache: the first {} entries of each list".format(meta["max_images"])
     return text
