@@ -83,7 +83,7 @@ def evaluate(model,loader,data,device):
    for o,t in zip(outputs,targets):
     for box,score in zip(o['boxes'].cpu().tolist(),o['scores'].cpu().tolist()):
      x1,y1,x2,y2=box;pred.append({'image_id':int(t['image_id']),'category_id':1,'bbox':[x1,y1,x2-x1,y2-y1],'score':score})
- coco=COCO();coco.dataset=copy.deepcopy(data)
+ coco=COCO();coco.dataset=copy.deepcopy(data);coco.dataset.setdefault('info',{});coco.dataset.setdefault('licenses',[])
  with contextlib.redirect_stdout(io.StringIO()):
   coco.createIndex()
   if not pred:return {'ap50_95':0.,'ap50':0.,'images':len(data['images']),'annotations':len(data['annotations'])}
