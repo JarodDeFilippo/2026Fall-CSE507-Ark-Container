@@ -622,10 +622,33 @@ finally:
     SSLMetaArch.forward_backward, ssl_pretrain.build_dataset = real_forward_backward, real_build_dataset
 assert "crops: global 512, local 224 (x8), Gram teacher 1024; JPEG decode min side 2368" in buf.getvalue(), buf.getvalue()
 assert json.load(open(os.path.join(DIR_D, "args.json")))["decode_min_side"] == 2368 and decode_sides == [2368]
+# --decode_min_side sets the side by hand (chain/newdata512_cropsrc.sh: 512 / 224 / 512 without a Gram teacher, which the crops alone decode at 1344, cut from the source as the 224 px runs were, at 1024).
+# Only a JPEG follows it (PIL's draft); a PNG of the same size is decoded whole at either
+big_png = os.path.join(TMP, "big", "x.png")
+Image.fromarray(np.random.RandomState(1).randint(0, 255, (3000, 2600), dtype=np.uint8)).save(big_png)
+for side, jpeg_size in ((1344, (2600, 3000)), (1024, (1300, 1500))):
+    decoded = []
+    for path in (big, big_png):
+        ssl_data.SSLImageDataset([path], lambda img: decoded.append(img.size), side)[0]
+    assert decoded == [jpeg_size, (2600, 3000)], (side, decoded)
+for extra, side in (((), 1344), (("--decode_min_side", "1024"), 1024)):
+    DIR_E = os.path.join(TMP, "E%d" % side)
+    decode_sides.clear()
+    SSLMetaArch.forward_backward, ssl_pretrain.build_dataset = stop_at_forward, recording_build_dataset
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            raises(StopAtForward, ssl_pretrain.run, make_args(DIR_E, "--no_gram", "--global_crops_size", "512", "--local_crops_size", "224", "--gram_teacher_size", "512", *extra),
+                   TINY_VIT, TINY_HEADS, CFG)
+    finally:
+        SSLMetaArch.forward_backward, ssl_pretrain.build_dataset = real_forward_backward, real_build_dataset
+    assert "crops: global 512, local 224 (x8), no Gram teacher (global crops cut at 512, no resize); JPEG decode min side %d" % side in buf.getvalue(), buf.getvalue()
+    assert json.load(open(os.path.join(DIR_E, "args.json")))["decode_min_side"] == side and decode_sides == [side]
 print("OK (r) decode side: decode_min_side = max(1024, ceil(crop / (sqrt(min area) x sqrt(min ratio 3/4)) / 64) x 64), ratio read from the crops: "
       "224 / 96 / 448 -> 1024 (Stage A, kept; a 2600 x 3000 JPEG decodes to 1300 x 1500, as with the fixed 1024 before), 512 / 224 / 1024 -> 2368 "
       "(2600 x 3000, no draft shrink), 512 / 224 / 512 -> 1344 (the local crops), 256 / 112 / 512 -> 1216; run() hands it to the dataset, prints it "
-      "on the crops: line and records decode_min_side in args.json (1024 / 2368)")
+      "on the crops: line and records decode_min_side in args.json (1024 / 2368); --decode_min_side 1024 with 512 / 224 / 512 gives 1024 in all three (a JPEG halves to 1300 x 1500, a PNG of "
+      "the same size stays 2600 x 3000 at 1344 and at 1024), and without the flag the same crops give 1344")
 
 # --init_from_checkpoint: DIR_B's last full checkpoint (18 steps, 3 epochs, Gram refreshed at steps 4 and 8, so its Gram teacher != its EMA teacher)
 INIT, OTHER = os.path.join(DIR_B, "ckpt", "epoch_0003.pth"), os.path.join(DIR_A, "ckpt", "epoch_0003.pth")
