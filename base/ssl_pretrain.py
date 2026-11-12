@@ -134,6 +134,10 @@ on --resume and a --branch_from source must match it (a checkpoint without the k
 where the crop sizes would give another: 1024 for 224 / 96 / 448, 1344 for 512 / 224 / 512 (the local crops'), 2368 for 512 / 224 / 1024. 0 keeps that rule, so every earlier launch line is unchanged. A PNG is
 decoded at its own size whatever N is (Image.draft exists for JPEG and MPO only), so it moves MIMIC, CheXpert and VinDrCXR, not ChestXray14, PadChest, TAIXRay or ReXGradient. Recorded as decode_min_side in args.json
 (the side actually used, as always); it changes the inputs, so it is locked on --resume and a --branch_from source must match it (a checkpoint without the key reads as 0). Refused with --pre_resize, which sets the side itself.
+
+--log_peak_memory (default off) makes every rank print `peak_memory rank=R step=S GiB=G` at each logged step: its own card's allocator high-water mark since the start (compile included), read as the memory probes
+read it (probe_resolution_memory.peak_gb: torch.<device>.max_memory_allocated, else on hpu Habana's memory_stats()["MaxInUse"], bytes; `GiB=unavailable` when neither answers, and the run goes on), for the multi-card
+memory smoke (run_d1_8_newdata512_smoke_gaudi.sh). It reads and changes nothing else, and is not locked on --resume.
 """
 import argparse
 import csv
@@ -312,6 +316,8 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=100)
     p.add_argument("--max_steps", type=int, default=None, help="stop after this many global steps (timing runs)")
     p.add_argument("--print_freq", type=int, default=50)
+    p.add_argument("--log_peak_memory", action="store_true",
+                   help="every rank prints its own card's peak device memory (GiB since the start, as probe_resolution_memory.peak_gb reads it; `unavailable` when no counter answers) at each logged step; off by default (the multi-card memory smoke)")
     p.add_argument("--device", default=os.environ.get("PROJECT_ACCELERATOR", "cuda"))
     p.add_argument("--bf16", action="store_true", help="bf16 autocast for the forward passes (default fp32)")
     args = p.parse_args(argv)
@@ -913,6 +919,10 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                           f"ibot {ib:.4f} gram {gr:.5f} total {total:.4f} | lr {lr:.3e} temp {temp:.4f} | "
                           f"{step_time:.3f}s/step data {data_time:.3f}s | elapsed {now - t_start:.0f}s"
                           + (f" | {tag}" if args.cyclic_ark_teacher else ""), flush=True)
+                if args.log_peak_memory:  # every rank, its own card (this block is collective: the all_reduce above ran on all of them)
+                    from probe_resolution_memory import peak_gb  # here, so a run without the flag never loads it
+                    peak = peak_gb(device)  # GiB; None when no counter answers (on Gaudi torch.hpu.max_memory_allocated can be absent where Habana's memory_stats()["MaxInUse"] works)
+                    print(f"peak_memory rank={rank} step={step} GiB=" + ("unavailable" if peak is None else f"{peak:.2f}"), flush=True)
                 if pending and step - 1 == pending[1]:
                     say(gram_line(*pending, gr))
                     pending = None
