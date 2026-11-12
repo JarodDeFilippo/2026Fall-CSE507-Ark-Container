@@ -33,3 +33,5 @@ sbatch -A <class-account> --array=0-9%2 run_localization_compare.sh candidptx ra
 ```
 
 The array task ID is the seed, and each seed writes to a distinct directory. The `%2` limits concurrent tasks in each array. For the stock baseline, seed 0 has already been submitted by Jan for both datasets; use `--array=1-9%2` for that baseline to avoid duplicate outputs. Confirm the pilot jobs completed successfully before scheduling arrays. Set `DATA_BIND` if `/jarod` or `/data` differs, and obtain gated model weights independently. `run_localization_smoke.sh` and `run_tbx_localization.sh` record Jan's original site-specific commands and should be adapted before use elsewhere.
+
+Important: the earlier pilot used one half of the same labeled TBX11K validation set for epoch selection and scored the other half. Consequently, this data has already informed development and must not be described as an untouched test set for the project, even though the new training script does not use it for model selection. Obtain a genuinely untouched evaluation set for a final unbiased claim.
