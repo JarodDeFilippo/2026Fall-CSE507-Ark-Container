@@ -129,6 +129,11 @@ differently from the trunk's.)
 convention (base/dataloader.py resizes every image to a square before its RandomResizedCrop); the other runs cut their crops from the full decode. The JPEG decode side
 is then N, since the whole image is squashed to N anyway: printed on the crops: line and recorded as decode_min_side in args.json. It changes the inputs, so it is locked
 on --resume and a --branch_from source must match it (a checkpoint without the key reads as 0); an --init_from_checkpoint source is not compared.
+
+--decode_min_side N (default 0: off; chain/newdata512_cropsrc.sh passes 1024) sets the JPEG decode side by hand (the PIL draft target: a JPEG is decoded at 1/2, 1/4 or 1/8 size while both sides stay >= N)
+where the crop sizes would give another: 1024 for 224 / 96 / 448, 1344 for 512 / 224 / 512 (the local crops'), 2368 for 512 / 224 / 1024. 0 keeps that rule, so every earlier launch line is unchanged. A PNG is
+decoded at its own size whatever N is (Image.draft exists for JPEG and MPO only), so it moves MIMIC, CheXpert and VinDrCXR, not ChestXray14, PadChest, TAIXRay or ReXGradient. Recorded as decode_min_side in args.json
+(the side actually used, as always); it changes the inputs, so it is locked on --resume and a --branch_from source must match it (a checkpoint without the key reads as 0). Refused with --pre_resize, which sets the side itself.
 """
 import argparse
 import csv
@@ -173,20 +178,21 @@ LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "i
 # cyclic_ark_teacher / ark_teacher_momentum / teacher_clean_view / heads / lock_half_pass / keep_all_checkpoints: the Ark-teacher mode (its data order,
 # teacher rule, teacher views, head parameters, lock passes, checkpoint record); a --branch_from must match them too (none is branch-free)
 # pre_resize: the image the crops are cut from (squashed to N x N first; 0: the full decode); like the crop sizes it changes the inputs, so a --branch_from must match it too
+# decode_min_side: the JPEG decode side when set by hand (0: follows the crop sizes); likewise
 RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_lr_scaling", "warmup_epochs",
                 "weight_decay", "momentum_teacher", "teacher_temp_warmup_epochs", "gram_weight", "global_crops_size",
                 "local_crops_size", "gram_teacher_size", "gram_refresh_steps", "freeze_backbone_epochs", "local_crops_number",
                 "seed", "bf16", "world_size", "init_from_checkpoint", "init_new_heads_from", "no_gram", "branch_from", "drop_path_rate",
                 "rope_rescale_coords", "untie_local_cls_norm", "cyclic_ark_teacher", "ark_teacher_momentum", "teacher_clean_view", "heads",
-                "lock_half_pass", "keep_all_checkpoints", "gram_teacher_from", "pre_resize")
+                "lock_half_pass", "keep_all_checkpoints", "gram_teacher_from", "pre_resize", "decode_min_side")
 # checkpoints written before the crop-size flags existed (pilots, main, constlr) were all trained at these
 CROP_DEFAULTS = dict(global_crops_size=224, local_crops_size=96, gram_teacher_size=448)
 # keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off, no --branch_from (nor
-# --gram_teacher_from), no --init_new_heads_from, no recipe setting (drop path 0, no RoPE rescale, tied CLS norm), no --pre_resize (crops cut from the full decode), and the mixed-batch mode
-# (per-step EMA teacher on the student's crops, shared heads, no lock passes, the pruned checkpoint record)
+# --gram_teacher_from), no --init_new_heads_from, no recipe setting (drop path 0, no RoPE rescale, tied CLS norm), no --pre_resize (crops cut from the full decode), no --decode_min_side (the decode side
+# follows the crop sizes), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads, no lock passes, the pruned checkpoint record)
 ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None, drop_path_rate=0.0, rope_rescale_coords=None, untie_local_cls_norm=False,
                     cyclic_ark_teacher=False, ark_teacher_momentum=None, teacher_clean_view=False, heads="shared", lock_half_pass=False,
-                    keep_all_checkpoints=False, gram_teacher_from=None, init_new_heads_from=None, pre_resize=0)
+                    keep_all_checkpoints=False, gram_teacher_from=None, init_new_heads_from=None, pre_resize=0, decode_min_side=0)
 # what a --branch_from start may differ from its source in (check_resume skips these): the Gram switch and knobs the branch turns on, the path itself,
 # the source's own init provenance (its full state is restored; a branch cannot pass --init_from_checkpoint or --init_new_heads_from, so they would always differ)
 # and the Gram teacher's own source (a no-Gram trunk has none)
@@ -273,6 +279,9 @@ def parse_args(argv=None):
     p.add_argument("--local_crops_number", type=int, default=8)
     p.add_argument("--pre_resize", type=int, default=0,
                    help="squash each image to N x N after decode and before the random crops, the Ark loader convention (base/dataloader.py); 0 = crop from the full decode")
+    p.add_argument("--decode_min_side", type=int, default=0,
+                   help="the JPEG decode side (PIL draft target), in place of the one the crop sizes give (1024 for 224 / 96 / 448, 1344 for 512 / 224 / 512, 2368 for 512 / 224 / 1024); "
+                        "0 = follow the crops. PNGs are decoded at their own size whatever it is. Refused with --pre_resize, which sets the side itself")
     p.add_argument("--drop_path_rate", type=float, default=0.0,
                    help="student stochastic depth, in [0, 1) (Meta's DINOv3 recipe: 0.3); train mode only")
     p.add_argument("--rope_rescale_coords", type=parse_rescale, default=None,
@@ -313,6 +322,10 @@ def parse_args(argv=None):
         p.error(f"--drop_path_rate must be in [0, 1), got {args.drop_path_rate}")
     if args.pre_resize < 0:  # 0 is off
         p.error(f"--pre_resize must be 0 (off) or a size in pixels, got {args.pre_resize}")
+    if args.decode_min_side < 0:  # 0 is off
+        p.error(f"--decode_min_side must be 0 (off) or a size in pixels, got {args.decode_min_side}")
+    if args.decode_min_side and args.pre_resize:  # the whole image is squashed to pre_resize x pre_resize, which is then the side the JPEG is decoded at
+        p.error("--decode_min_side cannot be combined with --pre_resize (the decode side is then the squash size)")
     if args.pretrained_weights is None and args.init_from_checkpoint is None and args.branch_from is None:
         p.error("--pretrained_weights is required unless --init_from_checkpoint is given (or --branch_from)")
     if args.gram_teacher_from is not None:  # the Gram teacher of a branch's start, from an earlier checkpoint of its source's run
@@ -650,7 +663,7 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     transform = DataAugmentationCXR(local_crops_number=args.local_crops_number, global_crops_size=args.global_crops_size,
                                     local_crops_size=args.local_crops_size, gram_teacher_crops_size=args.gram_teacher_size,
                                     emit_gram_teacher_crops=not args.no_gram, teacher_no_distortions=args.teacher_clean_view)
-    decode_side = args.pre_resize or transform.decode_min_side  # --pre_resize N: N (the image is squashed to N x N after the decode); else follows the crop sizes: 1024 for 224 / 96 / 448 (as before), 2368 for 512 / 224 / 1024
+    decode_side = args.pre_resize or args.decode_min_side or transform.decode_min_side  # --pre_resize N: N (the image is squashed to N x N after the decode); --decode_min_side N: N; else follows the crop sizes: 1024 for 224 / 96 / 448 (as before), 1344 for 512 / 224 / 512, 2368 for 512 / 224 / 1024
     cut_note = (f"global crops cut at {args.global_crops_size}, no resize" if args.gram_teacher_size == args.global_crops_size else
                 f"global crops cut at {args.gram_teacher_size} and resized to {args.global_crops_size}, as in the Gram runs")
     gram_crops_note = f"no Gram teacher ({cut_note})" if args.no_gram else f"Gram teacher {args.gram_teacher_size}"

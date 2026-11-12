@@ -1,10 +1,14 @@
 """CPU checks for the 512 px new-data run (chain/newdata512.sh): the three datasets added to Stage A's four (PadChest, TAIXRay, ReXGradient), SSLImageDataset's 16-bit-safe read and --pre_resize
 squash, --no_gram with --gram_teacher_size = --global_crops_size, --init_new_heads_from (parse_args, load_init_state, and a tiny end-to-end start from a finished run's checkpoint with its --resume),
 --pre_resize (its locks, and in that end-to-end start), the launch script and its sbatch wrapper in a fake repo, ssl_common.sh's SSL_DATASETS and gaudi.sh's EXTRA_BINDS.
+Also its two variants and the 224 px run on the same seven datasets: --decode_min_side, base/datasets_config_taix_original.yaml (TAIXRay from the native files), chain/newdata512_cropsrc.sh and
+chain/newdata224.sh with their wrappers, each against the launch line it copies (newdata512.sh, the 224 px Ark-teacher trunk's constlr.sh) to show the only differences, and the LR the trainer
+computes from cropsrc's line (a base of 1e-4, a constant effective 1.4142e-4 at batch 128).
 Run from base/: python test_newdata.py (needs torch, timm, torchvision, PIL; no Slurm, no Gaudi). The test_ functions are also collected by pytest."""
 import contextlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -21,7 +25,7 @@ import ssl_pretrain
 from models import DINOV3_VITB16_KWARGS
 from ssl_dinov3.data import DATASET_NAMES, DataAugmentationCXR, SSLImageDataset, image_paths
 from ssl_dinov3.model import build_models
-from ssl_dinov3.optim import lr_scaling_factor
+from ssl_dinov3.optim import build_schedules, lr_scaling_factor
 from utils import get_config
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -145,6 +149,19 @@ def test_pre_resize_flag():
         ssl_pretrain.check_resume(ckpt, P(), 1, 1, "f", skip, action)
         message = raises(ValueError, ssl_pretrain.check_resume, ckpt, P("--pre_resize", "512"), 1, 1, "f", skip, action)
         assert "cannot " + action in message and "pre_resize: checkpoint 0, now 512" in message, message
+
+
+def test_decode_min_side_flag():
+    assert P().decode_min_side == 0 == ssl_pretrain.ARG_DEFAULTS["decode_min_side"] and P("--decode_min_side", "1024").decode_min_side == 1024
+    assert "decode_min_side" in ssl_pretrain.RESUME_MATCH and "decode_min_side" not in ssl_pretrain.BRANCH_FREE
+    refused("--decode_min_side", "-1", words=("--decode_min_side", "-1"))
+    refused("--decode_min_side", "1024", "--pre_resize", "512", words=("--decode_min_side cannot be combined with --pre_resize",))  # the squash size is the decode side then
+    # locked on --resume and by --branch_from (it changes the inputs); a checkpoint written before the flag reads as 0, so every earlier launch line resumes as it did
+    ckpt = dict(args={k: v for k, v in vars(P()).items() if k != "decode_min_side"}, world_size=1, step=0, epoch=0, data_fingerprint="f")
+    for skip, action in (((), "--resume"), (ssl_pretrain.BRANCH_FREE, "--branch_from")):
+        ssl_pretrain.check_resume(ckpt, P(), 1, 1, "f", skip, action)
+        message = raises(ValueError, ssl_pretrain.check_resume, ckpt, P("--decode_min_side", "1024"), 1, 1, "f", skip, action)
+        assert "cannot " + action in message and "decode_min_side: checkpoint 0, now 1024" in message, message
 
 
 def test_no_gram_gram_teacher_size_equal_to_global():
@@ -352,7 +369,7 @@ def fake_repo(tmp, settings=SETTINGS, init=True):
     root = os.path.join(tmp, "repo")
     for directory in ("chain", "experiment_scripts", "weights", os.path.dirname(INIT.replace("/workspace/", ""))):
         os.makedirs(os.path.join(root, directory))
-    for name in ("newdata512.sh", "ssl_common.sh"):
+    for name in ("newdata512.sh", "newdata512_cropsrc.sh", "newdata224.sh", "constlr.sh", "ssl_common.sh"):  # constlr.sh: the 224 px trunk's launcher, which newdata224.sh is compared with
         shutil.copy(os.path.join(REPO, "chain", name), os.path.join(root, "chain", name))
     shutil.copy(os.path.join(REPO, "experiment_scripts", "common.sh"), os.path.join(root, "experiment_scripts"))
     for name, body in (("gaudi.sh", 'printf "%s\\n" "$@" > "$PWD/argv.txt"; printf "%s" "${EXTRA_BINDS:-}" > "$PWD/extra_binds.txt"'),
@@ -370,9 +387,32 @@ def fake_repo(tmp, settings=SETTINGS, init=True):
 
 
 def launch(root, script="chain/newdata512.sh", env=ENV4, cwd=None):
-    result = subprocess.run(["bash", script], cwd=cwd or root, env=env, capture_output=True, text=True)
     path = os.path.join(root, "argv.txt")
+    if os.path.exists(path):
+        os.remove(path)  # what an earlier launch recorded must not pass for this one's
+    result = subprocess.run(["bash", script], cwd=cwd or root, env=env, capture_output=True, text=True)
     return result, (open(path).read().splitlines() if os.path.exists(path) else None)
+
+
+def flags(argv):
+    """The trainer's part of a launch line as {flag: [the value list of each time it was given]} (--data_set once per dataset, --batch_size_per_gpu twice: ssl_launch's default, then the run's)."""
+    out, current = {}, None
+    for word in argv[argv.index("ssl_pretrain.py") + 1:]:
+        if word.startswith("--"):
+            current = out.setdefault(word, [])
+            current.append([])
+        else:
+            current[-1].append(word)
+    return out
+
+
+def changed(a, b):
+    """The flags two launch lines do not give alike (one given in only one of them counts)."""
+    fa, fb = flags(a), flags(b)
+    return {flag for flag in fa.keys() | fb.keys() if fa.get(flag) != fb.get(flag)}
+
+
+parse = lambda argv: ssl_pretrain.parse_args(argv[argv.index("ssl_pretrain.py") + 1:])
 
 
 def test_newdata512_script():
@@ -454,6 +494,214 @@ def test_newdata512_wrapper():
         assert result.returncode == 0 and argv[-1] == "MIMIC" and "--init_new_heads_from" in argv, result.stderr
         assert open(os.path.join(root, "extra_binds.txt")).read() == "/scratch/tester/datasets-new:/scratch/tester/datasets-new:ro"
         assert os.path.exists(os.path.join(root, "cards_checked"))
+
+
+RUN224 = "ssl_dinov3_cxr_newdata224_arkteacher_seed_100"
+RUN_CROPSRC = "ssl_dinov3_cxr_newdata512_cropsrc_arkteacher_seed_100"
+TRUNK = "ssl_dinov3_cxr_constlr_arkteacher_seed_100"
+NATIVE_YAML = "datasets_config_taix_original.yaml"
+SETTINGS_NEW = {"main_lr.txt": "0.002\n", "newdata224_stop_after.txt": "5\n", "constlr_arkteacher_stop_after.txt": "5\n", "newdata512_stop_after.txt": "5\n", "newdata512_batch_per_gpu.txt": "16\n",
+                "newdata512_cropsrc_stop_after.txt": "5\n", "newdata512_cropsrc_batch_per_gpu.txt": "16\n"}  # the settings files of the two new launchers and of the two they are compared with
+ENV8 = dict(ENV, SLURM_JOB_GPUS="0,1,2,3,4,5,6,7", USER="tester")  # the 8-card allocation newdata512 ran on
+
+
+def test_native_taix_config():
+    main = get_config(os.path.join(BASE, "datasets_config.yaml"))
+    native = get_config(os.path.join(BASE, NATIVE_YAML))
+    assert list(native) == ["ChestXray14", "CheXpert", "VinDrCXR", "MIMIC", "PadChest", "TAIXRay", "ReXGradient"] and sorted(native) == sorted(SEVEN)
+    for name in SEVEN:  # the trainer reads data_dir and train_list; the other six datasets are the shipped config's, line for line
+        want = {key: main[name][key] for key in ("data_dir", "train_list")}
+        if name == "TAIXRay":
+            want = dict(data_dir="/scratch/jdefili4/datasets-new/TAIX-Ray/png_original/", train_list="/scratch/jdefili4/datasets-new/TAIX-Ray/taix_original_train.csv")
+        assert native[name] == want, name
+    assert main["TAIXRay"]["data_dir"].endswith("/TAIX-Ray/png512/") and main["TAIXRay"]["train_list"].endswith("/TAIX-Ray/taix_train.csv")  # the entry the 512 px run and the probe read: untouched
+    with tempfile.TemporaryDirectory() as tmp:  # the list taix_unpack_original.sh writes: Path, then <split>/<UID>.png, under png_original/
+        listing = os.path.join(tmp, "taix_original_train.csv")
+        open(listing, "w").write("Path\ntrain/a.png\ntrain/b.png\n")
+        assert image_paths("TAIXRay", native["TAIXRay"]["data_dir"], listing) == ["/scratch/jdefili4/datasets-new/TAIX-Ray/png_original/train/a.png", "/scratch/jdefili4/datasets-new/TAIX-Ray/png_original/train/b.png"]
+
+
+def check_wrapper(name, sbatch, chain_script, needles, env):
+    """A new sbatch wrapper: bash -n, mode, #SBATCH lines, last line, the guards, the header's commands, and (in a fake repo, run from elsewhere as sbatch does) the datasets mount and the card check."""
+    wrapper = os.path.join(REPO, name)
+    subprocess.run(["bash", "-n", wrapper], check=True)
+    assert os.access(wrapper, os.X_OK) and stat.S_IMODE(os.stat(wrapper).st_mode) == 0o755
+    text = open(wrapper).read()
+    lines = text.splitlines()
+    assert [line[len("#SBATCH "):] for line in lines if line.startswith("#SBATCH ")] == sbatch, lines
+    code = [line for line in lines if line and not line.startswith("#")]
+    assert code[-1] == "EXTRA_BINDS=/scratch/$USER/datasets-new:/scratch/$USER/datasets-new:ro exec ./chain/" + chain_script, code
+    for needle in ("export PT_HPU_LAZY_MODE=1", "./gaudi_check_cards.sh || exit 1", "[[ -x ./gaudi_verify_busy.sh ]]", "./gaudi_verify_busy.sh 900 &"):
+        assert any(needle in line for line in code), needle
+    assert all(line.startswith("#") for line in lines if "phases.txt" in line)  # not a chain phase: phases.txt is named in comments only
+    for needle in needles:
+        assert needle in text, needle
+    cd = "cd /scratch/$USER/2026Fall-CSE507-Ark-Container || exit 1"
+    assert text.count(cd) == 1
+    with tempfile.TemporaryDirectory() as tmp:
+        root = fake_repo(tmp, SETTINGS_NEW)
+        open(os.path.join(root, "wrapper.sh"), "w").write(text.replace(cd, "cd '%s' || exit 1" % root))
+        result, argv = launch(root, script=os.path.join(root, "wrapper.sh"), cwd=tempfile.mkdtemp(dir=tmp), env=env)
+        assert result.returncode == 0 and argv[-1] == NATIVE_YAML, result.stderr  # both launch lines end with the config file
+        assert open(os.path.join(root, "extra_binds.txt")).read() == "/scratch/tester/datasets-new:/scratch/tester/datasets-new:ro"
+        assert os.path.exists(os.path.join(root, "cards_checked"))
+
+
+def test_newdata224_script():
+    script = os.path.join(REPO, "chain", "newdata224.sh")
+    subprocess.run(["bash", "-n", script], check=True)
+    assert os.access(script, os.X_OK) and open(script).read().startswith("#!/usr/bin/env bash\n")
+    assert "newdata224" not in [line.split("#")[0].strip() for line in open(os.path.join(REPO, "chain", "phases.txt"))]  # not a chain phase
+    expected = (["python", "-m", "torch.distributed.run", "--standalone", "--nproc-per-node", "4", "ssl_pretrain.py", "--device", "hpu"]
+                + [x for name in SEVEN for x in ("--data_set", name)]
+                + ["--pretrained_weights", "/workspace/weights/" + WEIGHT_NAME, "--batch_size_per_gpu", "64", "--workers", "16", "--seed", "100", "--output_dir", "/workspace/" + RUN224, "--resume",
+                   "--lr", "0.002", "--min_lr", "0.002", "--no_lr_scaling", "--epochs", "1000", "--stop_after_epochs", "5",
+                   "--drop_path_rate", "0.3", "--rope_rescale_coords", "2", "--untie_local_cls_norm", "--no_gram", "--cyclic_ark_teacher", "--heads", "per_dataset", "--no_lock_half_pass",
+                   "--keep_all_checkpoints", "--init_from_checkpoint", INIT, "--init_new_heads_from", "MIMIC", "--datasets_config", NATIVE_YAML])
+    with tempfile.TemporaryDirectory() as tmp:
+        root = fake_repo(tmp, SETTINGS_NEW)
+        result, argv = launch(root, script="chain/newdata224.sh", env=dict(ENV4, SSL_DATASETS="VinDrCXR"))  # an inherited SSL_DATASETS does not change the seven
+        assert result.returncode == 0 and result.stderr == "" and argv == expected, (result.stderr, argv)
+        lines = result.stdout.splitlines()
+        assert lines[0].startswith("run: " + RUN224 + " (") and "from chain/newdata224_stop_after.txt)" in lines[0] and "from " + INIT in lines[0], lines[0]
+        assert lines[1] == "LR: 0.002 absolute (--no_lr_scaling) at global batch 256 (64 x 4 cards), flat after a 4-cycle warmup", lines
+        # against the 224 px Ark-teacher trunk's own launch line (chain/constlr.sh CONSTLR_NOGRAM=1 CONSTLR_ARK=1): the data sets, the init pair, the run dir and the config file, and nothing else
+        trunk_result, trunk = launch(root, script="chain/constlr.sh", env=dict(ENV4, CONSTLR_NOGRAM="1", CONSTLR_ARK="1"))
+        assert trunk_result.returncode == 0 and flags(trunk)["--output_dir"] == [["/workspace/" + TRUNK]], trunk_result.stderr
+        assert flags(trunk)["--data_set"] == [[name] for name in ("VinDrCXR", "ChestXray14", "MIMIC", "CheXpert")]
+        assert changed(argv, trunk) == {"--data_set", "--output_dir", "--init_from_checkpoint", "--init_new_heads_from", "--datasets_config"}
+        parsed, trunk_parsed = parse(argv), parse(trunk)  # the trainer accepts the line, and reads it as meant: the trunk's crops, decode side, batch, LR and warmups
+        assert ssl_pretrain.check_args(parsed) == 5 and parsed.data_set == SEVEN and parsed.output_dir == "/workspace/" + RUN224
+        assert (parsed.global_crops_size, parsed.local_crops_size, parsed.gram_teacher_size, parsed.no_gram, parsed.pre_resize, parsed.decode_min_side) == (224, 96, 448, True, 0, 0)
+        assert DataAugmentationCXR(global_crops_size=224, local_crops_size=96, gram_teacher_crops_size=448, emit_gram_teacher_crops=False).decode_min_side == 1024  # STAGE_A_CROPS: the trunk's decode side
+        assert (parsed.batch_size_per_gpu, parsed.warmup_epochs, parsed.teacher_temp_warmup_epochs, parsed.freeze_backbone_epochs, parsed.no_lr_scaling) == (64, 4, 12, 1, True)
+        assert parsed.lr == parsed.min_lr == 0.002 and (parsed.init_from_checkpoint, parsed.init_new_heads_from, parsed.datasets_config) == (INIT, "MIMIC", NATIVE_YAML)
+        assert {k for k in ssl_pretrain.RESUME_MATCH if k != "world_size" and getattr(parsed, k) != getattr(trunk_parsed, k)} == {"data_set", "init_from_checkpoint", "init_new_heads_from"}
+        # 4 cards or nothing: another count would change the global batch and, the LR being absolute, the recipe
+        for gpus in ("0,1", "0,1,2,3,4,5,6,7"):
+            result, none = launch(root, script="chain/newdata224.sh", env=dict(ENV, SLURM_JOB_GPUS=gpus))
+            assert result.returncode == 1 and none is None and "ERROR: %d cards in the allocation" % (gpus.count(",") + 1) in result.stderr, result
+        # the checkpoint to start from: refused when absent, unless the run already has an epoch checkpoint of its own (a resume reads no INIT)
+        bare = fake_repo(os.path.join(tmp, "no_init"), SETTINGS_NEW, init=False)
+        result, none = launch(bare, script="chain/newdata224.sh")
+        assert result.returncode == 1 and none is None and result.stdout == "" and "ERROR: ./ssl_dinov3_cxr_constlr_arkteacher_seed_100/ckpt/epoch_0200.pth" in result.stderr, result
+        os.makedirs(os.path.join(bare, RUN224, "ckpt"))
+        open(os.path.join(bare, RUN224, "ckpt", "epoch_0003.pth"), "w").write("x")
+        result, resumed = launch(bare, script="chain/newdata224.sh")
+        assert result.returncode == 0 and resumed == expected, result.stderr
+        # both settings files are needed and checked, naming them, before anything is launched
+        for name in ("main_lr.txt", "newdata224_stop_after.txt"):
+            result, none = launch(fake_repo(tempfile.mkdtemp(dir=tmp), dict(SETTINGS_NEW, **{name: None})), script="chain/newdata224.sh")
+            assert result.returncode == 1 and none is None and "ERROR" in result.stderr and name in result.stderr, (name, result.stderr)
+        for name, value in (("main_lr.txt", "0"), ("main_lr.txt", "abc"), ("newdata224_stop_after.txt", "0"), ("newdata224_stop_after.txt", "2.5"), ("newdata224_stop_after.txt", "1001"),
+                            ("newdata224_stop_after.txt", "18446744073709551617")):
+            result, none = launch(fake_repo(tempfile.mkdtemp(dir=tmp), dict(SETTINGS_NEW, **{name: value + "\n"})), script="chain/newdata224.sh")
+            assert result.returncode == 1 and none is None and "ERROR" in result.stderr and name in result.stderr, (name, value, result.stderr)
+        result, top = launch(fake_repo(tempfile.mkdtemp(dir=tmp), dict(SETTINGS_NEW, **{"newdata224_stop_after.txt": "1000\n"})), script="chain/newdata224.sh")
+        assert result.returncode == 0 and top[top.index("--stop_after_epochs") + 1] == "1000"
+
+
+def test_newdata224_wrapper():
+    check_wrapper("run_d1_8_newdata224_arkteacher_gaudi.sh", ["--job-name=d1-8-newdata224", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:4", "-c 72", "--mem=256G"],
+                  "newdata224.sh", ("A=$(sbatch --parsable run_d1_8_newdata224_arkteacher_gaudi.sh)", "sbatch -d afterany:$A run_d1_8_newdata224_arkteacher_gaudi.sh", "chain/newdata224_stop_after.txt",
+                                    "taix_unpack_original.sh train", "6.5 GB", "690 GB per 100 cycles", "4763 steps"), ENV4)
+
+
+def test_newdata512_cropsrc_script():
+    script = os.path.join(REPO, "chain", "newdata512_cropsrc.sh")
+    subprocess.run(["bash", "-n", script], check=True)
+    assert os.access(script, os.X_OK) and open(script).read().startswith("#!/usr/bin/env bash\n")
+    assert "newdata512_cropsrc" not in [line.split("#")[0].strip() for line in open(os.path.join(REPO, "chain", "phases.txt"))]  # not a chain phase
+    with tempfile.TemporaryDirectory() as tmp:
+        root = fake_repo(tmp, SETTINGS_NEW)
+        result, argv = launch(root, script="chain/newdata512_cropsrc.sh", env=dict(ENV8, SSL_DATASETS="VinDrCXR"))  # an inherited SSL_DATASETS does not change the seven
+        exemplar_result, exemplar = launch(root, env=ENV8)  # chain/newdata512.sh with the same settings, the run it copies
+        assert result.returncode == 0 and result.stderr == "" and exemplar_result.returncode == 0, (result.stderr, exemplar_result.stderr)
+        assert argv[5] == "8" and flags(argv)["--batch_size_per_gpu"] == [["64"], ["16"]] and flags(exemplar)["--pre_resize"] == [["512"]]
+        # the exemplar's launch line with four edits and no others: the run dir, the base LR in --lr and --min_lr (1e-4, a tenth of the exemplar's 0.001: 1.4142e-4 effective at batch 128 where the exemplar's is 1.4142e-3),
+        # --pre_resize 512 -> --decode_min_side 1024 (the same place), and the config file on the end
+        want = list(exemplar)
+        want[want.index("--output_dir") + 1] = "/workspace/" + RUN_CROPSRC
+        for flag in ("--lr", "--min_lr"):
+            assert want[want.index(flag) + 1] == "0.001"
+            want[want.index(flag) + 1] = "0.0001"
+        i = want.index("--pre_resize")
+        want[i:i + 2] = ["--decode_min_side", "1024"]
+        assert argv == want + ["--datasets_config", NATIVE_YAML], (argv, want)
+        assert changed(argv, exemplar) == {"--output_dir", "--lr", "--min_lr", "--pre_resize", "--decode_min_side", "--datasets_config"}
+        lines = result.stdout.splitlines()
+        assert lines[0].startswith("run: " + RUN_CROPSRC + " (") and "from chain/newdata512_cropsrc_stop_after.txt)" in lines[0] and "with the new heads copied from MIMIC's" in lines[0], lines[0]
+        assert lines[1] == "LR: base 0.0001 -> effective 0.000141421 at global batch 128 (16 x 8 cards; the trainer's sqrt_wrt_1024 rule)", lines
+        assert exemplar_result.stdout.splitlines()[1] == "LR: base 0.001 -> effective 0.00141421 at global batch 128 (16 x 8 cards; the trainer's sqrt_wrt_1024 rule; constlr: 0.002 at 256)"
+        parsed, exemplar_parsed = parse(argv), parse(exemplar)  # the trainer accepts the line: crops cut from the source (no squash), the decode side held at 1024 where the crops alone give 1344
+        assert ssl_pretrain.check_args(parsed) == 5 and (parsed.pre_resize, parsed.decode_min_side, parsed.global_crops_size, parsed.local_crops_size, parsed.gram_teacher_size) == (0, 1024, 512, 224, 512)
+        assert DataAugmentationCXR(global_crops_size=512, local_crops_size=224, gram_teacher_crops_size=512, emit_gram_teacher_crops=False).decode_min_side == 1344
+        assert parsed.data_set == SEVEN and (parsed.init_from_checkpoint, parsed.init_new_heads_from, parsed.datasets_config) == (INIT, "MIMIC", NATIVE_YAML)
+        assert {k for k in ssl_pretrain.RESUME_MATCH if k != "world_size" and getattr(parsed, k) != getattr(exemplar_parsed, k)} == {"lr", "min_lr", "pre_resize", "decode_min_side"}
+        # the LR the trainer computes from the line (run()'s build_schedules call; epoch_length 10 stands in): effective peak = effective end = 1e-4 x 4 x sqrt(128 / 1024) = 1.4142135623730951e-4 exactly, 0 -> that over the 2 warmup cycles, flat after
+        schedule = lambda p, g: build_schedules(lr=p.lr, min_lr=p.min_lr, epochs=p.epochs, warmup_epochs=p.warmup_epochs, epoch_length=10, global_batch_size=g, scale_lr=not p.no_lr_scaling,
+                                                teacher_temp_warmup_epochs=p.teacher_temp_warmup_epochs)
+        sch = schedule(parsed, 128)
+        assert sch["factor"] == lr_scaling_factor(128) and sch["peak_lr"] == sch["end_lr"] == 1.4142135623730951e-4 and parsed.lr == parsed.min_lr == 1e-4 and not parsed.no_lr_scaling
+        assert sch["lr"][0] == 0 and (sch["lr"][:20] < 1.4142135623730951e-4).all() and (sch["lr"][20:] == 1.4142135623730951e-4).all()
+        assert math.isclose(schedule(exemplar_parsed, 128)["peak_lr"], 1.4142135623730951e-3, rel_tol=1e-15) and (parsed.warmup_epochs, parsed.teacher_temp_warmup_epochs) == (2, 2)
+        # 4 cards: G = 64, where the trainer's factor 4 x sqrt(64 / 1024) is exactly 1, so the effective LR is the base itself
+        result, four = launch(root, script="chain/newdata512_cropsrc.sh", env=dict(ENV, SLURM_JOB_GPUS="0,1,2,3"))
+        assert result.returncode == 0 and result.stdout.splitlines()[1] == "LR: base 0.0001 -> effective 0.0001 at global batch 64 (16 x 4 cards; the trainer's sqrt_wrt_1024 rule)"
+        assert math.isclose(schedule(parse(four), 64)["peak_lr"], 1e-4, rel_tol=1e-14)
+        # LR_BASE is the one place to change it: another value is passed as --lr = --min_lr as it stands, and the trainer's factor makes the effective LR value x 1.4142135623730951 at batch 128; zero or text is refused before anything is launched
+        for value, ok in (("1e-3", True), ("0", False), ("fast", False)):
+            changed_root = fake_repo(tempfile.mkdtemp(dir=tmp), SETTINGS_NEW)
+            path = os.path.join(changed_root, "chain", "newdata512_cropsrc.sh")
+            text = open(path).read()
+            assert text.count("\nLR_BASE=0.0001  #") == 1
+            open(path, "w").write(text.replace("\nLR_BASE=0.0001  #", "\nLR_BASE=%s  #" % value))
+            result, other_lr = launch(changed_root, script="chain/newdata512_cropsrc.sh", env=ENV8)
+            if ok:
+                other = parse(other_lr)
+                assert result.returncode == 0 and other.lr == other.min_lr == 1e-3 and math.isclose(schedule(other, 128)["peak_lr"], 1.4142135623730951e-3, rel_tol=1e-14), result.stderr
+            else:
+                assert result.returncode == 1 and other_lr is None and "ERROR: LR_BASE holds '%s'" % value in result.stderr, result
+        # a start from a checkpoint of the 224 px seven-dataset run: all seven heads are in it, so there is no --init_new_heads_from (the trainer refuses it when no dataset is new)
+        later = "/workspace/%s/ckpt/epoch_0003.pth" % RUN224
+        os.makedirs(os.path.join(root, RUN224, "ckpt"))
+        open(os.path.join(root, RUN224, "ckpt", "epoch_0003.pth"), "w").write("x")
+        result, from_later = launch(root, script="chain/newdata512_cropsrc.sh", env=dict(ENV8, CROPSRC_INIT=later, CROPSRC_NEW_HEADS_FROM="none"))
+        edited = list(argv)
+        edited[edited.index("--init_from_checkpoint") + 1] = later
+        i = edited.index("--init_new_heads_from")
+        del edited[i:i + 2]
+        assert result.returncode == 0 and from_later == edited and parse(from_later).init_new_heads_from is None, result.stderr
+        assert "from %s with all its datasets' heads already in it (no --init_new_heads_from)" % later in result.stdout.splitlines()[0]
+        result, other = launch(root, script="chain/newdata512_cropsrc.sh", env=dict(ENV8, CROPSRC_NEW_HEADS_FROM="random"))  # any other value goes to the trainer, which checks it
+        assert result.returncode == 0 and other[other.index("--init_new_heads_from") + 1] == "random"
+        result, none = launch(root, script="chain/newdata512_cropsrc.sh", env=dict(ENV8, CROPSRC_INIT="/workspace/nowhere/ckpt/epoch_0001.pth"))
+        assert result.returncode == 1 and none is None and "ERROR: ./nowhere/ckpt/epoch_0001.pth" in result.stderr, result
+        # the default start is refused when absent, unless the run has an epoch checkpoint of its own
+        bare = fake_repo(os.path.join(tmp, "no_init"), SETTINGS_NEW, init=False)
+        result, none = launch(bare, script="chain/newdata512_cropsrc.sh", env=ENV8)
+        assert result.returncode == 1 and none is None and "ERROR: ./ssl_dinov3_cxr_constlr_arkteacher_seed_100/ckpt/epoch_0200.pth" in result.stderr, result
+        os.makedirs(os.path.join(bare, RUN_CROPSRC, "ckpt"))
+        open(os.path.join(bare, RUN_CROPSRC, "ckpt", "epoch_0003.pth"), "w").write("x")
+        result, resumed = launch(bare, script="chain/newdata512_cropsrc.sh", env=ENV8)
+        assert result.returncode == 0 and resumed == argv, result.stderr
+        # both settings files are needed and checked, naming them, before anything is launched; chain/main_lr.txt is not read (the LR is LR_BASE)
+        names = ("newdata512_cropsrc_stop_after.txt", "newdata512_cropsrc_batch_per_gpu.txt")
+        for name in names:
+            result, none = launch(fake_repo(tempfile.mkdtemp(dir=tmp), dict(SETTINGS_NEW, **{name: None})), script="chain/newdata512_cropsrc.sh", env=ENV8)
+            assert result.returncode == 1 and none is None and "ERROR" in result.stderr and name in result.stderr, (name, result.stderr)
+        for name, value in ((names[0], "0"), (names[0], "1001"), (names[1], "0"), (names[1], "08"), (names[1], "12345")):
+            result, none = launch(fake_repo(tempfile.mkdtemp(dir=tmp), dict(SETTINGS_NEW, **{name: value + "\n"})), script="chain/newdata512_cropsrc.sh", env=ENV8)
+            assert result.returncode == 1 and none is None and "ERROR" in result.stderr and name in result.stderr, (name, value, result.stderr)
+        result, no_lr_file = launch(fake_repo(tempfile.mkdtemp(dir=tmp), dict(SETTINGS_NEW, **{"main_lr.txt": None})), script="chain/newdata512_cropsrc.sh", env=ENV8)
+        assert result.returncode == 0 and no_lr_file == argv, result.stderr
+
+
+def test_newdata512_cropsrc_wrapper():
+    check_wrapper("run_d1_8_newdata512_cropsrc_arkteacher_gaudi.sh", ["--job-name=d1-8-newdata512-cropsrc", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:8", "-c 144", "--mem=480G"],
+                  "newdata512_cropsrc.sh", ("A=$(sbatch --parsable run_d1_8_newdata512_cropsrc_arkteacher_gaudi.sh)", "sbatch -d afterany:$A run_d1_8_newdata512_cropsrc_arkteacher_gaudi.sh",
+                                            "sbatch --gres=gpu:hl225:4 -c 72 --mem=256G run_d1_8_newdata512_cropsrc_arkteacher_gaudi.sh", "chain/newdata512_cropsrc_stop_after.txt",
+                                            "chain/newdata512_cropsrc_batch_per_gpu.txt", "CROPSRC_INIT", "CROPSRC_NEW_HEADS_FROM=none", "taix_unpack_original.sh train", "6.5 GB", "690 GB per 100 cycles"), ENV8)
 
 
 def test_ssl_datasets_default_and_gaudi_extra_binds():

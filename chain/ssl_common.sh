@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Sourced by chain/pilot_a.sh, pilot_b.sh, main.sh, constlr.sh, hires.sh, newdata512.sh and run_d1_8s_timing_gaudi.sh: shared guards plus ssl_launch, which starts
-# base/ssl_pretrain.py on every card of the Slurm allocation (2 or 4), and read_setting, which main.sh, constlr.sh, hires.sh and newdata512.sh read their
+# Sourced by chain/pilot_a.sh, pilot_b.sh, main.sh, constlr.sh, hires.sh, newdata512.sh, newdata224.sh, newdata512_cropsrc.sh and run_d1_8s_timing_gaudi.sh: shared guards plus ssl_launch, which starts
+# base/ssl_pretrain.py on every card of the Slurm allocation (2 or 4), and read_setting, which main.sh, constlr.sh, hires.sh, newdata512.sh, newdata224.sh and newdata512_cropsrc.sh read their
 # settings files with. cwd must be the repo root. No SBATCH header: these phases run inside an allocation that someone else (the chain script)
 # already holds.
 set -euo pipefail
@@ -24,7 +24,7 @@ fi
 # completed phase exits at once ("nothing to do"), a re-submitted chain continues where the last one stopped, and a first
 # run just starts from scratch. Flags in "$@" come last, so they win over the defaults above them.
 # SSL_DATASETS (space-separated dataset names, in this order) picks the --data_set flags; unset or empty, they are the four Stage A sets, exactly as every phase
-# has always launched them. Only chain/newdata512.sh sets it.
+# has always launched them. Only chain/newdata512.sh, newdata224.sh and newdata512_cropsrc.sh set it.
 ssl_launch() {
   local run_name="$1" cards names data_sets=() name
   shift
