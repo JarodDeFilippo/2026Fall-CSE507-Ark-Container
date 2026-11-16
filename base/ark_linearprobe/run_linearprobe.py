@@ -8,12 +8,13 @@ CANDIDPTX (CANDID-PTX pneumothorax, one label: the mAUC is its AUC; the dense pr
 So is TAIXRAY (TAIX-Ray, eight binary findings, present when the grade is above 0: the mAUC is the mean of their eight AUCs, each also in the JSON; the official train and test splits, the val split unused).
 Only the columns with both a positive and a negative example among the test images it is scored on count: the others are dropped and recorded (a smoke cache can make a column single-valued).
 It writes, for each dataset,
-  <results_root>/<tag>/<dataset>.json    per run the best test epoch (0-based, as the script prints it), its mAUC and per-class AUCs; mean and s.d. over the runs; the weights and the
-                                         protocol it ran; flags; for a RayDINO backbone also pretraining_overlap_train (informational: not a flag)
+  <results_root>/<tag>/<dataset>.json    per run the best test epoch (0-based, as the script prints it), its mAUC, mMCC, mAUPRC (the script's mAP) and mF1, each also per class; mean and s.d. over the runs of each,
+                                         per class too (the MCC and the F1 are at the script's per-label Youden-J threshold, found on the test set); the weights and the protocol it ran; flags;
+                                         for a RayDINO backbone also pretraining_overlap_train (informational: not a flag)
                                          (written whole or not at all: a synced .part in probe/<dataset>/, hard-linked into place, or renamed where hard links are refused)
   <results_root>/<tag>/probe/<dataset>/  the script's own files: log.txt (a line per batch, large), linear_eval/<dataset>/<tag>/b2/log.txt (the average over the runs) and
                                          run_<i>/ckpt.pth (each run's best epoch)
-Every number in the JSON comes from the script's own run (its returned records) and is checked against the checkpoints (best epoch) and the average line the script wrote to its log.
+Every number in the JSON comes from the script's own run (its returned records) and is checked against the checkpoints (best epoch) and the average line the script wrote to its log (all four of its mean (s.d.) pairs).
 
 Before anything is fitted it refuses: results that already exist for the tag (the same two paths are checked by run_emb_gaudi.sh before it starts the extraction); a missing cache; caches under
 the tag that were not extracted from the same backbone the same way (model, weights path, size and sha256, normalization, transform, max_images); a dataset none of whose columns can be scored;
@@ -53,6 +54,9 @@ RAYDINO_TRAIN_OVERLAP = "CheXpert, MIMIC-CXR, ChestX-ray14 training splits (RayD
 PROVENANCE = (("model", ("model",)), ("weights path", ("weights", "path")), ("weights size", ("weights", "size_bytes")), ("weights sha256", ("weights", "sha256")),
               ("normalization", ("normalization",)), ("transform", ("transform",)), ("max_images", ("max_images",)))
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+EXTRA_METRICS = ("MCC", "AUPRC", "F1")  # what the JSON carries beside mAUC / AUC, in the order of the script's [mAUC, mMCC, mAP, mF1] and per-class [AUC, MCC, AP, F1] (so index 1, 2, 3); its AP is the AUPRC (sklearn's average_precision_score)
+# the script's last line: its mean(s.d.) over the runs of [mAUC, mMCC, mAP, mF1], four strings in a list; an MCC mean can be negative ('-0.0123(0.0040)')
+AVERAGE_RE = re.compile(r"^Average performance from \d+ runs: \[" + ", ".join([r"'(-?\d\.\d{4})\((\d\.\d{4})\)'"] * 4) + r"\]", re.M)
 
 
 def parse_args(argv=None):
@@ -150,7 +154,9 @@ def protocol_text(options, meta):
 
 
 def collect(options, probe_dir, records, meta, plan, tag):
-    """The dataset's JSON from the script's returned `records` (one per run: best epoch, [mAUC, mMCC, mAP, mF1], [AUC, MCC, AP, F1 per class] at that epoch), checked against the files it wrote."""
+    """The dataset's JSON from the script's returned `records` (one per run: best epoch, [mAUC, mMCC, mAP, mF1], [AUC, MCC, AP, F1 per class] at that epoch), checked against the files it wrote.
+    It carries, per run and per class, the test mAUC, mMCC, mAUPRC (the script's mAP) and mF1 at the run's best-test-mAUC epoch, and the mean and s.d. over the runs of each (per class too); the MCC and the F1 are at
+    the script's per-label Youden-J threshold, found on the test set. All four mean (s.d.) pairs are checked against the average line of the script's log."""
     exp_path = os.path.join(probe_dir, "linear_eval", options.dataset, options.arch, options.exp_name)
     if len(records) != options.runs:
         raise RuntimeError("{} runs returned, --runs {}".format(len(records), options.runs))
@@ -163,19 +169,33 @@ def collect(options, probe_dir, records, meta, plan, tag):
         aucs = record["scores"][0]
         if len(aucs) != len(scored) or abs(float(np.mean(aucs)) - record["performance"][0]) > 1e-12:
             raise RuntimeError("run {}: {} class AUCs for {} scored classes, or their mean is not the run's mAUC".format(record["run"], len(aucs), len(scored)))
+        extra = {}  # the other three metrics, checked as the AUCs are: a value per scored class, whose mean is the run's mean at the same (best) epoch
+        for k, metric in enumerate(EXTRA_METRICS, 1):
+            values = record["scores"][k]
+            if len(values) != len(scored) or abs(float(np.mean(values)) - record["performance"][k]) > 1e-12:
+                raise RuntimeError("run {}: {} class {}s for {} scored classes, or their mean is not the run's m{}".format(record["run"], len(values), metric, len(scored), metric))
+            extra["test_m" + metric], extra["test_" + metric] = float(record["performance"][k]), dict(zip(scored, map(float, values)))
         if record["columns"] != plan["columns"] or record["dropped_columns"] != [{"column": d["column"], "reason": d["reason"]} for d in plan["dropped"]]:  # the script scored what was planned
             raise RuntimeError("run {}: the script scored columns {} and dropped {}, the plan was {} and {}".format(record["run"], record["columns"], record["dropped_columns"], plan["columns"], plan["dropped"]))
         checkpoint = torch.load(os.path.join(exp_path, "run_{}".format(record["run"]), "ckpt.pth"), map_location="cpu", weights_only=False)  # saved at the best epoch; the script's own file, so no allow-list
         if checkpoint["epoch"] != record["best_epoch"]:
             raise RuntimeError("run {}: best epoch {}, its checkpoint is epoch {}".format(record["run"], record["best_epoch"], checkpoint["epoch"]))
         per_run.append({"run": record["run"], "seed": record["seed"], "best_epoch": record["best_epoch"], "test_mAUC": float(record["performance"][0]),
-                        "test_AUC": dict(zip(scored, map(float, aucs)))})
+                        "test_AUC": dict(zip(scored, map(float, aucs))), **extra})
     maucs = np.array([r["test_mAUC"] for r in per_run])
     class_aucs = np.array([[r["test_AUC"][name] for name in scored] for r in per_run])
+    run_means = {"m" + metric: np.array([r["test_m" + metric] for r in per_run]) for metric in ("AUC",) + EXTRA_METRICS}  # each metric's mean per run (mAUC, mMCC, mAUPRC, mF1: the order of the script's average line)
+    extra_stats = {}  # the mAUC's four statistics for the other three metrics: mean and s.d. over the runs of the run's mean, then per class (np.mean / np.std, ddof 0, as the script prints them)
+    for metric in EXTRA_METRICS:
+        class_values = np.array([[r["test_" + metric][name] for name in scored] for r in per_run])
+        extra_stats.update({"test_m{}_mean".format(metric): float(run_means["m" + metric].mean()), "test_m{}_std".format(metric): float(run_means["m" + metric].std()),
+                            "test_{}_mean".format(metric): dict(zip(scored, class_values.mean(0).tolist())), "test_{}_std".format(metric): dict(zip(scored, class_values.std(0).tolist()))})
     with open(os.path.join(exp_path, "log.txt")) as f:  # the script's own mean(s.d.) over the runs, for the four metrics
-        average = re.findall(r"^Average performance from \d+ runs: \['(\d\.\d{4})\((\d\.\d{4})\)'", f.read(), re.M)
-    if average != [("{:.4f}".format(maucs.mean()), "{:.4f}".format(maucs.std()))]:
-        raise RuntimeError("mean (s.d.) mAUC {:.4f} ({:.4f}) recomputed, {} in the script's log".format(maucs.mean(), maucs.std(), average))
+        average = AVERAGE_RE.findall(f.read())  # one 8-tuple (mean, s.d., mean, s.d., ...) per average line: exactly one is expected
+    for i, (metric, values) in enumerate(run_means.items()):
+        recomputed, logged = ("{:.4f}".format(values.mean()), "{:.4f}".format(values.std())), [line[2 * i:2 * i + 2] for line in average]
+        if logged != [recomputed]:
+            raise RuntimeError("mean (s.d.) {} {} ({}) recomputed, {} in the script's log".format(metric, *recomputed, logged))
     warnings = ["{}: {} among the evaluated test images, so no AUC: not scored (left out of the means)".format(d["name"], d["reason"]) for d in plan["dropped"]]
     result = {
         "tag": tag, "dataset": options.dataset, "model": meta["model"], "weights": {"path": meta["weights"]["path"], "size_bytes": meta["weights"]["size_bytes"], "sha256": meta["weights"]["sha256"]},
@@ -185,6 +205,7 @@ def collect(options, probe_dir, records, meta, plan, tag):
         "classes": scored, "dropped_columns": plan["dropped"], "per_run": per_run, "best_epoch_per_run": [r["best_epoch"] for r in per_run],
         "test_mAUC_mean": float(maucs.mean()), "test_mAUC_std": float(maucs.std()),  # np.average / np.std (ddof 0), as the script prints them
         "test_AUC_mean": dict(zip(scored, class_aucs.mean(0).tolist())), "test_AUC_std": dict(zip(scored, class_aucs.std(0).tolist())),
+        **extra_stats,
         "flags": {"selection": SELECTION, "rad_dino_pretraining_overlap": rad_dino_flag(meta, tag, options.dataset)}, "warnings": warnings,
         "script_log": os.path.relpath(os.path.join(exp_path, "log.txt"), os.path.dirname(os.path.dirname(probe_dir))),  # relative to results/<tag>
     }

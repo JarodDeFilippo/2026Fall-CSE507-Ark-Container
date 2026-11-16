@@ -922,7 +922,8 @@ with tempfile.TemporaryDirectory() as tmp:
         classes = {"ChestXray14": real_config["ChestXray14"]["diseases"], "CheXpert": real_config["CheXpert"]["test_diseases_name"], "MIMIC": real_config["MIMIC"]["diseases"],
                    "VinDrCXR": real_config["VinDrCXR"]["diseases"]}
         keys = ["tag", "dataset", "model", "weights", "protocol", "embeddings_dir", "normalization", "max_images", "n", "runs", "seed", "epochs", "classes", "dropped_columns", "per_run",
-                "best_epoch_per_run", "test_mAUC_mean", "test_mAUC_std", "test_AUC_mean", "test_AUC_std", "flags", "warnings", "script_log", "elapsed_s"]
+                "best_epoch_per_run", "test_mAUC_mean", "test_mAUC_std", "test_AUC_mean", "test_AUC_std", "test_mMCC_mean", "test_mMCC_std", "test_MCC_mean", "test_MCC_std",
+                "test_mAUPRC_mean", "test_mAUPRC_std", "test_AUPRC_mean", "test_AUPRC_std", "test_mF1_mean", "test_mF1_std", "test_F1_mean", "test_F1_std", "flags", "warnings", "script_log", "elapsed_s"]
         for name in NAMES:
             result = load_result(res_root, "sig", name)
             assert list(result) == keys, list(result)
@@ -940,14 +941,23 @@ with tempfile.TemporaryDirectory() as tmp:
             for j, class_name in enumerate(classes[name]):  # the per-class mean and s.d. over the runs
                 column = [r["test_AUC"][class_name] for r in runs]
                 assert abs(result["test_AUC_mean"][class_name] - np.mean(column)) < 1e-12 and abs(result["test_AUC_std"][class_name] - np.std(column)) < 1e-12
+            assert all(list(r) == ["run", "seed", "best_epoch", "test_mAUC", "test_AUC", "test_mMCC", "test_MCC", "test_mAUPRC", "test_AUPRC", "test_mF1", "test_F1"] for r in runs)  # the five keys as before, then the three metrics
+            for metric in ("MCC", "AUPRC", "F1"):  # the same checks for the other three metrics (the script's mMCC, mAP, mF1)
+                assert all(list(r["test_" + metric]) == classes[name] and abs(r["test_m" + metric] - np.mean(list(r["test_" + metric].values()))) < 1e-12 for r in runs)  # a run's mean is the mean of its per-class values
+                means = [r["test_m" + metric] for r in runs]
+                assert result["test_m{}_mean".format(metric)] == float(np.mean(means)) and result["test_m{}_std".format(metric)] == float(np.std(means))
+                assert list(result["test_{}_mean".format(metric)]) == list(result["test_{}_std".format(metric)]) == classes[name]
+                for class_name in classes[name]:
+                    column = [r["test_" + metric][class_name] for r in runs]
+                    assert abs(result["test_{}_mean".format(metric)][class_name] - np.mean(column)) < 1e-12 and abs(result["test_{}_std".format(metric)][class_name] - np.std(column)) < 1e-12
             assert result["flags"] == {"selection": "best epoch on test (as shipped)", "rad_dino_pretraining_overlap": None}
             results_dir, run_dir = script_dir(res_root, "sig", name)
             assert sorted(os.listdir(run_dir)) == sorted(["log.txt"] + ["run_{}".format(i) for i in range(10)]) and all(os.path.isfile(os.path.join(run_dir, "run_{}".format(i), "ckpt.pth")) for i in range(10))
             assert os.path.isfile(os.path.join(results_dir, "log.txt")) and os.path.join(res_root, "sig", result["script_log"]) == os.path.join(run_dir, "log.txt")
             assert "PROBE sig {}: test mAUC {:.4f} ({:.4f}) over 10 runs, best epoch on test (as shipped), best epochs {}".format(
                 name, result["test_mAUC_mean"], result["test_mAUC_std"], result["best_epoch_per_run"]) in out
-        print("OK (g1) the runner on synthetic embeddings, all four datasets: 10 runs by default, seeds 0..9, per run the best test epoch, its mAUC and per-class AUCs, mean / s.d. over the runs "
-              "(np.average / np.std), scored classes (CheXpert: its 5 findings), the weights (path, size) and the protocol text built from the effective settings, flags.selection, the script's own "
+        print("OK (g1) the runner on synthetic embeddings, all four datasets: 10 runs by default, seeds 0..9, per run the best test epoch, its mAUC and per-class AUCs (and mMCC, mAUPRC, mF1, each per class), "
+              "mean / s.d. over the runs (np.average / np.std), scored classes (CheXpert: its 5 findings), the weights (path, size) and the protocol text built from the effective settings, flags.selection, the script's own "
               "files (log.txt, run_<i>/ckpt.pth) beside the JSON")
 
         # run i is seeded with --seed + i, before its data module is built: --seed 1 run 0 is --seed 0 run 1 (MIMIC's soft labels and CheXpert's draws included); the same seed repeats exactly
@@ -983,18 +993,27 @@ with tempfile.TemporaryDirectory() as tmp:
         print("OK (g2) seeds: the same --seed reproduces every run exactly; --seed 1 run 0 equals --seed 0 run 1 on all four datasets; another seed gives other results; random is seeded with "
               "seed + run before the data module is built (MIMIC's draws)")
 
-        # the JSON is checked against the script's own files: a changed average line, a best epoch that its checkpoint does not carry, and a run without a defined mAUC are refused
+        # the JSON is checked against the script's own files: a changed average line (any of its four mean (s.d.) pairs), a best epoch that its checkpoint does not carry, and a run without a defined mAUC are refused
         for name in ("ChestXray14", "MIMIC"):
-            for tag in ("t1", "t2", "t3", "t4"):
+            for tag in ("t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11"):
                 clone_cache(emb_root, "sig", tag, name)
 
-        def tampered(kind, stock_main):
+        def tampered(kind, stock_main, pair=0):
             def wrapper(options):
                 records = stock_main(options)
                 exp = os.path.join(options.results_dir, "linear_eval", options.dataset, options.arch, options.exp_name)
-                if kind == "average":
+                if kind == "average":  # the mean of the average line's pair-th mean(s.d.) (0 mAUC, 1 mMCC, 2 mAUPRC, 3 mF1) becomes 0.1234
                     text = open(os.path.join(exp, "log.txt")).read()
-                    open(os.path.join(exp, "log.txt"), "w").write(re.sub(r"(Average performance from \d+ runs: \[')\d\.\d{4}", r"\g<1>0.1234", text))
+                    open(os.path.join(exp, "log.txt"), "w").write(re.sub(r"(Average performance from \d+ runs: \[(?:'[^']*', ){" + str(pair) + r"}')-?\d\.\d{4}", r"\g<1>0.1234", text))
+                elif kind == "negative":  # every run's MCCs negated in the records AND in the script's average line: still consistent, so accepted, and the line's second mean carries a '-'
+                    for record in records:
+                        record["performance"][1] = -record["performance"][1]
+                        record["scores"][1] = [-v for v in record["scores"][1]]
+                    column = np.array([record["performance"][1] for record in records])
+                    text = open(os.path.join(exp, "log.txt")).read()
+                    open(os.path.join(exp, "log.txt"), "w").write(re.sub(r"(Average performance from \d+ runs: \['[^']*', ')[^']*'", r"\g<1>{:.4f}({:.4f})'".format(column.mean(), column.std()), text))
+                elif kind == "scores":  # one class value of run 0 (list `pair` of the script's [AUC, MCC, AP, F1]) moved: the mean of the list is not the run's any more
+                    records[0]["scores"][pair][0] += 0.5
                 elif kind == "epoch":
                     records[0]["best_epoch"] += 1
                 elif kind == "columns":
@@ -1002,15 +1021,31 @@ with tempfile.TemporaryDirectory() as tmp:
                 return records
             return wrapper
 
-        for kind, tag, expected in (("average", "t1", "recomputed"), ("epoch", "t2", "its checkpoint is epoch"), ("columns", "t4", "the script scored columns [0, 1, 2] and dropped [], the plan was None and []")):
+        for kind, tag, expected, *pair in (("average", "t1", "recomputed"), ("epoch", "t2", "its checkpoint is epoch"), ("columns", "t4", "the script scored columns [0, 1, 2] and dropped [], the plan was None and []"),
+                                           ("average", "t5", "mean (s.d.) mMCC ", 1), ("average", "t6", "mean (s.d.) mAUPRC ", 2), ("average", "t7", "mean (s.d.) mF1 ", 3),  # the other three pairs, each changed alone
+                                           ("scores", "t9", "run 0: 14 class MCCs for 14 scored classes, or their mean is not the run's mMCC", 1), ("scores", "t10", "run 0: 14 class AUPRCs for 14 scored classes, or their mean is not the run's mAUPRC", 2),
+                                           ("scores", "t11", "run 0: 14 class F1s for 14 scored classes, or their mean is not the run's mF1", 3)):  # ... and a per-class list whose mean is not the run's, as the AUCs are checked
             with short_epochs(3):
                 shortened = main_linearprobing.main
-                main_linearprobing.main = tampered(kind, shortened)
+                main_linearprobing.main = tampered(kind, shortened, *pair)
                 try:
-                    rejects(RuntimeError, lambda: run_fit(tag, emb_root, res_root, "--datasets", "ChestXray14", "--runs", "2"), expected)
+                    message = rejects(RuntimeError, lambda: run_fit(tag, emb_root, res_root, "--datasets", "ChestXray14", "--runs", "2"), expected)
                 finally:
                     main_linearprobing.main = shortened
+            assert kind != "average" or re.fullmatch(r"mean \(s\.d\.\) m\w+ -?\d\.\d{4} \(\d\.\d{4}\) recomputed, \[\('0\.1234', '\d\.\d{4}'\)\] in the script's log", message), message  # metric, recomputed pair, what the log says
             assert not os.path.exists(os.path.join(res_root, tag, "ChestXray14.json"))  # nothing is written for a result that did not check out
+        # a negative MCC mean is printed by the script with a '-' ('-0.0123(0.0040)'): the runner reads it, and the JSON agrees
+        with short_epochs(3):
+            shortened = main_linearprobing.main
+            main_linearprobing.main = tampered("negative", shortened)
+            try:
+                run_fit("t8", emb_root, res_root, "--datasets", "ChestXray14", "--runs", "2")
+            finally:
+                main_linearprobing.main = shortened
+        negative = load_result(res_root, "t8", "ChestXray14")
+        with open(os.path.join(script_dir(res_root, "t8", "ChestXray14")[1], "log.txt")) as f:
+            logged = re.findall(r"^Average performance from 2 runs: \['\d\.\d{4}\(\d\.\d{4}\)', '(-\d\.\d{4})\(\d\.\d{4}\)', ", f.read(), re.M)  # the line as the wrapper left it: a '-' on the second mean
+        assert negative["test_mMCC_mean"] < 0 and logged == ["{:.4f}".format(negative["test_mMCC_mean"])] and all(r["test_mMCC"] < 0 for r in negative["per_run"]), (logged, negative["test_mMCC_mean"])
         main_linearprobing.test = scripted_test([float("nan")] * 3)
         try:
             with short_epochs(3):
@@ -1018,8 +1053,9 @@ with tempfile.TemporaryDirectory() as tmp:
         finally:
             main_linearprobing.test = stock_test
         assert not os.path.exists(os.path.join(res_root, "t3", "MIMIC.json"))
-        print("OK (g3) cross-checks: a JSON whose mean (s.d.) differs from the script's own average line, a best epoch that its checkpoint does not carry, columns that the script scored but the runner "
-              "did not plan, or a run whose test mAUC was never defined is refused, and no JSON is written")
+        print("OK (g3) cross-checks: a JSON whose mean (s.d.) differs from the script's own average line (mAUC, mMCC, mAUPRC or mF1 pair, each altered alone: the refusal names the metric, the recomputed pair and "
+              "what the log says), a per-class MCC, AUPRC or F1 list whose mean is not the run's, a best epoch that its checkpoint does not carry, columns that the script scored but the runner did not plan, or a run "
+              "whose test mAUC was never defined is refused, and no JSON is written; a negative MCC mean ('-0.xxxx(...)') in the script's line is read and the JSON agrees")
 
         # the preflight: results that exist stop the run FIRST, before the cache is looked at (and run_emb_gaudi.sh checks the same two paths before it starts the extraction)
         assert run_linearprobe.results_of("R", "tag", "MIMIC") == [os.path.join("R", "tag", "MIMIC.json"), os.path.join("R", "tag", "probe", "MIMIC")]
