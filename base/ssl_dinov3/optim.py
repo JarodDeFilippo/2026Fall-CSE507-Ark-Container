@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from dinov3.train.cosine_lr_scheduler import linear_warmup_cosine_decay
+from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosine_decay
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
 
 LAYERWISE_DECAY = 0.9  # ssl_default_config optim.layerwise_decay
@@ -42,10 +42,12 @@ def lr_scaling_factor(global_batch_size):
 
 
 def build_schedules(*, lr, min_lr, epochs, warmup_epochs, epoch_length, global_batch_size, scale_lr=True,
-                    teacher_temp_warmup_epochs, warmup_teacher_temp=0.04, teacher_temp=0.07, freeze_last_layer_epochs=1):
+                    teacher_temp_warmup_epochs, warmup_teacher_temp=0.04, teacher_temp=0.07, freeze_last_layer_epochs=1,
+                    weight_decay=None, weight_decay_end=None):
     """build_schedulers_v2: per-iteration numpy arrays over epochs * epoch_length steps. LR peak and end are both scaled,
     as Meta does; scale_lr=False keeps --lr / --min_lr absolute. Weight decay and teacher momentum are constants here
-    (the Gram-anchor config's start == peak == end), so they are not arrays."""
+    (the Gram-anchor config's start == peak == end), so they are not arrays, except weight decay when weight_decay_end is given:
+    "wd" is then DINOv2's build_schedulers cosine from weight_decay to weight_decay_end over every step, no warmup (None otherwise)."""
     total = epochs * epoch_length
     factor = lr_scaling_factor(global_batch_size) if scale_lr else 1.0
     peak, end = lr * factor, min_lr * factor
@@ -58,8 +60,10 @@ def build_schedules(*, lr, min_lr, epochs, warmup_epochs, epoch_length, global_b
         start=warmup_teacher_temp, peak=teacher_temp, end=teacher_temp,
         warmup_iterations=teacher_temp_warmup_epochs * epoch_length, total_iterations=total,
     )
+    wd_schedule = None if weight_decay_end is None else CosineScheduler(
+        base_value=weight_decay, final_value=weight_decay_end, total_iters=total).schedule  # dinov2 train.py build_schedulers: wd
     return dict(lr=lr_schedule, last_layer_lr=last_layer_lr_schedule, teacher_temp=teacher_temp_schedule,
-                peak_lr=peak, end_lr=end, factor=factor)
+                peak_lr=peak, end_lr=end, factor=factor, wd=wd_schedule)
 
 
 def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr, freeze_backbone=False):

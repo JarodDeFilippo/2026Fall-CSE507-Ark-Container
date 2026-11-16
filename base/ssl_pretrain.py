@@ -87,6 +87,12 @@ groups, the last-layer freeze, the EMA and Ark blends follow, since each iterate
 --resume (a checkpoint without the key reads as False), recorded in args.json and matched by --branch_from; an --init_from_checkpoint source must match it too (the load is
 strict: an untied file into a tied run raises naming its ibot_head keys as unexpected, a tied file into an untied run as missing).
 
+--weight_decay_end W gives the weight decay DINOv2's schedule: build_schedulers' CosineScheduler(base_value=optim.weight_decay, final_value=optim.weight_decay_end, total_iters=epochs x epoch length; 0.04 to 0.4
+in DINOv2's ssl_default_config), the vendored one as is (ssl_dinov3/optim.py build_schedules): a cosine from --weight_decay at step 0 to W over every step of the --epochs schedule, no warmup (its last entry is one
+step short of W), so a run stopped earlier (--stop_after_epochs) has followed only the first part of it. Off by default (none): --weight_decay on every step, bitwise as before. The ssl_losses.csv wd column is the
+value the step applied (the schedule's entry for it, before each group's wd_multiplier; --weight_decay itself on every row of a default run), and one line says so at the start. Locked on --resume (a checkpoint
+without the key reads as None), recorded in args.json and matched by --branch_from; a negative, NaN or infinite W is refused.
+
 --cyclic_ark_teacher is the Ark+ / Foundation X teacher transplanted into this trainer (Jarod, 2026-10-26). A cycle replaces the mixed-batch epoch: the
 --data_set datasets in turn, largest first by image count (computed and logged; on the four CXR sets MIMIC, CheXpert, ChestXray14, VinDrCXR, whatever the
 --data_set order; a tie keeps that order), every batch from one dataset. Per dataset the cycle runs its release pass, one full pass over the dataset with
@@ -190,6 +196,7 @@ LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "i
 # gram_teacher_from: likewise its Gram teacher's source (read only at the branch's start): a branch resumes only with the same one, or none if it had none
 # drop_path_rate / rope_rescale_coords / untie_local_cls_norm: the student's training recipe (its forward; untied, its parameters too)
 # no_ibot_separate_head: the models' parameters (no ibot_head) and what the iBOT loss reads (the DINO head), so a --branch_from must match it too (not branch-free)
+# weight_decay_end: the weight decay every step applies (none: --weight_decay throughout; given: a cosine from it to this over the --epochs schedule), so a --branch_from must match it too (not branch-free)
 # cyclic_ark_teacher / ark_teacher_momentum / teacher_clean_view / heads / lock_half_pass / keep_all_checkpoints: the Ark-teacher mode (its data order,
 # teacher rule, teacher views, head parameters, lock passes, checkpoint record); a --branch_from must match them too (none is branch-free)
 # pre_resize: the image the crops are cut from (squashed to N x N first; 0: the full decode); like the crop sizes it changes the inputs, so a --branch_from must match it too
@@ -199,16 +206,16 @@ RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_
                 "local_crops_size", "gram_teacher_size", "gram_refresh_steps", "freeze_backbone_epochs", "local_crops_number",
                 "seed", "bf16", "world_size", "init_from_checkpoint", "init_new_heads_from", "no_gram", "branch_from", "drop_path_rate",
                 "rope_rescale_coords", "untie_local_cls_norm", "cyclic_ark_teacher", "ark_teacher_momentum", "teacher_clean_view", "heads",
-                "lock_half_pass", "keep_all_checkpoints", "gram_teacher_from", "pre_resize", "decode_min_side", "no_ibot_separate_head")
+                "lock_half_pass", "keep_all_checkpoints", "gram_teacher_from", "pre_resize", "decode_min_side", "no_ibot_separate_head", "weight_decay_end")
 # checkpoints written before the crop-size flags existed (pilots, main, constlr) were all trained at these
 CROP_DEFAULTS = dict(global_crops_size=224, local_crops_size=96, gram_teacher_size=448)
 # keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off, no --branch_from (nor
 # --gram_teacher_from), no --init_new_heads_from, no recipe setting (drop path 0, no RoPE rescale, tied CLS norm), no --pre_resize (crops cut from the full decode), no --decode_min_side (the decode side
-# follows the crop sizes), a separate iBOT head (--no_ibot_separate_head off), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads, no lock passes, the pruned checkpoint record)
+# follows the crop sizes), a separate iBOT head (--no_ibot_separate_head off), a constant weight decay (no --weight_decay_end), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads, no lock passes, the pruned checkpoint record)
 ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None, drop_path_rate=0.0, rope_rescale_coords=None, untie_local_cls_norm=False,
                     cyclic_ark_teacher=False, ark_teacher_momentum=None, teacher_clean_view=False, heads="shared", lock_half_pass=False,
                     keep_all_checkpoints=False, gram_teacher_from=None, init_new_heads_from=None, pre_resize=0, decode_min_side=0,
-                    no_ibot_separate_head=False)
+                    no_ibot_separate_head=False, weight_decay_end=None)
 # what a --branch_from start may differ from its source in (check_resume skips these): the Gram switch and knobs the branch turns on, the path itself,
 # the source's own init provenance (its full state is restored; a branch cannot pass --init_from_checkpoint or --init_new_heads_from, so they would always differ)
 # and the Gram teacher's own source (a no-Gram trunk has none)
@@ -274,6 +281,9 @@ def parse_args(argv=None):
                    help="--lr/--min_lr are absolute (default: scaled by dinov3's sqrt_wrt_1024 rule)")
     p.add_argument("--warmup_epochs", type=int, default=4)
     p.add_argument("--weight_decay", type=float, default=0.04)
+    p.add_argument("--weight_decay_end", type=float, default=None,
+                   help="the weight decay's final value: given, it follows a cosine from --weight_decay at step 0 to this over every step of the --epochs schedule, no warmup "
+                        "(DINOv2's optim.weight_decay_end, 0.4 in its ssl_default_config; build_schedulers' CosineScheduler); default: --weight_decay on every step")
     p.add_argument("--momentum_teacher", type=float, default=None,
                    help=f"per-step EMA teacher momentum (default {DEFAULT_MOMENTUM_TEACHER}); refused with --cyclic_ark_teacher, which has no per-step EMA")
     p.add_argument("--teacher_temp_warmup_epochs", type=int, default=12)
@@ -341,6 +351,8 @@ def parse_args(argv=None):
             p.error(f"--{name} is empty: pass a checkpoint path, or leave the flag out")
     if not 0.0 <= args.drop_path_rate < 1.0:  # 1 would drop every sample of every residual branch (and NaN fails both)
         p.error(f"--drop_path_rate must be in [0, 1), got {args.drop_path_rate}")
+    if args.weight_decay_end is not None and not (math.isfinite(args.weight_decay_end) and args.weight_decay_end >= 0.0):  # 0 is a decay to none; NaN and inf fail the test
+        p.error(f"--weight_decay_end must be a finite number >= 0 (the weight decay at the end of the schedule), got {args.weight_decay_end}")
     if args.pre_resize < 0:  # 0 is off
         p.error(f"--pre_resize must be 0 (off) or a size in pixels, got {args.pre_resize}")
     if args.decode_min_side < 0:  # 0 is off
@@ -745,13 +757,17 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     sch = build_schedules(lr=args.lr, min_lr=args.min_lr, epochs=args.epochs, warmup_epochs=args.warmup_epochs,
                           epoch_length=epoch_length, global_batch_size=global_batch, scale_lr=not args.no_lr_scaling,
                           teacher_temp_warmup_epochs=args.teacher_temp_warmup_epochs,
-                          freeze_last_layer_epochs=FREEZE_LAST_LAYER_EPOCHS)
+                          freeze_last_layer_epochs=FREEZE_LAST_LAYER_EPOCHS,
+                          weight_decay=args.weight_decay, weight_decay_end=args.weight_decay_end)
     total_steps = args.epochs * epoch_length
     if args.no_lr_scaling:
         say(f"LR: --no_lr_scaling, peak = --lr = {args.lr:g}, end {sch['end_lr']:g}")
     else:
         say(f"LR: --lr {args.lr:g} x sqrt_wrt_1024 factor 4*sqrt({global_batch}/1024) = {sch['factor']:.4f} "
             f"-> peak {sch['peak_lr']:g}, end {sch['end_lr']:g}")
+    if args.weight_decay_end is not None:  # the default prints nothing new
+        say(f"weight decay: cosine from {args.weight_decay:g} to {args.weight_decay_end:g} over the {total_steps} steps of the {args.epochs}-epoch schedule "
+            "(--weight_decay_end; DINOv2's build_schedulers)")
     say(f"epoch_length {epoch_length} steps, {total_steps} steps in the {args.epochs}-epoch schedule, "
         f"stopping after epoch {stop_epoch} (step {stop_epoch * epoch_length})")
     for s in args.gram_refresh_steps:
@@ -887,7 +903,8 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                     + (f"a random half, {n_images // 2} of {n_images} images" if lock else f"all {n_images} images") + f", {lengths[(name, phase)]} steps): "
                     + ("backbone frozen (LR 0, no optimizer step), heads train" if lock else "backbone and heads train" + ("; the backbone at LR 0 in this frozen cycle" if freeze else "")))
             lr, temp = float(sch["lr"][it]), float(sch["teacher_temp"][it])
-            apply_optim_scheduler(optimizer, lr, args.weight_decay, float(sch["last_layer_lr"][it]), freeze_backbone=freeze or lock)
+            wd = args.weight_decay if sch["wd"] is None else float(sch["wd"][it])  # --weight_decay_end: the cosine's entry for this step; else the constant itself
+            apply_optim_scheduler(optimizer, lr, wd, float(sch["last_layer_lr"][it]), freeze_backbone=freeze or lock)
             optimizer.zero_grad(set_to_none=True)
             loss, loss_dict = meta.forward_backward(data, teacher_temp=temp)
             accelerator.mark_step()
@@ -935,7 +952,7 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                 momentum = args.momentum_teacher if not args.cyclic_ark_teacher else args.ark_teacher_momentum if blend else 1.0
                 if main:
                     with open(csv_path, "a", newline="") as f:
-                        csv.writer(f).writerow([it, epoch, dg, dl, ko, ib, gr, total, lr, args.weight_decay,
+                        csv.writer(f).writerow([it, epoch, dg, dl, ko, ib, gr, total, lr, wd,
                                                 momentum, temp, args.gram_weight, step_time, data_time, tag])
                     print(f"step {step}/{total_steps} epoch {epoch} | dino_g {dg:.4f} dino_l {dl:.4f} koleo {ko:.4f} "
                           f"ibot {ib:.4f} gram {gr:.5f} total {total:.4f} | lr {lr:.3e} temp {temp:.4f} | "

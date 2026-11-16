@@ -2742,6 +2742,173 @@ print("OK (y) two real ranks (tied, --no_gram --cyclic_ark_teacher, batch 1 per 
       "a step (the teacher's under no_grad, the student's with 8 rows more, its local crops); the student's DDP modules are exactly backbone and dino_head, each DistributedDataParallel with "
       "find_unused_parameters 0; student and teacher end bitwise alike on both ranks, with no ibot_head key; the step-15 checkpoint holds both ranks' RNG states")
 
+# (z) weight decay schedule (--weight_decay_end) and the fixed-length cosine of the planned run -----------------------------------------------------------------------------------------------
+# --weight_decay_end W gives the weight decay DINOv2's build_schedulers wd: the vendored CosineScheduler(--weight_decay, W, epochs x epoch_length) as is, its entry at the step; none, the default, keeps --weight_decay itself on every step.
+# The planned run: --cyclic_ark_teacher on the seven datasets, --epochs E --warmup_epochs W --teacher_temp_warmup_epochs T --lr 2e-3 --min_lr 1e-6 --no_lr_scaling --weight_decay 0.04 --weight_decay_end 0.4 on 8 ranks x 64 (global
+# batch 512), (E, W, T) = (100, 10, 30) or (30, 3, 9). (c) checks its schedules at the real sizes; (d) and (e) its mode end to end in miniature: (x)'s data, --no_gram --cyclic_ark_teacher --no_ibot_separate_head, 15 steps a cycle,
+# E = 2, W = T = 1
+from dinov3.train.cosine_lr_scheduler import CosineScheduler
+
+Z_FLAG = "--weight_decay_end"
+
+# (a) parse: none by default (= ARG_DEFAULTS, what a checkpoint without the key reads as), --resume-locked, not branch-free; a value parses and changes nothing else; a negative, NaN or infinite one exits 2 naming the flag
+assert P().weight_decay_end is None and ssl_pretrain.ARG_DEFAULTS["weight_decay_end"] is None
+assert "weight_decay_end" in ssl_pretrain.RESUME_MATCH and "weight_decay_end" not in ssl_pretrain.BRANCH_FREE
+assert P(Z_FLAG, "0.4").weight_decay_end == 0.4 and vars(P(Z_FLAG, "0.4")) == dict(vars(P()), weight_decay_end=0.4) and P(Z_FLAG, "0").weight_decay_end == 0.0  # 0: a decay to none, allowed
+for z_bad in ("-0.1", "nan", "inf"):
+    with contextlib.redirect_stderr(io.StringIO()) as z_err:
+        assert raises(SystemExit, P, Z_FLAG, z_bad) == "2"
+    assert Z_FLAG in z_err.getvalue().split("error: ", 1)[1], (z_bad, z_err.getvalue())
+print("OK (z) parse: --weight_decay_end is none by default (= ARG_DEFAULTS, what a checkpoint without the key reads as), --resume-locked and not branch-free; 0.4 (and 0) parse and change no other setting; -0.1, nan and inf "
+      "each exit 2 naming the flag")
+
+# (b) build_schedules: without the new keywords, with them and no end, and with an end, every existing array and value is bitwise the same, and "wd" is None unless an end is given; with 0.04 -> 0.4 it is exactly the vendored CosineScheduler's
+z_kw = dict(lr=2e-3, min_lr=1e-6, epochs=40, warmup_epochs=4, epoch_length=1000, global_batch_size=512, scale_lr=False, teacher_temp_warmup_epochs=12)
+z_plain, z_none, z_both = build_schedules(**z_kw), build_schedules(**z_kw, weight_decay=0.04, weight_decay_end=None), build_schedules(**z_kw, weight_decay=0.04, weight_decay_end=0.4)
+z_old_keys = {"lr", "last_layer_lr", "teacher_temp", "peak_lr", "end_lr", "factor"}
+assert set(z_plain) == set(z_none) == set(z_both) == z_old_keys | {"wd"} and z_plain["wd"] is None and z_none["wd"] is None
+assert all(same_state(z_plain[k], z_none[k]) and same_state(z_plain[k], z_both[k]) for k in z_old_keys)  # the arrays and the peak / end / factor floats
+z_total = z_kw["epochs"] * z_kw["epoch_length"]
+assert z_both["wd"].shape == (z_total,) == z_both["lr"].shape and z_both["wd"].dtype == np.float64
+assert same_state(z_both["wd"], CosineScheduler(0.04, 0.4, z_total).schedule)
+assert abs(z_both["wd"][0] - 0.04) < 1e-15 and abs(z_both["wd"][-1] - 0.4) < 1e-9 and (np.diff(z_both["wd"]) >= 0).all() and z_both["wd"][-1] > z_both["wd"][0]  # the last entry is one step short of the end value
+print("OK (z) build_schedules: with no end the result has every old key bitwise as without the keywords and wd None (also when --weight_decay is passed); with 0.04 -> 0.4 over %d steps every old array is still bitwise "
+      "the same and wd is exactly CosineScheduler(0.04, 0.4, %d).schedule: first entry %.17g (within %.1e of 0.04), last %.17g (%.1e short of 0.4), never decreasing"
+      % (z_total, z_total, z_both["wd"][0], abs(z_both["wd"][0] - 0.04), z_both["wd"][-1], 0.4 - z_both["wd"][-1]))
+
+# (c) the planned run's schedules at its real sizes. epoch_length L = the sum over the seven datasets of floor(floor(images / ranks) / 64), counted by build_data_loader itself (DistributedSampler drop_last, then the loader's) on a dataset of that
+# many items. The counts: MIMIC, CheXpert, ChestXray14 and VinDrCXR are (x)'s real lists and PadChest's is test_newdata.py's 160,828; the TAIXRay list (the paper's 137,593 train rows) and the ReXGradient one (238,968 train images; it stays on Sol
+# under a data-use agreement) exist only on the cluster, so those two are the numbers chain/newdata224.sh's header derives its per-dataset steps and 4763 a cycle at 4 x 64 from (1,220,075 images in all), and the DINO-X registry row
+# ssl-newdata512_arkteacher (registry/runs.tsv, its cycles cell) lists with the other five; that run's args.json (DINO-X results/jarod/ssl/ssl_dinov3_cxr_newdata512_arkteacher_seed_100) records epoch_length 9528 at 8 x 16, which the counts reproduce
+Z_IMAGES = dict(MIMIC=368960, ReXGradient=238968, CheXpert=223414, PadChest=160828, TAIXRay=137593, ChestXray14=75312, VinDrCXR=15000)
+z_steps = lambda ranks, batch: {name: len(ssl_data.build_data_loader(range(n), batch, 0, 0, ranks, 100, False, None)[0]) for name, n in Z_IMAGES.items()}
+assert sum(Z_IMAGES.values()) == 1220075 and z_steps(4, 64) == dict(MIMIC=1441, ReXGradient=933, CheXpert=872, PadChest=628, TAIXRay=537, ChestXray14=294, VinDrCXR=58)  # newdata224.sh's header, per dataset
+assert z_steps(8, 64) == dict(MIMIC=720, ReXGradient=466, CheXpert=436, PadChest=314, TAIXRay=268, ChestXray14=147, VinDrCXR=29)
+z_L = sum(z_steps(8, 64).values())
+assert z_L == 2380 and sum(z_steps(4, 64).values()) == 4763 and sum(z_steps(8, 16).values()) == 9528  # the planned run (8 x 64); the 224 px seven-dataset run (4 x 64); the 512 px run (8 x 16)
+z_planned = [a for name in Z_IMAGES for a in ("--data_set", name)] + ["--pretrained_weights", "w", "--output_dir", "o", "--cyclic_ark_teacher", "--lr", "2e-3", "--min_lr", "1e-6", "--no_lr_scaling",
+                                                                        "--weight_decay", "0.04", Z_FLAG, "0.4"]
+for z_E, z_W, z_T in ((100, 10, 30), (30, 3, 9)):
+    z_args = ssl_pretrain.parse_args(z_planned + ["--epochs", str(z_E), "--warmup_epochs", str(z_W), "--teacher_temp_warmup_epochs", str(z_T)])
+    assert ssl_pretrain.check_args(z_args) == z_E  # accepted, and the run stops after cycle E
+    z_sch = build_schedules(lr=z_args.lr, min_lr=z_args.min_lr, epochs=z_args.epochs, warmup_epochs=z_args.warmup_epochs, epoch_length=z_L, global_batch_size=8 * 64, scale_lr=not z_args.no_lr_scaling,
+                            teacher_temp_warmup_epochs=z_args.teacher_temp_warmup_epochs, freeze_last_layer_epochs=ssl_pretrain.FREEZE_LAST_LAYER_EPOCHS,
+                            weight_decay=z_args.weight_decay, weight_decay_end=z_args.weight_decay_end)  # run()'s call
+    z_lr, z_temp, z_last, z_wd = z_sch["lr"], z_sch["teacher_temp"], z_sch["last_layer_lr"], z_sch["wd"]
+    z_n, z_lr_peak, z_temp_top = z_E * z_L, z_W * z_L, z_T * z_L  # steps in the schedule; the step the LR peaks at, and the one the teacher temperature tops out at
+    assert (z_sch["factor"], z_sch["peak_lr"], z_sch["end_lr"]) == (1.0, 2e-3, 1e-6)  # --no_lr_scaling: --lr and --min_lr as given
+    assert len(z_lr) == len(z_temp) == len(z_last) == len(z_wd) == z_n and (z_n - 1) // z_L == z_E - 1  # a value for each of the E x L steps, the last of them in cycle E - 1; the run takes no step after it
+    assert z_lr[0] == 0.0 and (np.diff(z_lr[:z_lr_peak + 1]) > 0).all() and np.allclose(z_lr[:z_lr_peak + 1], np.linspace(0, 2e-3, z_lr_peak + 1), rtol=1e-12, atol=0)  # 0 at step 0, rising linearly ...
+    assert z_lr[z_lr_peak] == 2e-3 and z_lr.max() == 2e-3 and z_lr.argmax() == z_lr_peak  # ... to exactly 2e-3 at step W x L ...
+    assert (np.diff(z_lr[z_lr_peak:]) < 0).all() and z_lr[z_n - 1] == 1e-6 and z_lr[z_lr_peak:].min() == 1e-6  # ... strictly down from there to exactly 1e-6 at the last step
+    assert z_temp[0] == 0.04 and (np.diff(z_temp[:z_temp_top + 1]) > 0).all() and np.allclose(z_temp[:z_temp_top + 1], np.linspace(0.04, 0.07, z_temp_top + 1), rtol=1e-12, atol=0)  # 0.04, rising linearly ...
+    assert z_temp[z_temp_top] == 0.07 and (z_temp[z_temp_top:] == 0.07).all()  # ... to exactly 0.07 at step T x L, and there for the rest
+    assert (z_last[:z_L] == 0.0).all() and same_state(z_last[z_L:], z_lr[z_L:])  # the last layers' freeze: LR 0 for the first cycle, the LR itself after
+    assert abs(z_wd[0] - 0.04) < 1e-15 and abs(z_wd[-1] - 0.4) < 1e-9 and (np.diff(z_wd) >= 0).all() and same_state(z_wd, CosineScheduler(0.04, 0.4, z_n).schedule)
+print("OK (z) planned run, at the real sizes: epoch_length 2380 at 8 x 64 (the seven lists' floor(floor(n / ranks) / 64) as build_data_loader counts them; 4763 at 4 x 64 as chain/newdata224.sh's header, 9528 at 8 x 16 as the 512 px run's "
+      "args.json); for (E, W, T) = (100, 10, 30) and (30, 3, 9), with the planned flags parsed and run()'s build_schedules call: %d / %d steps, lr 0 at step 0, rising linearly to exactly 2e-3 at step W x L, strictly down "
+      "to exactly 1e-6 at step E x L - 1 (the last step of cycle E - 1, so the run ends after cycle E); the teacher temperature 0.04 rising linearly to exactly 0.07 at step T x L and 0.07 after; the last-layer LR 0 "
+      "through cycle 0 and the LR after; wd the vendored cosine from 0.04 (%.1e off) to 0.4 (%.1e short of it), never decreasing" % (100 * z_L, 30 * z_L, abs(z_wd[0] - 0.04), 0.4 - z_wd[-1]))
+
+# (d) end to end in the run's mode, tiny: --no_gram --cyclic_ark_teacher --no_ibot_separate_head, 2 cycles of (x)'s 15 steps, W = T = 1, the planned LR flags (make_args's own --epochs 3 etc. come first: argparse keeps the last value).
+# A spy on apply_optim_scheduler records the weight decay each step hands it and each optimizer group's weight_decay after it
+Z_LINE = ["--no_gram", "--cyclic_ark_teacher", "--no_ibot_separate_head", "--epochs", "2", "--warmup_epochs", "1", "--teacher_temp_warmup_epochs", "1", "--lr", "2e-3", "--min_lr", "1e-6", "--no_lr_scaling"]
+Z_ON = [*Z_LINE, Z_FLAG, "0.4"]
+Z_TEXT = "weight decay: cosine from 0.04 to 0.4 over the 30 steps of the 2-epoch schedule (--weight_decay_end; DINOv2's build_schedulers)"
+z_dir_state = lambda d: {n: hashlib.sha256(open(os.path.join(d, n), "rb").read()).hexdigest() for n in sorted(os.listdir(d))}  # every file of a dir, by content
+
+
+@contextlib.contextmanager
+def z_spying():  # per apply_optim_scheduler call: (the wd it was handed, each optimizer group's (weight_decay, wd_multiplier) after it)
+    calls, real_apply = [], ssl_pretrain.apply_optim_scheduler
+
+    def apply(optimizer, lr, wd, *args, **kwargs):
+        real_apply(optimizer, lr, wd, *args, **kwargs)
+        calls.append((wd, [(g["weight_decay"], g["wd_multiplier"]) for g in optimizer.param_groups]))
+
+    ssl_pretrain.apply_optim_scheduler = apply
+    try:
+        yield calls
+    finally:
+        ssl_pretrain.apply_optim_scheduler = real_apply
+
+
+z_made = make_args(os.path.join(TMP, "Z_made"), *Z_ON)
+assert (z_made.epochs, z_made.warmup_epochs, z_made.teacher_temp_warmup_epochs, z_made.weight_decay_end) == (2, 1, 1, 0.4)  # the later flags won
+Z_A = os.path.join(TMP, "Z_A")
+with z_spying() as z_calls:
+    z_summary, z_text = xgo(Z_A, *Z_ON)
+z_want = CosineScheduler(0.04, 0.4, 30).schedule  # DINOv2's wd for 2 x 15 steps
+z_rows, z_info = read_csv(Z_A), json.load(open(os.path.join(Z_A, "args.json")))
+z_col = {c: i for i, c in enumerate(z_rows[0])}
+assert (z_summary["step"], z_summary["epoch"], z_summary["epoch_length"]) == (30, 2, 15) and (z_info["total_steps"], z_info["weight_decay"], z_info["weight_decay_end"]) == (30, 0.04, 0.4)
+assert sorted(os.listdir(os.path.join(Z_A, "ckpt"))) == ["epoch_0001.pth", "epoch_0002.pth"]  # the run ends cleanly after cycle 2: no epoch_0003
+assert z_text.splitlines().count(Z_TEXT) == 1 and "weight decay:" not in z_text.replace(Z_TEXT, "")  # the one new line, printed once
+assert [wd for wd, _ in z_calls] == [float(v) for v in z_want] and (np.diff(z_want) > 0).all()  # each of the 30 steps handed apply_optim_scheduler the schedule's entry for it, rising
+assert {0.0, 1.0} <= {m for _, groups in z_calls for _, m in groups} and all(w == wd * m for wd, groups in z_calls for w, m in groups)  # every group's weight_decay is that wd x its wd_multiplier (both kinds of group)
+assert ",".join(z_rows[0]) == CSV_HEADER and z_rows[1][0] == "0" and z_rows[-1][0] == "29" and len(z_rows) - 1 >= 16  # the last row is step 29: the last of cycle 2
+assert all(r[z_col["wd"]] == repr(float(z_want[int(r[0])])) == repr(z_calls[int(r[0])][0]) for r in z_rows[1:])  # every row's wd: the schedule's entry for its step, the wd that step applied
+assert len({r[z_col["wd"]] for r in z_rows[1:]}) == len(z_rows) - 1 and abs(float(z_rows[1][z_col["wd"]]) - 0.04) < 1e-15  # not the constant: one value a row, the first within 1e-15 of 0.04
+z_by_step = {int(r[0]): r for r in z_rows[1:]}
+assert z_rows[1][z_col["lr"]] == "0.0" and z_by_step[15][z_col["lr"]] == "0.002" and z_rows[-1][z_col["lr"]] == "1e-06"  # the LR: 0, exactly 2e-3 at step W x L = 15, exactly 1e-06 at the last step
+assert z_rows[1][z_col["teacher_temp"]] == "0.04" and all(r[z_col["teacher_temp"]] == "0.07" for s, r in z_by_step.items() if s >= 15)  # the teacher temperature: 0.04, exactly 0.07 from step T x L on
+z_ckpts = z_dir_state(os.path.join(Z_A, "ckpt"))
+_, z_text_again = xgo(Z_A, *Z_ON, "--resume")  # the run again: it has nothing left to do
+assert "nothing to do: 2 epochs done, --stop_after_epochs 2" in z_text_again and z_dir_state(os.path.join(Z_A, "ckpt")) == z_ckpts
+
+# the default: no flag, no new line, and --weight_decay itself (the very float) handed to apply_optim_scheduler at every step and written in every row
+Z_D = os.path.join(TMP, "Z_D")
+z_default = make_args(Z_D, *Z_LINE)
+with z_spying() as z_calls_d, contextlib.redirect_stdout(io.StringIO()) as z_out_d:
+    ssl_pretrain.run(z_default, TINY_VIT, TINY_HEADS, X_CFG)
+assert z_default.weight_decay_end is None and z_default.weight_decay == 0.04
+assert len(z_calls_d) == 30 and all(wd is z_default.weight_decay for wd, _ in z_calls_d) and all(w == 0.04 * m for _, groups in z_calls_d for w, m in groups)
+assert all(r[z_col["wd"]] == "0.04" for r in read_csv(Z_D)[1:]) and all(r[z_col["wd"]] == "0.04" for r in rows_a[1:]) and len(rows_a) > 2  # the cyclic run's CSV, and (g)'s mixed-batch run's
+assert not any(line.startswith("weight decay:") for line in z_out_d.getvalue().splitlines()) and json.load(open(os.path.join(Z_D, "args.json")))["weight_decay_end"] is None
+print("OK (z) end to end (--no_gram --cyclic_ark_teacher --no_ibot_separate_head, 2 cycles of 15 steps, the planned LR flags): with --weight_decay_end 0.4 it completes 2 cycles (summary step 30, epoch 2, epoch_0001 and epoch_0002, "
+      "no epoch_0003; last CSV row step 29 with lr exactly 1e-06; lr exactly 0.002 at step 15; teacher temperature 0.04, then exactly 0.07 from step 15), prints the one weight-decay line, hands apply_optim_scheduler "
+      "CosineScheduler(0.04, 0.4, 30).schedule[step] at each of the 30 steps (each group's weight_decay that x its wd_multiplier) and writes it in every CSV row's wd column (first %s, rising); a second --resume says "
+      "nothing to do and leaves ckpt/ byte for byte; without the flag no line is printed, every step is handed the very float --weight_decay, and every row of the run and of (g)'s mixed-batch run reads 0.04" % z_rows[1][z_col["wd"]])
+
+# (e) resume: (d)'s line stopped after cycle 1 and resumed to 2 is bitwise the uninterrupted run (set_epoch as under --workers > 0, as (x)(g) and (y)); the flag is --resume-locked both ways and --branch_from-matched (naming the key, args.json
+# untouched, nothing created); a checkpoint without the key reads as none
+Z_RA, Z_RB = os.path.join(TMP, "Z_RA"), os.path.join(TMP, "Z_RB")
+ssl_pretrain.set_epoch = set_epoch_main_rngs_untouched
+try:
+    xgo(Z_RA, *Z_ON, "--stop_after_epochs", "1")
+    _, z_text_ra = xgo(Z_RA, *Z_ON, "--resume")
+    xgo(Z_RB, *Z_ON)
+finally:
+    ssl_pretrain.set_epoch = real_set_epoch
+z_ck_ra, z_ck_rb = (load_ckpt(d, "epoch_0002.pth") for d in (Z_RA, Z_RB))
+assert "resumed from" in z_text_ra and Z_TEXT in z_text_ra and not same_state(z_ck_rb["student"], load_ckpt(Z_RB, "epoch_0001.pth")["student"])  # cycle 2 trained
+for z_part in ("student", "teacher", "optimizer", "rng"):
+    assert same_state(z_ck_ra[z_part], z_ck_rb[z_part]), z_part
+z_untimed = lambda rows: [r[:z_col["step_time"]] + r[z_col["data_time"] + 1:] for r in rows[1:]]  # a CSV's rows but for the two timing columns
+assert z_untimed(read_csv(Z_RA)) == z_untimed(read_csv(Z_RB))
+assert all(r[z_col["wd"]] == repr(float(z_want[int(r[0])])) for r in read_csv(Z_RA)[1:])  # the resumed cycle's rows carry the cosine from where cycle 1 left it
+z_before = {d: open(os.path.join(d, "args.json")).read() for d in (Z_RB, Z_D)}
+z_message = raises(ValueError, xgo, Z_RB, *Z_LINE, "--resume")  # a checkpoint with 0.4, resumed without the flag ...
+assert "cannot --resume" in z_message and z_message.endswith("differs from the checkpoint in weight_decay_end: checkpoint 0.4, now None"), z_message
+z_message = raises(ValueError, xgo, Z_RB, *Z_LINE, Z_FLAG, "0.3", "--resume")  # ... with another value ...
+assert "cannot --resume" in z_message and z_message.endswith("differs from the checkpoint in weight_decay_end: checkpoint 0.4, now 0.3"), z_message
+z_message = raises(ValueError, xgo, Z_D, *Z_ON, "--resume")  # ... and a default run's, resumed with it
+assert "cannot --resume" in z_message and z_message.endswith("differs from the checkpoint in weight_decay_end: checkpoint None, now 0.4"), z_message
+assert z_before == {d: open(os.path.join(d, "args.json")).read() for d in (Z_RB, Z_D)}  # the refusals left the records alone
+Z_UC = os.path.join(TMP, "Z_UC")  # the default run as written before the flag existed: its args lack the key
+shutil.copytree(Z_D, Z_UC)
+z_ck_old = load_ckpt(Z_UC, "epoch_0002.pth")
+assert z_ck_old["args"].pop("weight_decay_end") is None and "weight_decay_end" not in z_ck_old["args"]
+torch.save(z_ck_old, os.path.join(Z_UC, "ckpt", "epoch_0002.pth"))
+assert "weight_decay_end: checkpoint None, now 0.4" in raises(ValueError, xgo, Z_UC, *Z_ON, "--resume")  # it reads as none: refused with the flag ...
+assert "nothing to do: 2 epochs done" in xgo(Z_UC, *Z_LINE, "--resume")[1]  # ... and resumed without it
+Z_BR = os.path.join(TMP, "Z_BR")  # a Gram branch of the no-Gram cycle-1 checkpoint that differs from it in the flag only
+z_message = raises(ValueError, xgo, Z_BR, "--branch_from", os.path.join(Z_RA, "ckpt", "epoch_0001.pth"), *[a for a in Z_LINE if a != "--no_gram"], "--gram_refresh_steps", "100", "--stop_after_epochs", "2")
+assert "cannot --branch_from" in z_message and z_message.endswith("differs from the checkpoint in weight_decay_end: checkpoint 0.4, now None") and not os.path.exists(Z_BR), z_message
+print("OK (z) resume: a --weight_decay_end run stopped after cycle 1 and resumed equals 2 cycles straight with set_epoch as under --workers > 0 (student, teacher, optimizer, RNG bitwise; every CSV row but the two timings; the resumed "
+      "cycle's wd continues the cosine); a checkpoint with 0.4 refuses --resume without the flag and with 0.3, and a default run's refuses it with 0.4, each naming only weight_decay_end, with args.json untouched; a checkpoint "
+      "whose args lack the key reads as none (refused with the flag, resumed without it); --branch_from a 0.4 run without the flag is refused naming the key, nothing created")
+
 
 # (k) launch scripts ------------------------------------------------------------------------------------------------------------
 scripts = [os.path.join(REPO, "chain", f) for f in ("ssl_common.sh", "pilot_a.sh", "pilot_b.sh", "main.sh", "constlr.sh", "hires.sh")]
