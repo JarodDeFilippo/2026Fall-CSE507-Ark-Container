@@ -841,7 +841,7 @@ if [[ -n ${FAKE_TRAINER:-} ]]; then  # what the trainer leaves behind in its run
   kind=fp32; base=80; for a in "$@"; do [[ $a == --bf16 ]] && { kind=bf16; base=60; }; done
   mkdir -p "$PWD/$out/ckpt" "$PWD/$out/export"; touch "$PWD/$out/ckpt/epoch_0001.pth" "$PWD/$out/export/teacher_backbone_epoch_0001.pth"; echo '{}' > "$PWD/$out/args.json"
   for a in "$@"; do  # --export_pass_end_every: the trainer's pass-end exports of the cycle, after each of its passes but the last (4 bytes each here)
-    if [[ $a == --export_pass_end_every ]]; then mkdir -p "$PWD/$out/export/pass_end"; for d in MIMIC ReXGradient CheXpert TAIXRay PadChest ChestXray14; do printf abcd > "$PWD/$out/export/pass_end/teacher_backbone_epoch_0001_after_$d.pth"; done; fi
+    if [[ $a == --export_pass_end_every ]]; then mkdir -p "$PWD/$out/export/pass_end"; for d in MIMIC ReXGradient CheXpert TAIXRay PadChest ChestXray14; do printf abcd > "$PWD/$out/export/pass_end/teacher_backbone_epoch_0001_after_$d.pth"; echo "pass-end export after step 1: /workspace/$out/export/pass_end/teacher_backbone_epoch_0001_after_$d.pth (2.5 s to write)"; done; fi
   done
   cp "$FAKE_CSV_DIR/$kind.csv" "$PWD/$out/ssl_losses.csv"
   for step in 1 5 389; do for r in 0 1 2 3 4 5 6 7; do echo "peak_memory rank=$r step=$step GiB=${FAKE_PEAK:-$((base + step / 100 + r)).50}"; done; done  # FAKE_PEAK=unavailable: the trainer found no counter
@@ -1048,7 +1048,9 @@ def test_newdata224_cos100_smoke_summary():
                 assert expected in lines, (expected, lines)
             assert sorted(os.listdir(run_dir)) == ["args.json", "argv.txt", "extra_binds.txt", "hlsmi.txt", "ssl_losses.csv", "train.log"], os.listdir(run_dir)  # ckpt/ and export/ are gone, the evidence stays
             assert "peak_memory rank=7 step=389 GiB=%.2f" % (base + 7) in open(os.path.join(run_dir, "train.log")).read()
-        assert sorted(l for l in lines if "pass-end export" in l) == sorted("SMOKE fp32 pass-end export teacher_backbone_epoch_0001_after_%s.pth: 4 bytes" % d for d in COS_PASS_END), lines  # fp32 only, reported before the cleanup (glob order is the locale's)
+        assert [l for l in lines if "pass-end export time" in l] == ["SMOKE fp32 pass-end export time: 6 files, mean 2.5 s to write each, 0.2 min per exporting cycle (6 files): 0.42 h over 100 cycles at "
+                                                                   "--export_pass_end_every 1, half that at 2 (arithmetic on this smoke's mean)"], lines  # the trainer's per-file seconds (2.5 each here), fp32 only
+        assert sorted(l for l in lines if l.startswith("SMOKE") and "pass-end export " in l and "time" not in l) == sorted("SMOKE fp32 pass-end export teacher_backbone_epoch_0001_after_%s.pth: 4 bytes" % d for d in COS_PASS_END), lines  # fp32 only, reported before the cleanup (glob order is the locale's)
         assert "SMOKE fp32 verdict: FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines
         assert "SMOKE bf16 verdict (report only): FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines
         assert max(i for i, l in enumerate(lines) if l.startswith("SMOKE fp32")) < min(i for i, l in enumerate(lines) if l.startswith("SMOKE bf16 "))  # fp32 first, its whole summary before bf16's

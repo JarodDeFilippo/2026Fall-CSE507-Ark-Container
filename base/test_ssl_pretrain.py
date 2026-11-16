@@ -3521,6 +3521,8 @@ print("OK (ab) two real ranks: pairing: each rank's 4 of the 8 images (%s / %s) 
 # (ac) pass-end exports: --export_pass_end_every N (--cyclic_ark_teacher only) ---------------------------------------------------------------------------------------------------------------------------
 # In every cycle whose 1-based number is a multiple of N, the teacher backbone after each dataset's release pass and its blend, as export/pass_end/teacher_backbone_epoch_NNNN_after_<dataset>.pth, written by
 # the end-of-cycle export's writer; none after the cycle's last dataset (the end-of-cycle export is that state). (y)'s tied cyclic mode at 32 / 16 / 32 px on (x)'s data (MIMIC, CheXpert, ChestXray14, VinDrCXR)
+import re  # noqa: E402
+
 AC_LINE = [*Y_MODE, Y_FLAG, "--global_crops_size", "32", "--local_crops_size", "16", "--gram_teacher_size", "32", "--freeze_backbone_epochs", "0"]  # no frozen first cycle, as the planned run (a frozen backbone would leave the teacher backbone unmoved through cycle 1's blends)
 ac_name = lambda cycle, name: "teacher_backbone_epoch_%04d_after_%s.pth" % (cycle, name)
 ac_files = lambda out: sorted(os.listdir(os.path.join(out, "export", "pass_end")))
@@ -3560,10 +3562,10 @@ for ac_c in (1, 2):
         assert same_state(ac_file, ac_blended[(ac_c - 1) * 4 + ac_k]) and list(ac_file) == list(ac_end) and all(ac_file[k].dtype == ac_end[k].dtype for k in ac_end), (ac_c, ac_d)
         assert not same_state(ac_file, ac_end) and not same_state(ac_file, ac_blended[(ac_c - 1) * 4 + ac_k + 1]), (ac_c, ac_d)  # not vacuous: each pass moved the teacher
     assert same_state(ac_blended[(ac_c - 1) * 4 + 3], ac_end), ac_c  # after VinDrCXR: the end-of-cycle export itself
-ac_lines = [line for line in ac_text.splitlines() if line.startswith("pass-end export")]
+ac_lines = [re.sub(r"\(\d+\.\d s to write\)$", "(", line) for line in ac_text.splitlines() if line.startswith("pass-end export")]  # each file's line ends with its write time
 assert ac_lines == ["pass-end exports (--export_pass_end_every 1): in every cycle whose number is a multiple of 1, the teacher backbone after the release pass and blend of MIMIC, CheXpert, ChestXray14, as "
                     "export/pass_end/teacher_backbone_epoch_NNNN_after_<dataset>.pth; none after VinDrCXR's, the cycle's end (export/teacher_backbone_epoch_NNNN.pth is that state)"] + [
-    "pass-end export after step %d: %s" % (s, os.path.join(AC_1, "export", "pass_end", ac_name(c, d))) for c, s0 in ((1, 0), (2, 15)) for s, d in zip((s0 + 6, s0 + 10, s0 + 13), X_ORDER[:3])], ac_lines
+    "pass-end export after step %d: %s (" % (s, os.path.join(AC_1, "export", "pass_end", ac_name(c, d))) for c, s0 in ((1, 0), (2, 15)) for s, d in zip((s0 + 6, s0 + 10, s0 + 13), X_ORDER[:3])], ac_lines
 assert "pass-end" not in ac_text_0 and not os.path.exists(os.path.join(AC_0, "export", "pass_end")) and json.load(open(os.path.join(AC_1, "args.json")))["export_pass_end_every"] == 1
 for ac_ck in ("epoch_0001.pth", "epoch_0002.pth"):
     ac_a, ac_b = load_ckpt(AC_0, ac_ck), load_ckpt(AC_1, ac_ck)
@@ -3575,14 +3577,35 @@ print("OK (ac) N = 1, 2 cycles: export/pass_end/ holds exactly teacher_backbone_
       "one start line and one line per file (after steps 6, 10, 13, 21, 25, 28); args.json records 1; the checkpoints (student, teacher, optimizer, RNG), CSV and end-of-cycle exports are bitwise those of the run without "
       "the flag, which prints nothing new and writes no export/pass_end/")
 
-# (c) N = 2, 4 cycles: files in cycles 2 and 4 only. (d) resume: AC_1 (N = 1, 2 cycles) with its export/pass_end/ deleted, resumed to cycle 3 with N = 3: accepted (not locked), nothing read back, and only cycle 3's three files
+# (c) N = 2, 4 cycles: files in cycles 2 and 4 only. (d) resume: AC_1 (N = 1, 2 cycles done) holding two junk files of cycle 3, as a job killed in cycle 3 would leave them (one after VinDrCXR, a name never
+# written, and a half-written .tmp), resumed to cycle 3 with N = 3: accepted (not locked), the two are removed first and named, cycles 1 and 2's files stay bitwise, cycle 3's three are written; nothing reads the junk.
+# (e) a non-finite loss at a blend step (the 6th, MIMIC's last): the run raises at that step's finite-loss check and writes no pass-end file
 AC_2 = os.path.join(TMP, "AC_2")
 xgo(AC_2, *AC_LINE, "--export_pass_end_every", "2", "--epochs", "4", "--stop_after_epochs", "4")
 assert ac_files(AC_2) == sorted(ac_name(c, d) for c in (2, 4) for d in X_ORDER[:3]), ac_files(AC_2)
-shutil.rmtree(os.path.join(AC_1, "export", "pass_end"))
+ac_kept = {n: ac_load(AC_1, n) for n in ac_files(AC_1)}
+ac_stale = [ac_name(3, "VinDrCXR"), ac_name(3, "MIMIC") + ".tmp"]
+for ac_junk in ac_stale:
+    open(os.path.join(AC_1, "export", "pass_end", ac_junk), "w").write("junk")
 ac_resumed, ac_resumed_text = xgo(AC_1, *AC_LINE, "--export_pass_end_every", "3", "--resume", "--stop_after_epochs", "3")
-assert ac_resumed["step"] == 45 and "resumed from" in ac_resumed_text and ac_files(AC_1) == sorted(ac_name(3, d) for d in X_ORDER[:3]), (ac_resumed, ac_files(AC_1))
-print("OK (ac) N = 2 over 4 cycles writes cycles 2 and 4 only (3 files each); a resume with another N (3 after 1) is accepted, reads no pass-end file (the directory was deleted) and writes cycle 3's three")
+assert ac_resumed["step"] == 45 and "resumed from" in ac_resumed_text and ac_files(AC_1) == sorted(list(ac_kept) + [ac_name(3, d) for d in X_ORDER[:3]]), (ac_resumed, ac_files(AC_1))
+assert "pass-end exports: removed 2 of a cycle after the last checkpoint (epoch 2), which reruns: " + ", ".join(sorted(ac_stale)) in ac_resumed_text.splitlines(), ac_resumed_text
+assert all(same_state(ac_load(AC_1, n), v) for n, v in ac_kept.items())
+ac_calls, ac_real_fb = [0], SSLMetaArch.forward_backward
+
+
+def ac_nan_at_blend(self, data, *, teacher_temp):  # the 6th step's logged loss is NaN (its row is written, then the run raises)
+    loss, loss_dict = ac_real_fb(self, data, teacher_temp=teacher_temp)
+    ac_calls[0] += 1
+    return (loss * float("nan") if ac_calls[0] == 6 else loss), loss_dict
+
+
+AC_N = os.path.join(TMP, "AC_N")
+with mock.patch.object(SSLMetaArch, "forward_backward", ac_nan_at_blend):
+    assert "non-finite loss nan at step 5" in raises(RuntimeError, xgo, AC_N, *AC_LINE, "--export_pass_end_every", "1", "--stop_after_epochs", "1")
+assert ac_calls[0] == 6 and not os.path.exists(os.path.join(AC_N, "export", "pass_end"))
+print("OK (ac) N = 2 over 4 cycles writes cycles 2 and 4 only (3 files each); a resume with another N (3 after 1) is accepted, first removes the two junk files of the cycle after its checkpoint (named on one line), "
+      "keeps cycles 1 and 2's files bitwise and writes cycle 3's three; a NaN at MIMIC's blend step raises at its finite-loss check with no pass-end file written")
 
 
 # (k) launch scripts ------------------------------------------------------------------------------------------------------------

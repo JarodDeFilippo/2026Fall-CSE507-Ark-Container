@@ -114,8 +114,10 @@ matched by --branch_from. Off by default: bitwise as before.
 --export_pass_end_every N (--cyclic_ark_teacher only; default 0, off) writes pass-end exports for focused / unfocused probe curves: in every cycle whose 1-based number is a multiple of N, after each
 dataset's release pass and its teacher blend, the teacher backbone as export/pass_end/teacher_backbone_epoch_NNNN_after_<dataset>.pth (NNNN the cycle's number, as in that cycle's end-of-cycle
 export/teacher_backbone_epoch_NNNN.pth; the same writer, export_backbone, so the same stock keys, loading into Ark's vit_base_dinov3 the same way). In a subdirectory, so no glob of the end-of-cycle
-exports matches one. None is written after the cycle's last dataset: its pass ends the cycle, and the end-of-cycle export is that very state. Rank 0 writes, nothing else changes (no RNG, no collective);
-nothing is read back on --resume (a resumed run restarts at a cycle boundary and writes that cycle's files again), so N is recorded in args.json but not locked on --resume.
+exports matches one. None is written after the cycle's last dataset: its pass ends the cycle, and the end-of-cycle export is that very state. Rank 0 writes, after the step's finite-loss check (a blend
+step is always a log step), and the save is in no row's step_time (its seconds are on its line); nothing else changes (no RNG, no collective). Nothing is read back on --resume: a resumed run restarts at a
+cycle boundary, so any pass-end file of a cycle after the last checkpoint (an abandoned trajectory, whatever N is now) is removed at the start, one line naming them, as the CSV drops the interrupted
+epoch's rows; N is recorded in args.json but not locked on --resume.
 
 --cyclic_ark_teacher is the Ark+ / Foundation X teacher transplanted into this trainer (Jarod, 2026-10-26). A cycle replaces the mixed-batch epoch: the
 --data_set datasets in turn, largest first by image count (computed and logged; on the four CXR sets MIMIC, CheXpert, ChestXray14, VinDrCXR, whatever the
@@ -395,8 +397,8 @@ def parse_args(argv=None):
     p.add_argument("--export_pass_end_every", type=int, metavar="N", default=0,
                    help="--cyclic_ark_teacher only: in every cycle whose 1-based number is a multiple of N, write the teacher backbone export (the end-of-cycle export's writer and keys) after each "
                         "dataset's release pass and its teacher blend, as export/pass_end/teacher_backbone_epoch_NNNN_after_<dataset>.pth (NNNN: the cycle's number, as in its end-of-cycle "
-                        "export/teacher_backbone_epoch_NNNN.pth). None for the cycle's last dataset: its pass ends the cycle, whose own export is that very state. Backbone only; nothing is read "
-                        "back on --resume (a resumed cycle writes its files again) and N is not locked. 0 = off (default)")
+                        "export/teacher_backbone_epoch_NNNN.pth). None for the cycle's last dataset: its pass ends the cycle, whose own export is that very state. Backbone only, written after the step's "
+                        "finite-loss check; nothing is read back on --resume, where any file of a cycle after the last checkpoint (one that reruns) is removed first, and N is not locked. 0 = off (default)")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--workers", type=int, default=16)
     p.add_argument("--seed", type=int, default=100)
@@ -949,6 +951,16 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                         if len(r) in (len(csv_header) - 1, len(csv_header)) and r[0].isdigit() and int(r[0]) < step]
         with open(csv_path, "w", newline="") as f:
             csv.writer(f).writerows([csv_header] + kept)
+    # --export_pass_end_every: like the interrupted epoch's CSV rows, pass-end exports of a cycle after the last checkpoint are from an abandoned trajectory (that cycle reruns from its start, and N may have
+    # changed): dropped before training, whatever N is now (Codex r1 P2). No directory (every run without the flag): nothing is touched
+    pass_end_dir = os.path.join(export_dir, "pass_end")
+    if main and os.path.isdir(pass_end_dir):
+        stale = sorted(f for f in os.listdir(pass_end_dir)
+                       if (found := re.fullmatch(r"teacher_backbone_epoch_(\d+)_after_\w+\.pth(\.tmp)?", f)) and int(found.group(1)) > epochs_done)
+        for f in stale:
+            os.remove(os.path.join(pass_end_dir, f))
+        if stale:
+            say(f"pass-end exports: removed {len(stale)} of a cycle after the last checkpoint (epoch {epochs_done}), which reruns: {', '.join(stale)}")
 
     if args.max_steps and step >= args.max_steps:
         say(f"nothing to do: {step} steps done, --max_steps {args.max_steps}")
@@ -1037,12 +1049,9 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                 accelerator.mark_step()
                 say(f"teacher blend after step {it + 1} (end of {name}'s release pass, cycle {epoch}, dataset {order.index(name) + 1}/{len(order)}): teacher <- "
                     f"{args.ark_teacher_momentum:g} x teacher + {1 - args.ark_teacher_momentum:g} x student, backbone and all heads")
-                # --export_pass_end_every N: the blended teacher's backbone, in every N-th cycle (1-based), but after the cycle's last pass (its end-of-cycle export is that state)
-                if args.export_pass_end_every and (epoch + 1) % args.export_pass_end_every == 0 and name != order[-1] and main:
-                    pass_end_path = os.path.join(export_dir, "pass_end", "teacher_backbone_epoch_%04d_after_%s.pth" % (epoch + 1, name))
-                    os.makedirs(os.path.dirname(pass_end_path), exist_ok=True)
-                    save_atomic(export_backbone(teacher.backbone), pass_end_path)
-                    say(f"pass-end export after step {it + 1}: {pass_end_path}")
+            # --export_pass_end_every N: the blended teacher's backbone, in every N-th cycle (1-based), but after the cycle's last pass (its end-of-cycle export is that state); written below, after this step's finite-loss check
+            pass_end_path = (os.path.join(pass_end_dir, "teacher_backbone_epoch_%04d_after_%s.pth" % (epoch + 1, name))
+                             if blend and args.export_pass_end_every and (epoch + 1) % args.export_pass_end_every == 0 and name != order[-1] and main else None)
             step += 1
             n_mark += 1
             refreshed = step in refresh_steps and step not in gram_refreshes
@@ -1093,6 +1102,12 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                     raise RuntimeError(f"non-finite loss {total} at step {it} on rank {rank} "
                                        f"(all-reduced over {world_size} ranks); row written to {csv_path}")
                 t_mark, n_mark, data_wait = time.time(), 0, 0.0
+                if pass_end_path:  # a blend step is always a log step: written only once the finite-loss check above has passed (Codex r1 P2)
+                    t_save = time.time()
+                    os.makedirs(pass_end_dir, exist_ok=True)
+                    save_atomic(export_backbone(teacher.backbone), pass_end_path)
+                    say(f"pass-end export after step {step}: {pass_end_path} ({time.time() - t_save:.1f} s to write)")
+                    t_mark = time.time()  # the save is in no row's step_time, as the end-of-cycle save is in none: the speed stays the training's (Codex r1 P2)
             t_data = time.time()
             if args.max_steps and step >= args.max_steps:
                 break

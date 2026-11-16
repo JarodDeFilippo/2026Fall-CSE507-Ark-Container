@@ -41,6 +41,8 @@
 #                                           in hours: arithmetic on this smoke's mean, not a measurement of the run
 #   SMOKE <tag> dataset <name>:release      one line per dataset, in the cycle's order: its rows (step 0's row not counted), mean s/step and data s/step, and its last row's dino_global, dino_local, dino_whole and total
 #   SMOKE <tag> pass-end export <file>: B bytes   each pass-end export the line wrote (the fp32 line only), before the cleanup deletes it
+#   SMOKE <tag> pass-end export time        from the trainer's lines (each save's seconds): the mean per file, per exporting cycle (6 files) and over 100 cycles, arithmetic on this smoke's mean. The saves
+#                                           (pass end and cycle end) are in no row's step_time, so the speed and its projection above are the training's alone
 #   SMOKE <tag> verdict                     FITS (the line exited 0), OUT OF MEMORY, or FAILED (anything else: read the log); the bf16 one says (report only)
 # The 1 h limit is a guess with margin, not measured: two lines, each a container start, the model build and the stock weights load, the first step's graph compile, 389 steps and the cycle-end save. The fp32 line runs first, so a time-out costs the bf16 report, not the verdict.
 # Fail closed as the other wrappers do: ./gaudi_check_cards.sh refuses to launch unless the container sees exactly the allocated cards.
@@ -140,6 +142,8 @@ smoke_line() {
   else
     echo "SMOKE $tag verdict$note: FAILED (exit $RC) and not obviously memory: read the log above"
   fi
+  awk -v t="$tag" '$1 == "pass-end" && $2 == "export" && $3 == "after" && $NF == "write)" { s = $(NF - 3); sub(/^\(/, "", s); n++; sum += s }
+    END { if (n) printf "SMOKE %s pass-end export time: %d files, mean %.1f s to write each, %.1f min per exporting cycle (6 files): %.2f h over 100 cycles at --export_pass_end_every 1, half that at 2 (arithmetic on this smoke'"'"'s mean)\n", t, n, sum / n, sum / n * 6 / 60, sum / n * 600 / 3600 }' "$SMOKE/$tag/train.log"
   for f in "$SMOKE/$tag"/export/pass_end/*.pth; do  # --export_pass_end_every: what the run writes after each pass but the last, as written here
     if [[ -f $f ]]; then echo "SMOKE $tag pass-end export ${f##*/}: $(wc -c < "$f" | tr -d '[:space:]') bytes"; fi
   done
