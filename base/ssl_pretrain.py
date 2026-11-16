@@ -18,7 +18,7 @@ export/teacher_backbone_epoch_NNNN.pth (flat stock-key backbone, loads into Ark'
 The loss columns of ssl_losses.csv are global means over the ranks, built the way Ark's trainer.py builds its losses: each
 rank reads its own on the host with .item(), a tensor made from those floats is all-reduced, then divided by world_size.
 
-Each student submodule (backbone, dino_head, ibot_head) is its own DDP module with find_unused_parameters=False, because every student parameter gets a
+Each student submodule (backbone, dino_head, ibot_head; with --no_ibot_separate_head there is no ibot_head and the dino_head module runs once per step) is its own DDP module with find_unused_parameters=False, because every student parameter gets a
 gradient on every step (both heads, the mask token, the storage tokens and, with --untie_local_cls_norm, local_cls_norm; the --freeze_backbone_epochs freeze
 and the last-layer freeze are LR-0 freezes, so their gradients still flow), which saves DDP its per-iteration search for unused parameters, and if that ever
 stops being true DDP raises at the next forward instead of hanging (Ark+ fine-tuning keeps the default, True: one dataset head is active per step).
@@ -76,6 +76,16 @@ branches unchanged: the three are locked on --resume (a checkpoint without the k
 source must match them. With --untie_local_cls_norm the stock --pretrained_weights file loads strictly and local_cls_norm starts as a copy of its
 norm (one line says so); the epoch checkpoints carry local_cls_norm (student, EMA teacher, Gram teacher) and the exports leave it out (the stock 188
 keys, as before). An --init_from_checkpoint source must match the flag: its student and teacher load strictly.
+
+--no_ibot_separate_head builds no iBOT head: the iBOT loss runs on the DINO head, as in DINOv2's ssl_meta_arch with its config's ibot.separate_head false (DINOv3
+asserts it true: separate heads, the default here). Per model and step the DINO head is called ONCE, on the CLS tokens and the masked patch tokens together, and the
+output is split (DINOv2's [CLS, masked patches] buffer), so the dino_head DDP module (each student submodule is its own) still runs once per step: two calls (CLS, then
+patches) would be two forwards of one DDP module before one backward, which test (y) rules out by counting the head's calls. Shared heads only: --heads per_dataset (one
+DINO and one iBOT head per dataset) is refused with it.
+The student, the EMA teacher and the checkpoints then hold backbone and dino_head only (no ibot_head.* keys; the export, the backbone, is unchanged); the optimizer's
+groups, the last-layer freeze, the EMA and Ark blends follow, since each iterates the student's keys. Off by default: the separate heads, bitwise as before. Locked on
+--resume (a checkpoint without the key reads as False), recorded in args.json and matched by --branch_from; an --init_from_checkpoint source must match it too (the load is
+strict: an untied file into a tied run raises naming its ibot_head keys as unexpected, a tied file into an untied run as missing).
 
 --cyclic_ark_teacher is the Ark+ / Foundation X teacher transplanted into this trainer (Jarod, 2026-10-26). A cycle replaces the mixed-batch epoch: the
 --data_set datasets in turn, largest first by image count (computed and logged; on the four CXR sets MIMIC, CheXpert, ChestXray14, VinDrCXR, whatever the
@@ -179,6 +189,7 @@ LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "i
 # branch_from: a branch resumes only as the same branch (its source is read only at its start); a trunk or any other run never as one
 # gram_teacher_from: likewise its Gram teacher's source (read only at the branch's start): a branch resumes only with the same one, or none if it had none
 # drop_path_rate / rope_rescale_coords / untie_local_cls_norm: the student's training recipe (its forward; untied, its parameters too)
+# no_ibot_separate_head: the models' parameters (no ibot_head) and what the iBOT loss reads (the DINO head), so a --branch_from must match it too (not branch-free)
 # cyclic_ark_teacher / ark_teacher_momentum / teacher_clean_view / heads / lock_half_pass / keep_all_checkpoints: the Ark-teacher mode (its data order,
 # teacher rule, teacher views, head parameters, lock passes, checkpoint record); a --branch_from must match them too (none is branch-free)
 # pre_resize: the image the crops are cut from (squashed to N x N first; 0: the full decode); like the crop sizes it changes the inputs, so a --branch_from must match it too
@@ -188,15 +199,16 @@ RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_
                 "local_crops_size", "gram_teacher_size", "gram_refresh_steps", "freeze_backbone_epochs", "local_crops_number",
                 "seed", "bf16", "world_size", "init_from_checkpoint", "init_new_heads_from", "no_gram", "branch_from", "drop_path_rate",
                 "rope_rescale_coords", "untie_local_cls_norm", "cyclic_ark_teacher", "ark_teacher_momentum", "teacher_clean_view", "heads",
-                "lock_half_pass", "keep_all_checkpoints", "gram_teacher_from", "pre_resize", "decode_min_side")
+                "lock_half_pass", "keep_all_checkpoints", "gram_teacher_from", "pre_resize", "decode_min_side", "no_ibot_separate_head")
 # checkpoints written before the crop-size flags existed (pilots, main, constlr) were all trained at these
 CROP_DEFAULTS = dict(global_crops_size=224, local_crops_size=96, gram_teacher_size=448)
 # keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off, no --branch_from (nor
 # --gram_teacher_from), no --init_new_heads_from, no recipe setting (drop path 0, no RoPE rescale, tied CLS norm), no --pre_resize (crops cut from the full decode), no --decode_min_side (the decode side
-# follows the crop sizes), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads, no lock passes, the pruned checkpoint record)
+# follows the crop sizes), a separate iBOT head (--no_ibot_separate_head off), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads, no lock passes, the pruned checkpoint record)
 ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None, drop_path_rate=0.0, rope_rescale_coords=None, untie_local_cls_norm=False,
                     cyclic_ark_teacher=False, ark_teacher_momentum=None, teacher_clean_view=False, heads="shared", lock_half_pass=False,
-                    keep_all_checkpoints=False, gram_teacher_from=None, init_new_heads_from=None, pre_resize=0, decode_min_side=0)
+                    keep_all_checkpoints=False, gram_teacher_from=None, init_new_heads_from=None, pre_resize=0, decode_min_side=0,
+                    no_ibot_separate_head=False)
 # what a --branch_from start may differ from its source in (check_resume skips these): the Gram switch and knobs the branch turns on, the path itself,
 # the source's own init provenance (its full state is restored; a branch cannot pass --init_from_checkpoint or --init_new_heads_from, so they would always differ)
 # and the Gram teacher's own source (a no-Gram trunk has none)
@@ -294,6 +306,9 @@ def parse_args(argv=None):
     p.add_argument("--untie_local_cls_norm", action="store_true",
                    help="a second student LayerNorm for the local crops' CLS and register tokens (Meta's untie_global_and_local_cls_norm); "
                         "train mode only, initialized from the stock norm, not exported")
+    p.add_argument("--no_ibot_separate_head", action="store_true",
+                   help="no iBOT head: the iBOT loss uses the DINO head, called once per model and step on the CLS and masked patch tokens together (DINOv2's ibot.separate_head false; "
+                        "DINOv3 asserts true); shared heads only, refused with --heads per_dataset")
     p.add_argument("--cyclic_ark_teacher", action="store_true",
                    help="the Ark+ / FX teacher: a cycle (= one epoch) is one pass over each --data_set in turn, largest first, every batch from one "
                         "dataset; no per-step EMA: at the end of every dataset epoch teacher <- m x teacher + (1 - m) x student (--ark_teacher_momentum), "
@@ -354,6 +369,9 @@ def parse_args(argv=None):
             p.error("--init_new_heads_from needs --init_from_checkpoint (it starts the heads of datasets the checkpoint has none for)")
         if args.heads != "per_dataset":
             p.error("--init_new_heads_from needs --heads per_dataset (shared heads are one pair for every dataset: there is no head to add or copy)")
+    if args.no_ibot_separate_head and args.heads == "per_dataset":  # the tied head is the one DINO head; per-dataset heads are a DINO and an iBOT head per dataset
+        p.error("--no_ibot_separate_head cannot be combined with --heads per_dataset (per-dataset heads are one DINO and one iBOT head per dataset; the iBOT loss "
+                "using the DINO head is built for the shared head only)")
     if args.no_gram:  # no Gram teacher: the Gram knobs have nothing to act on, so an explicit one is a mistake, not a no-op
         for name, why in (("gram_weight", "there is no Gram loss to weight"), ("gram_refresh_steps", "there is no Gram teacher to refresh"),
                           ("gram_teacher_size", "there is no Gram teacher to size; the global crops are cut at 2 x --global_crops_size, or at --global_crops_size "
@@ -605,7 +623,8 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     student, teacher, gram_teacher = build_models(dict(vit_kwargs or DINOV3_VITB16_KWARGS, **recipe),
                                                   None if weights_from else args.pretrained_weights,
                                                   head_kwargs or HEAD_KWARGS, gram=not args.no_gram,
-                                                  heads=list(args.data_set) if args.heads == "per_dataset" else None)
+                                                  heads=list(args.data_set) if args.heads == "per_dataset" else None,
+                                                  separate_ibot_head=not args.no_ibot_separate_head)
     # the init and the EMA / Gram copies are done: from here each rank draws its own model-side randomness (drop path, RoPE rescale), as Meta seeds
     # seed + rank; rank 0 keeps args.seed. The data loaders seed per rank themselves (build_data_loader, set_epoch)
     random.seed(args.seed + rank)
@@ -617,6 +636,9 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
             f"{'untied' if args.untie_local_cls_norm else 'tied'}")
     if args.untie_local_cls_norm and args.pretrained_weights and not weights_from and not resuming_own:  # a resume / init / branch restores it instead
         say(f"local_cls_norm: initialized as a copy of norm.weight / norm.bias from {args.pretrained_weights} (the stock file has no local_cls_norm)")
+    if args.no_ibot_separate_head:  # the default prints nothing new
+        say("iBOT head: none, the iBOT loss uses the DINO head (--no_ibot_separate_head, DINOv2's ibot.separate_head false): one DINO-head forward per model and step "
+            "over the CLS and the masked patch tokens")
     if args.no_gram:
         say("Gram: OFF (--no_gram): no Gram teacher built or loaded, no Gram loss, no Gram refreshes; "
             "ssl_losses.csv gram and gram_weight columns are 0.0")

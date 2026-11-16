@@ -11,7 +11,7 @@ from torch import nn
 from dinov3.layers.dino_head import DINOHead
 from dinov3.models.vision_transformer import DinoVisionTransformer
 
-# dinov3 configs/ssl_default_config.yaml dino.* / ibot.* (separate iBOT head, same sizes)
+# dinov3 configs/ssl_default_config.yaml dino.* / ibot.* (separate iBOT head, same sizes; --no_ibot_separate_head builds none, as DINOv2's ibot.separate_head false)
 HEAD_KWARGS = dict(out_dim=65536, hidden_dim=2048, bottleneck_dim=256, nlayers=3)
 
 
@@ -28,7 +28,7 @@ def build_backbone(vit_kwargs, weights_path=None):
     return backbone
 
 
-def build_models(vit_kwargs, weights_path=None, head_kwargs=HEAD_KWARGS, gram=True, heads=None):
+def build_models(vit_kwargs, weights_path=None, head_kwargs=HEAD_KWARGS, gram=True, heads=None, separate_ibot_head=True):
     """Returns (student, teacher, gram_teacher) as nn.ModuleDicts keyed like SSLMetaArch: student/teacher have
     backbone, dino_head, ibot_head; gram_teacher has backbone only. Teacher = copy of the student (init_weights:
     model_ema.load_state_dict(student.state_dict())); Gram teacher = the same stock backbone, frozen, eval.
@@ -36,15 +36,18 @@ def build_models(vit_kwargs, weights_path=None, head_kwargs=HEAD_KWARGS, gram=Tr
     student and teacher are built exactly as with gram=True (deepcopy draws no RNG).
     heads=None: one shared DINO and one iBOT head. heads=[dataset names] (--heads per_dataset): dino_head and ibot_head are nn.ModuleDicts
     keyed by those names, one head of each per dataset, every one built and randomly initialized as the shared ones are (in that order: all
-    DINO heads, all iBOT heads, then their init_weights); the teacher copies them all."""
+    DINO heads, all iBOT heads, then their init_weights); the teacher copies them all.
+    separate_ibot_head=False (--no_ibot_separate_head): no iBOT head is built, student and teacher hold backbone and dino_head only (heads must be None)."""
+    assert separate_ibot_head or heads is None, "--no_ibot_separate_head is for the shared heads only: per-dataset heads are one DINO and one iBOT head per dataset"
     backbone = build_backbone(vit_kwargs, weights_path)
     new_head = lambda: DINOHead(in_dim=backbone.embed_dim, **head_kwargs)
     student = nn.ModuleDict(dict(
         backbone=backbone,
         dino_head=new_head() if heads is None else nn.ModuleDict({name: new_head() for name in heads}),
-        ibot_head=new_head() if heads is None else nn.ModuleDict({name: new_head() for name in heads}),
     ))
-    for head in (student.dino_head, student.ibot_head):  # heads are random: the released weights ship none
+    if separate_ibot_head:
+        student["ibot_head"] = new_head() if heads is None else nn.ModuleDict({name: new_head() for name in heads})
+    for head in (student[k] for k in ("dino_head", "ibot_head") if k in student):  # heads are random: the released weights ship none
         for one in (head.values() if heads is not None else [head]):
             one.init_weights()
     teacher = copy.deepcopy(student)

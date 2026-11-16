@@ -1,6 +1,7 @@
 """One Stage A training step: dinov3/train/ssl_meta_arch.py SSLMetaArch (forward_backward, get_teacher_output,
 get_student_output, get_gram_teacher_output, compute_losses, update_ema, update_gram) with the options this run uses fixed:
-sinkhorn_knopp centering, separate iBOT head, global_ignore_diagonal, non-distributed KoLeo (weight 0.1), no local-loss
+sinkhorn_knopp centering, separate iBOT head (a student without ibot_head, --no_ibot_separate_head, takes DINOv2's shared-head path: one DINO-head
+call per model over the CLS tokens and the masked patches), global_ignore_diagonal, non-distributed KoLeo (weight 0.1), no local-loss
 reweighting, Gram from a separate teacher (ema_teacher false) on all tokens, normalized, img_level, remove_neg false,
 bicubic resize without antialias, constant Gram weight. Method bodies follow Meta's line for line; differences are marked.
 gram_teacher=None is the no-Gram mode (--no_gram): no Gram teacher forward, no Gram loss term, no gram_loss key.
@@ -23,7 +24,7 @@ class SSLMetaArch(nn.Module):
         # The vendored iBOT Sinkhorn-Knopp all_reduces unconditionally, so even one process needs a process group;
         # ssl_pretrain.py creates a world-size-1 group when Accelerator does not (WORLD_SIZE=1).
         assert torch.distributed.is_initialized(), "SSLMetaArch needs torch.distributed initialized (world size 1 included)"
-        self.student = student  # ModuleDict(backbone, dino_head, ibot_head); entries may be DDP-wrapped
+        self.student = student  # ModuleDict(backbone, dino_head, ibot_head; no ibot_head with --no_ibot_separate_head); entries may be DDP-wrapped
         self.teacher = teacher
         self.model_ema = self.teacher
         self.gram_teacher = gram_teacher  # ModuleDict(backbone); None: no-Gram mode
@@ -33,9 +34,11 @@ class SSLMetaArch(nn.Module):
         self.ema_params_lists = None
         self.gram_params_lists = None
 
-        n_prototypes = self._heads(teacher, None)[0].last_layer.out_features  # --heads per_dataset: every head is built alike (HEAD_KWARGS)
+        dino_head, ibot_head = self._heads(teacher, None)  # --heads per_dataset: every head is built alike (HEAD_KWARGS)
+        n_prototypes = dino_head.last_layer.out_features
         self.dino_loss = DINOLoss(n_prototypes)
-        self.ibot_patch_loss = iBOTPatchLoss(self._heads(teacher, None)[1].last_layer.out_features)
+        # no iBOT head (--no_ibot_separate_head): the iBOT loss runs on the DINO head's prototypes (DINOv2's ibot_out_dim = dino.head_n_prototypes)
+        self.ibot_patch_loss = iBOTPatchLoss((dino_head if ibot_head is None else ibot_head).last_layer.out_features)
         self.koleo_loss = KoLeoLoss()
         self.gram_loss = (GramLoss(apply_norm=True, remove_only_teacher_neg=False, remove_neg=False)
                           if self.gram_teacher is not None else None)
@@ -57,9 +60,10 @@ class SSLMetaArch(nn.Module):
 
     @staticmethod
     def _heads(model, dataset):
-        """(dino_head, ibot_head) of model: the shared pair, or under --heads per_dataset that dataset's (None: the first, for the sizes)."""
+        """(dino_head, ibot_head) of model: the shared pair, or under --heads per_dataset that dataset's (None: the first, for the sizes).
+        ibot_head is None when the model has none (--no_ibot_separate_head, shared heads only): the iBOT loss then uses the DINO head."""
         if not isinstance(model.dino_head, nn.ModuleDict):
-            return model.dino_head, model.ibot_head
+            return model.dino_head, model["ibot_head"] if "ibot_head" in model else None
         name = next(iter(model.dino_head)) if dataset is None else dataset
         return model.dino_head[name], model.ibot_head[name]
 
@@ -143,10 +147,16 @@ class SSLMetaArch(nn.Module):
 
         # IBOT head only on patches that are masked for the student
         buffer = torch.index_select(ibot_patch.flatten(0, 1), dim=0, index=mask_indices_list)
-        masked_patch_after_head = ibot_head(buffer)
+        if ibot_head is None:
+            # ours, from DINOv2's ssl_meta_arch (ibot.separate_head false): no iBOT head, one DINO-head call on [CLS tokens, masked patches], then split
+            # (DINOv2's buffer is padded to its upperbound, which this file never was)
+            tokens_after_head = dino_head(torch.cat([cls, buffer]))
+            cls_after_head, masked_patch_after_head = tokens_after_head[:cls.shape[0]], tokens_after_head[cls.shape[0]:]  # [n_crops * B, K], [n_masked_patches, K]
+        else:
+            masked_patch_after_head = ibot_head(buffer)
 
-        # DINO head on CLS tokens
-        cls_after_head = dino_head(cls)  # [n_crops * B, K]
+            # DINO head on CLS tokens
+            cls_after_head = dino_head(cls)  # [n_crops * B, K]
 
         # Center with sinkhorn-knopp
         cls_centered = self.dino_loss.sinkhorn_knopp_teacher(cls_after_head, teacher_temp=teacher_temp)
@@ -216,14 +226,19 @@ class SSLMetaArch(nn.Module):
 
         # IBOT head only on masked patches
         masked_patches_pre_head = torch.index_select(g_patch.flatten(0, 1), dim=0, index=mask_indices_list)
-        global_masked_patch_after_head = ibot_head(masked_patches_pre_head)
+        if ibot_head is not None:
+            global_masked_patch_after_head = ibot_head(masked_patches_pre_head)
 
         # DINO head on CLS tokens (all in one pass)
         buffer = [g_cls, l_cls]
+        if ibot_head is None:  # ours, from DINOv2's ssl_meta_arch (ibot.separate_head false): the masked patches join the one DINO-head call, so the dino_head DDP module runs once per step
+            buffer.append(masked_patches_pre_head)
         sizes = [x.shape[0] for x in buffer]
         buffer = torch.cat(buffer, dim=0)
         buffer = dino_head(buffer)
         buffer = torch.split_with_sizes(buffer, sizes, dim=0)
+        if ibot_head is None:
+            global_masked_patch_after_head = buffer[2]
 
         global_out = {
             "cls_pre_head": g_cls.unflatten(0, [n_global_crops, B]),

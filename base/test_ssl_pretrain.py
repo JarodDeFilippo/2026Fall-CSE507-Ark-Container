@@ -2443,6 +2443,305 @@ print("OK (x) fingerprint: two runs over the same flattened image list (the mixe
       "heads per image) carry different data_fingerprints (the (dataset, path) hash in cycle order); each refuses a --resume and a --branch_from of the other, naming the training image list, args.json "
       "untouched and no branch dir created; a mixed-batch checkpoint's fingerprint is the flat hash as before")
 
+# (y) tied iBOT head: --no_ibot_separate_head, DINOv2's ibot.separate_head false (DINOv3 asserts it true): no iBOT head is built and the iBOT loss uses the DINO head ---------------------------------
+# The DINO head is called ONCE per model and step, on the CLS tokens and the masked patch tokens together, and the output is split: each student submodule is its own DDP module, which then runs once per step. A second call
+# does not make DDP raise on CPU / gloo (checked: two forwards of one DDP module before one backward ran through), so the tests pin the head's call count, (c) in one process and (h) on two real ranks. Shared heads only.
+# The runs use (x)'s cyclic data without lock passes (--no_gram --cyclic_ark_teacher with the shared heads: release passes of 6 / 4 / 3 / 2 steps, 15 a cycle, blends after steps 6, 10, 13, 15), a mode that had only run
+# with --heads per_dataset
+from dinov3.layers.dino_head import DINOHead
+
+Y_FLAG = "--no_ibot_separate_head"
+Y_MODE = ["--no_gram", "--cyclic_ark_teacher"]  # the mode with the shared heads (--heads defaults to shared) and no lock passes
+Y_PATTERN = [(name, "release") for name, phase, n in X_PASSES if phase == "release" for _ in range(n)]  # (dataset, phase) of each step of a cycle
+Y_ENDS = [6, 10, 13, 15]  # steps done at each release pass's end within a cycle: the blends
+Y_LINE = ("iBOT head: none, the iBOT loss uses the DINO head (--no_ibot_separate_head, DINOv2's ibot.separate_head false): one DINO-head forward per model and step over the CLS and the masked patch "
+          "tokens")
+
+# (a) parse: off by default (= ARG_DEFAULTS, what a checkpoint without the key reads as), --resume-locked, not branch-free; it parses with the shared heads, alone and in the mode; with --heads per_dataset it exits 2 naming both flags
+assert P().no_ibot_separate_head is False and ssl_pretrain.ARG_DEFAULTS["no_ibot_separate_head"] is False
+assert "no_ibot_separate_head" in ssl_pretrain.RESUME_MATCH and "no_ibot_separate_head" not in ssl_pretrain.BRANCH_FREE
+assert P(Y_FLAG).no_ibot_separate_head is True and vars(P(Y_FLAG)) == dict(vars(P()), no_ibot_separate_head=True)  # the flag changes nothing else
+y_parsed = P("--cyclic_ark_teacher", Y_FLAG)
+assert y_parsed.no_ibot_separate_head is True and y_parsed.heads == "shared" and vars(y_parsed) == dict(vars(P("--cyclic_ark_teacher")), no_ibot_separate_head=True)
+with contextlib.redirect_stderr(io.StringIO()) as y_err:
+    assert raises(SystemExit, P, "--cyclic_ark_teacher", "--heads", "per_dataset", Y_FLAG) == "2"
+y_complaint = y_err.getvalue().split("error: ", 1)[1]
+assert Y_FLAG in y_complaint and "--heads per_dataset" in y_complaint, y_err.getvalue()
+print("OK (y) parse: off by default (= ARG_DEFAULTS, what a checkpoint without the key reads as), --resume-locked and not branch-free; the flag alone and with --cyclic_ark_teacher (shared heads) parses and "
+      "changes no other setting; with --cyclic_ark_teacher --heads per_dataset it exits 2 naming --no_ibot_separate_head and --heads per_dataset")
+
+# (b) models: separate_ibot_head=True is the default, bitwise (the same keys and values) and drawing the same RNG; False builds no iBOT head, student and teacher are backbone + dino_head
+y_default = ng_seeded(build_models, TINY_VIT, None, TINY_HEADS)
+y_rng_default = torch.get_rng_state()
+y_explicit = ng_seeded(build_models, TINY_VIT, None, TINY_HEADS, separate_ibot_head=True)
+y_rng_explicit = torch.get_rng_state()
+for a, b in zip(y_default, y_explicit):  # student, EMA teacher, Gram teacher
+    assert list(a.state_dict()) == list(b.state_dict()) and same_state(a.state_dict(), b.state_dict())
+assert torch.equal(y_rng_default, y_rng_explicit) and list(y_default[0]) == list(y_default[1]) == ["backbone", "dino_head", "ibot_head"]
+y_tied = ng_seeded(build_models, TINY_VIT, None, TINY_HEADS, separate_ibot_head=False)
+assert list(y_tied[0]) == list(y_tied[1]) == ["backbone", "dino_head"] and list(y_tied[2]) == ["backbone"]
+assert not any(k.startswith("ibot_head") for m in y_tied[:2] for k in m.state_dict())
+assert same_state(y_tied[0].state_dict(), y_tied[1].state_dict()) and not any(p.requires_grad for p in y_tied[1].parameters())  # the teacher: a frozen copy
+assert same_state(backbone_of(y_tied[0].state_dict()), backbone_of(y_default[0].state_dict()))  # the backbone is built first: the same draws as before
+assert all(not m.bias.any() for m in y_tied[0].dino_head.mlp if isinstance(m, torch.nn.Linear))  # the one head went through init_weights (zero biases)
+assert "per-dataset heads" in raises(AssertionError, build_models, TINY_VIT, None, TINY_HEADS, heads=X_ORDER, separate_ibot_head=False)  # shared heads only
+print("OK (y) models: separate_ibot_head=True builds bitwise the student, EMA teacher and Gram teacher the default call builds (same keys, values and torch RNG state after; backbone, dino_head, ibot_head); False gives student and EMA "
+      "teacher exactly backbone + dino_head (no key starts with ibot_head; the teacher a frozen copy, the Gram teacher backbone only, the backbone bitwise the default build's), and with per-dataset heads it raises")
+
+# (c) one meta step on (a)'s real batch (B images, 8 local crops each, n masked patches): a tied meta calls the DINO head once per model, over [CLS tokens, masked patches] (the teacher's 2 x B + n rows, the student's
+# 2 x B + 8 x B + n) and nothing else; an untied meta makes the four calls it always did, in order. And the iBOT loss reaches the DINO head: its weight moves every dino_head gradient
+y_real_head_forward, y_calls = DINOHead.forward, []
+
+
+def y_head_forward(self, x, *args, **kwargs):  # (rows, grad enabled) of every DINOHead call: the teacher's run under no_grad, the student's with grad
+    y_calls.append((x.shape[0], torch.is_grad_enabled()))
+    return y_real_head_forward(self, x, *args, **kwargs)
+
+
+def y_meta(separate, **kwargs):  # a fresh no-Gram meta, the models seeded alike every time
+    student, teacher, _ = ng_seeded(build_models, TINY_VIT, None, TINY_HEADS, gram=False, separate_ibot_head=separate)
+    return SSLMetaArch(student, teacher, None, n_local_crops=8, **kwargs).train()
+
+
+y_B, y_n = batches[0]["collated_global_crops"].shape[0] // 2, len(batches[0]["mask_indices_list"])  # images in the batch, masked patches
+y_tied_meta, y_untied_meta = y_meta(False), y_meta(True)
+DINOHead.forward = y_head_forward
+try:
+    y_loss, y_loss_dict = y_tied_meta.forward_backward(batches[0], teacher_temp=0.04)
+    y_calls_tied = list(y_calls)
+    y_calls.clear()
+    y_untied_meta.forward_backward(batches[0], teacher_temp=0.04)
+    y_calls_untied = list(y_calls)
+finally:
+    DINOHead.forward = y_real_head_forward
+assert y_B == 4 and y_n == batches[0]["upperbound"] > 0
+assert y_calls_tied == [(2 * y_B + y_n, False), (2 * y_B + 8 * y_B + y_n, True)], y_calls_tied  # the teacher's one call (no grad), the student's one call
+assert y_calls_untied == [(y_n, False), (2 * y_B, False), (y_n, True), (2 * y_B + 8 * y_B, True)], y_calls_untied  # as before: iBOT head then DINO head, the teacher then the student
+assert torch.isfinite(y_loss) and set(y_loss_dict) == LOSS_KEYS - {"gram_loss"} and all(torch.isfinite(v) for v in y_loss_dict.values())  # no Gram teacher: no gram_loss key
+assert [m.ibot_patch_loss.center.shape[-1] for m in (y_tied_meta, y_untied_meta)] == [TINY_HEADS["out_dim"]] * 2  # the iBOT loss is sized by the DINO head's prototypes when there is no iBOT head
+assert [n for n, _ in y_tied_meta.student.named_parameters() if n.startswith("ibot_head")] == [] and all(p.grad is not None for p in y_tied_meta.student.parameters())
+
+
+def y_dino_grads(weight):  # the dino_head gradients after one step of a fresh tied meta whose iBOT loss is weighted `weight`
+    meta = y_meta(False, ibot_loss_weight=weight)
+    meta.forward_backward(batches[0], teacher_temp=0.04)
+    return {n: p.grad.clone() for n, p in meta.student.dino_head.named_parameters() if p.grad is not None}, len(list(meta.student.dino_head.parameters()))
+
+
+(y_g0, y_n_head), (y_g1, _), (y_g1_again, _) = y_dino_grads(0.0), y_dino_grads(1.0), y_dino_grads(1.0)
+assert len(y_g1) == y_n_head > 0  # weight 1.0: every dino_head parameter has a gradient
+assert all(torch.equal(y_g1[n], y_g1_again[n]) for n in y_g1)  # the control: the same step twice gives bitwise the same gradients ...
+assert all(not torch.equal(y_g0[n], y_g1[n]) for n in y_g1)  # ... so the iBOT loss weight is what moves every one of them: the loss reaches the DINO head
+print("OK (y) meta step: on a %d-image batch with %d masked patches a tied meta calls DINOHead exactly twice, the teacher's under no_grad with 2 x B + n = %d rows and the student's with 2 x B + 8 x B + n = %d, an untied "
+      "meta four times as before (n, 2 x B, n, 10 x B rows); the tied loss is finite with LOSS_KEYS less gram_loss, the iBOT loss sized by the DINO head's %d prototypes, no ibot_head parameter and a grad on every "
+      "student parameter; with the iBOT loss weighted 0.0 instead of 1.0 all %d dino_head gradients differ (and a repeat of weight 1.0 is bitwise the same)"
+      % (y_B, y_n, 2 * y_B + y_n, 2 * y_B + 8 * y_B + y_n, TINY_HEADS["out_dim"], y_n_head))
+
+# (d) the cyclic mode with shared heads, 2 cycles untied (today's heads) and tied, under the spies: both complete (15 steps a cycle), update_ema runs only at the release passes' ends with 0.8 x old + 0.2 x student over
+# the backbone and every head there is, every student parameter has a grad after every step (the find_unused_parameters=False premise), the checkpoints and the optimizer hold exactly the models' parameters, the
+# last-layer freeze reaches the one DINO head
+Y_U, Y_T = os.path.join(TMP, "Y_U"), os.path.join(TMP, "Y_T")
+y_n_params = {}
+for y_tag, y_out, y_extra in (("untied", Y_U, []), ("tied", Y_T, [Y_FLAG])):
+    with x_spying() as y_rec:
+        y_summary, y_text = xgo(y_out, *Y_MODE, *y_extra, "--stop_after_epochs", "2")
+    y_tied_run = y_tag == "tied"
+    y_kinds = {"backbone", "dino_head"} | (set() if y_tied_run else {"ibot_head"})
+    y_info, y_ck, y_lines = json.load(open(os.path.join(y_out, "args.json"))), load_ckpt(y_out, "epoch_0002.pth"), y_text.splitlines()
+    assert (y_summary["step"], y_summary["epoch"], y_summary["epoch_length"]) == (30, 2, 15) and (y_ck["step"], y_ck["epoch"], y_info["epoch_length"]) == (30, 2, 15), y_tag
+    assert (y_info["no_ibot_separate_head"], y_info["heads"], y_info["cyclic_ark_teacher"], y_info["no_gram"]) == (y_tied_run, "shared", True, True), y_info
+    assert ("each dataset in turn, largest first by image count, every batch from one dataset, its release pass only (--no_lock_half_pass): MIMIC 12 images: release 6 steps, CheXpert 8 images: release 4 steps, "
+            "ChestXray14 6 images: release 3 steps, VinDrCXR 4 images: release 2 steps; 15 steps a cycle (= one epoch)") in y_text, y_tag
+    assert [(s["dataset"], s["phase"]) for s in y_rec.steps] == Y_PATTERN * 2, y_tag  # the cycle's order, twice
+    assert [(e["step"], e["m"]) for e in y_rec.emas] == [(15 * c + e, 0.8) for c in (0, 1) for e in Y_ENDS], y_tag  # update_ema only at a release pass's end
+    assert [y_rec.steps[e["step"] - 1]["dataset"] for e in y_rec.emas] == X_ORDER * 2, y_tag  # ... MIMIC's, CheXpert's, ChestXray14's, VinDrCXR's
+    for e in y_rec.emas:
+        assert {k.split(".")[0] for k in e["params"]} == y_kinds, (y_tag, e["step"])  # the blend covers the backbone and every head there is
+        for k, before in e["before"].items():
+            want = before.mul(0.8).add_(e["student"][k], alpha=1 - 0.8) if k in e["params"] else before  # update_ema's foreach mul + add (buffers are not blended)
+            assert torch.equal(e["after"][k], want), (y_tag, e["step"], k)
+        for kind in y_kinds - {"backbone"}:  # each head really moved with the blend
+            assert any(not torch.equal(e["after"][k], e["before"][k]) for k in e["params"] if k.startswith(kind + ".")), (y_tag, e["step"], kind)
+    y_names = list(y_rec.steps[0]["grads"])
+    assert {n.split(".")[0] for n in y_names} == y_kinds and all(list(s["grads"]) == y_names and all(s["grads"].values()) for s in y_rec.steps), y_tag  # a grad on every student parameter after every step
+    for y_what in ("student", "teacher"):
+        assert {k.split(".")[0] for k in y_ck[y_what]} == y_kinds, (y_tag, y_what)  # tied: not one key starts with ibot_head
+        assert {k.split(".")[1] for k in y_ck[y_what] if k.startswith(("dino_head.", "ibot_head."))} == {"mlp", "last_layer"}, (y_tag, y_what)  # shared heads, not one per dataset
+    y_groups = y_ck["optimizer"]["param_groups"]
+    assert sum(len(g["params"]) for g in y_groups) == len(y_ck["optimizer"]["state"]) == len(y_names), y_tag  # every student parameter is in the optimizer, and has AdamW state
+    assert sum(len(g["params"]) for g in y_groups if g["is_last_layer"]) == (1 if y_tied_run else 2), y_tag  # the last-layer groups: the one head's last layer, or both heads'
+    for i, s in enumerate(y_rec.steps):
+        assert (x_last_lr(s) == {0.0}) if i < 15 else (x_last_lr(s) and 0.0 not in x_last_lr(s)), (y_tag, i)  # the last-layer freeze: LR 0 in cycle 0, every is_last_layer group
+    y_last = [k for k in y_rec.steps[0]["student"] if k.endswith("last_layer.weight")]
+    assert len(y_last) == (1 if y_tied_run else 2) and all(torch.equal(y_rec.steps[15]["student"][k], y_rec.steps[0]["student"][k]) for k in y_last), y_tag  # untouched in cycle 0 ...
+    assert all(not torch.equal(y_ck["student"][k], y_rec.steps[0]["student"][k]) for k in y_last), y_tag  # ... and trained in cycle 1
+    assert y_lines.count(Y_LINE) == (1 if y_tied_run else 0) and (y_tied_run or not any(line.startswith("iBOT head") or Y_FLAG in line for line in y_lines)), y_tag  # the new line: tied only, once
+    y_n_params[y_tag] = len(y_names)
+    del y_rec
+assert y_n_params["untied"] - y_n_params["tied"] == len(list(y_untied_meta.student.ibot_head.parameters())) > 0  # the tied student lacks exactly the iBOT head's tensors
+print("OK (y) cyclic, shared heads (--no_gram --cyclic_ark_teacher, 2 cycles): untied and tied both complete (epoch_length 15, MIMIC / CheXpert / ChestXray14 / VinDrCXR release passes of 6 / 4 / 3 / 2 steps, step tags in "
+      "cycle order); update_ema runs only after steps 6, 10, 13, 15 of each cycle with m 0.8 and every parameter is bitwise old x 0.8 + student x 0.2, over the backbone and dino_head (and ibot_head untied), each "
+      "head moving; after each of the 30 backwards every student parameter has a grad (%d untied, %d tied: no ibot_head); the untied checkpoint holds shared dino_head.* and ibot_head.* keys, the tied one none "
+      "starting with ibot_head in student or teacher, and its optimizer has state for exactly the tied student's parameters; every is_last_layer group is at LR 0 through cycle 0 (the last layer untouched) and "
+      "trained after; the tied run prints the iBOT-head line once, the untied none; args.json records no_ibot_separate_head True / False" % (y_n_params["untied"], y_n_params["tied"]))
+
+# (e) the mixed-batch run (per-step EMA, Gram teacher on, as the chain's runs), tied: it completes, its student and EMA teacher are backbone + dino_head in the checkpoint, the export is the stock backbone key set
+Y_E = os.path.join(TMP, "Y_E")
+with x_spying() as y_rec_e:
+    y_summary_e, y_text_e = go(Y_E, Y_FLAG, "--stop_after_epochs", "1")
+y_ck_e = load_ckpt(Y_E, "epoch_0001.pth")
+assert (y_summary_e["step"], y_summary_e["epoch"], y_summary_e["gram_refreshes"]) == (6, 1, [4]) and y_text_e.splitlines().count(Y_LINE) == 1
+assert {k.split(".")[0] for k in y_ck_e["student"]} == {k.split(".")[0] for k in y_ck_e["teacher"]} == {"backbone", "dino_head"} and not any("ibot_head" in k for sd in ("student", "teacher") for k in y_ck_e[sd])
+assert {k.split(".")[0] for k in y_ck_e["gram_teacher"]} == {"backbone"} and json.load(open(os.path.join(Y_E, "args.json")))["no_ibot_separate_head"] is True
+y_export_e = torch.load(os.path.join(Y_E, "export", "teacher_backbone_epoch_0001.pth"), weights_only=True)
+assert set(y_export_e) == set(tiny_stock) and all(torch.equal(v, y_ck_e["teacher"]["backbone." + k]) for k, v in y_export_e.items())  # exactly the backbone's keys: the EMA teacher's backbone
+assert all(all(s["grads"].values()) and {n.split(".")[0] for n in s["grads"]} == {"backbone", "dino_head"} for s in y_rec_e.steps) and len(y_rec_e.steps) == 6
+assert [(e["step"], e["m"]) for e in y_rec_e.emas] == [(i, 0.999) for i in range(1, 7)]  # the per-step EMA, after every step
+for e in y_rec_e.emas:
+    assert {k.split(".")[0] for k in e["params"]} == {"backbone", "dino_head"}
+    assert all(torch.equal(e["after"][k], before.mul(0.999).add_(e["student"][k], alpha=1 - 0.999) if k in e["params"] else before) for k, before in e["before"].items()), e["step"]
+del y_rec_e
+print("OK (y) mixed-batch run, tied (per-step EMA, Gram teacher on): completes its 6 steps (Gram refresh after step 4) and prints the iBOT-head line once; a grad on every student parameter at every step, the per-step "
+      "EMA is bitwise 0.999 x old + 0.001 x student over backbone and dino_head; the checkpoint's student and teacher have no ibot_head key (the Gram teacher's backbone only) and the export is exactly the "
+      "backbone's stock keys, bitwise the EMA teacher's")
+
+# (f) resume: a tied cyclic run stopped after cycle 1 and resumed to 2 is bitwise the uninterrupted 2-cycle run (set_epoch as under --workers > 0, as (x)(g)); the flag is --resume-locked both ways (naming the key, args.json
+# untouched) and --branch_from-matched; a checkpoint without the key reads as untied
+Y_RA, Y_RB = os.path.join(TMP, "Y_RA"), os.path.join(TMP, "Y_RB")
+ssl_pretrain.set_epoch = set_epoch_main_rngs_untouched
+try:
+    xgo(Y_RA, *Y_MODE, Y_FLAG, "--stop_after_epochs", "1")
+    _, y_text_ra = xgo(Y_RA, *Y_MODE, Y_FLAG, "--resume", "--stop_after_epochs", "2")
+    xgo(Y_RB, *Y_MODE, Y_FLAG, "--stop_after_epochs", "2")
+finally:
+    ssl_pretrain.set_epoch = real_set_epoch
+y_ck_ra, y_ck_rb = (load_ckpt(d, "epoch_0002.pth") for d in (Y_RA, Y_RB))
+assert "resumed from" in y_text_ra and not same_state(y_ck_rb["student"], load_ckpt(Y_RB, "epoch_0001.pth")["student"])  # cycle 2 trained
+for y_part in ("student", "teacher", "optimizer", "rng"):
+    assert same_state(y_ck_ra[y_part], y_ck_rb[y_part]), y_part
+assert same_state(*(torch.load(os.path.join(d, "export", "teacher_backbone_epoch_0002.pth"), weights_only=True) for d in (Y_RA, Y_RB)))
+assert not any(k.startswith("ibot_head") for y_part in ("student", "teacher") for k in y_ck_ra[y_part])
+y_before_rb, y_before_u = (open(os.path.join(d, "args.json")).read() for d in (Y_RB, Y_U))
+y_message = raises(ValueError, xgo, Y_RB, *Y_MODE, "--resume", "--stop_after_epochs", "3")  # a tied checkpoint, resumed without the flag
+assert "cannot --resume" in y_message and "no_ibot_separate_head: checkpoint True, now False" in y_message and open(os.path.join(Y_RB, "args.json")).read() == y_before_rb, y_message
+y_message = raises(ValueError, xgo, Y_U, *Y_MODE, Y_FLAG, "--resume", "--stop_after_epochs", "3")  # an untied one, resumed with it
+assert "cannot --resume" in y_message and "no_ibot_separate_head: checkpoint False, now True" in y_message and open(os.path.join(Y_U, "args.json")).read() == y_before_u, y_message
+for y_name, y_src, y_extra, y_diff in (("y_branch_tied", Y_T, [], "no_ibot_separate_head: checkpoint True, now False"), ("y_branch_untied", Y_U, [Y_FLAG], "no_ibot_separate_head: checkpoint False, now True")):
+    y_out = os.path.join(TMP, y_name)  # a Gram branch of a no-Gram trunk that differs from it in the flag only
+    y_message = raises(ValueError, xgo, y_out, "--branch_from", os.path.join(y_src, "ckpt", "epoch_0002.pth"), "--cyclic_ark_teacher", *y_extra, "--gram_refresh_steps", "100", "--stop_after_epochs", "3")
+    assert "cannot --branch_from" in y_message and y_diff in y_message and not os.path.exists(y_out), (y_name, y_message)
+Y_UC = os.path.join(TMP, "Y_UC")  # (d)'s untied run as written before the flag existed: its args lack the key
+shutil.copytree(Y_U, Y_UC)
+y_ck_old = load_ckpt(Y_UC, "epoch_0002.pth")
+assert y_ck_old["args"].pop("no_ibot_separate_head") is False and "no_ibot_separate_head" not in y_ck_old["args"]
+torch.save(y_ck_old, os.path.join(Y_UC, "ckpt", "epoch_0002.pth"))
+assert "no_ibot_separate_head: checkpoint False, now True" in raises(ValueError, xgo, Y_UC, *Y_MODE, Y_FLAG, "--resume", "--stop_after_epochs", "3")  # it reads as untied: refused with the flag
+y_summary_uc, y_text_uc = xgo(Y_UC, *Y_MODE, "--resume", "--stop_after_epochs", "3")  # ... and accepted without it, a third cycle on the untied models
+assert "resumed from" in y_text_uc and (y_summary_uc["step"], y_summary_uc["epoch"]) == (45, 3) and json.load(open(os.path.join(Y_UC, "args.json")))["no_ibot_separate_head"] is False
+print("OK (y) resume: a tied cyclic run stopped after cycle 1 and resumed equals 2 cycles straight with set_epoch as under --workers > 0 (student, teacher, optimizer, RNG and export bitwise; no ibot_head key); a tied "
+      "checkpoint refuses --resume without the flag and an untied one with it, naming no_ibot_separate_head, args.json untouched; --branch_from a tied trunk without it, or an untied one with it, is refused naming "
+      "the key and creates nothing; a checkpoint whose args lack the key reads as untied: refused with the flag, resumed (to 45 steps) without it")
+
+# (g) --init_from_checkpoint: the source must match the flag (the load is strict). A tied run from a tied checkpoint starts with its student and EMA teacher bitwise (read at the SSLMetaArch hand-over, before the first step);
+# an untied file into a tied run and a tied file into an untied one raise RuntimeError naming ibot_head keys, with nothing created
+Y_SRC_T, Y_SRC_U = (os.path.join(d, "ckpt", "epoch_0001.pth") for d in (Y_T, Y_U))
+y_src_t = torch.load(Y_SRC_T, map_location="cpu", weights_only=False)
+y_text_init = v_start(os.path.join(TMP, "Y_INIT"), "--no_gram", Y_FLAG, "--init_from_checkpoint", Y_SRC_T)
+y_init = v_handed[-1]["models"]
+assert set(y_init) == {"student", "teacher"} and same_state(y_init["student"], y_src_t["student"]) and same_state(y_init["teacher"], y_src_t["teacher"])  # --no_gram: no Gram teacher
+assert not any(k.startswith("ibot_head") for k in y_init["student"]) and "initialized from %s: its step 15, epoch 1," % Y_SRC_T in y_text_init, y_text_init
+for y_name, y_src, y_extra, y_words in (("y_init_untied_into_tied", Y_SRC_U, [Y_FLAG], "Unexpected key(s)"), ("y_init_tied_into_untied", Y_SRC_T, [], "Missing key(s)")):
+    y_out = os.path.join(TMP, y_name)
+    y_message = raises(RuntimeError, go, y_out, "--no_gram", *y_extra, "--init_from_checkpoint", y_src)
+    assert y_words in y_message and "ibot_head." in y_message, (y_name, y_message)
+    assert not os.path.exists(os.path.join(y_out, "args.json")) and not os.path.exists(os.path.join(y_out, "ckpt")), y_name
+print("OK (y) --init_from_checkpoint: a tied run from a tied epoch checkpoint hands SSLMetaArch a student and EMA teacher bitwise the checkpoint's (no ibot_head key, no Gram teacher); an untied checkpoint into a "
+      "tied run raises RuntimeError naming ibot_head keys as unexpected, a tied one into an untied run as missing, and neither leaves an args.json or ckpt/")
+
+# (h) two real ranks (gloo on this CPU, loopback rendezvous; the driver written like (x)(i)'s, for the shared heads): tied, --no_gram --cyclic_ark_teacher, batch 1 per rank, 1 cycle. Each rank calls the DINO head twice
+# a step (the teacher's, the student's), the student's DDP modules are exactly backbone and dino_head with find_unused_parameters False, and DDP keeps the student and the teacher bitwise alike on both ranks
+Y_DRIVER, Y_DRIVER_SOURCE = os.path.join(TMP, "y_driver.py"), '''# one rank of a real two-process (gloo, CPU) cyclic run with the iBOT head tied to the DINO head, written by test_ssl_pretrain.py (y); argv: base dir, spec json
+import argparse, json, os, sys
+import torch
+import torch.distributed as dist
+
+base, spec = sys.argv[1], json.load(open(sys.argv[2]))
+sys.path.insert(0, base)
+os.chdir(base)
+import ssl_pretrain
+from dinov3.layers.dino_head import DINOHead
+from ssl_dinov3.meta import SSLMetaArch
+
+rank, found, calls = int(os.environ["RANK"]), dict(steps=[], blends=[]), []
+real_fb, real_ema, real_init, real_head = SSLMetaArch.forward_backward, SSLMetaArch.update_ema, SSLMetaArch.__init__, DINOHead.forward
+flag = lambda ddp: int(ddp._get_ddp_logging_data()["find_unused_parameters"])
+
+
+def head_forward(self, x, *args, **kwargs):  # (rows, grad enabled) of each DINO head call
+    calls.append([x.shape[0], torch.is_grad_enabled()])
+    return real_head(self, x, *args, **kwargs)
+
+
+def forward_backward(self, data, *, teacher_temp):
+    calls.clear()
+    result = real_fb(self, data, teacher_temp=teacher_temp)
+    found["steps"].append([data["dataset"], data["phase"], list(calls)])
+    return result
+
+
+def update_ema(self, m):
+    found["blends"].append(len(found["steps"]))
+    return real_ema(self, m)
+
+
+def init(self, student, *args, **kwargs):  # the student's DDP modules as run() hands them over
+    found["ddp"] = {name: flag(module) for name, module in student.items()}
+    found["types"] = sorted({type(module).__name__ for module in student.values()})
+    real_init(self, student, *args, **kwargs)
+    found["meta"] = self
+
+
+SSLMetaArch.forward_backward, SSLMetaArch.update_ema, SSLMetaArch.__init__, DINOHead.forward = forward_backward, update_ema, init, head_forward
+ssl_pretrain.run(argparse.Namespace(**spec["args"]), spec["vit"], spec["heads"], spec["cfg"])
+meta = found.pop("meta")
+flat = lambda module: {k: v.detach().cpu() for k, v in module.state_dict().items()}
+torch.save(dict(student={k: flat(ssl_pretrain.Accelerator.unwrap_model(m)) for k, m in meta.student.items()}, teacher=flat(meta.teacher)), os.path.join(spec["dump"], "models_rank%d.pt" % rank))
+with open(os.path.join(spec["dump"], "found_rank%d.json" % rank), "w") as f:
+    json.dump(found, f)
+dist.destroy_process_group()
+'''
+with open(Y_DRIVER, "w") as f:
+    f.write(Y_DRIVER_SOURCE)
+y_dump, Y_TWO = os.path.join(TMP, "y_dump"), os.path.join(TMP, "Y_TWO")
+os.makedirs(y_dump)
+with open(os.path.join(TMP, "y_spec.json"), "w") as f:  # batch 1 per rank: 12 / 8 / 6 / 4 images over 2 ranks give the same passes as batch 2 on one
+    json.dump(dict(args=vars(make_args(Y_TWO, *Y_MODE, Y_FLAG, "--batch_size_per_gpu", "1", "--stop_after_epochs", "1")), vit=TINY_VIT, heads=TINY_HEADS, cfg=X_CFG, dump=y_dump), f)
+with socket.socket() as s:
+    s.bind(("127.0.0.1", 0))
+    y_env = dict(os.environ, WORLD_SIZE="2", MASTER_ADDR="127.0.0.1", MASTER_PORT=str(s.getsockname()[1]))
+y_procs = [subprocess.Popen([sys.executable, Y_DRIVER, BASE, os.path.join(TMP, "y_spec.json")], env=dict(y_env, RANK=str(r), LOCAL_RANK=str(r)), stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True) for r in range(2)]
+try:
+    y_outputs = [p.communicate(timeout=180)[0] for p in y_procs]
+finally:
+    for p in y_procs:
+        p.kill()  # a rank stuck in a collective must not outlive the test
+        p.wait()
+assert [p.returncode for p in y_procs] == [0, 0], y_outputs
+y_found = [json.load(open(os.path.join(y_dump, "found_rank%d.json" % r))) for r in range(2)]
+y_models_ranks = [torch.load(os.path.join(y_dump, "models_rank%d.pt" % r), weights_only=False) for r in range(2)]
+for y_rank_found in y_found:
+    assert [(name, phase) for name, phase, _ in y_rank_found["steps"]] == Y_PATTERN and y_rank_found["blends"] == Y_ENDS, y_rank_found
+    assert all(len(calls) == 2 and [grad for _, grad in calls] == [False, True] and calls[1][0] - calls[0][0] == 8 for _, _, calls in y_rank_found["steps"])  # teacher's call, then student's (+ 8 local crops)
+    assert y_rank_found["ddp"] == {"backbone": 0, "dino_head": 0} and y_rank_found["types"] == ["DistributedDataParallel"], y_rank_found
+assert same_state(y_models_ranks[0], y_models_ranks[1]) and set(y_models_ranks[0]["student"]) == {"backbone", "dino_head"}  # student (backbone, dino_head) and teacher, bitwise alike on both ranks
+assert not any(k.startswith("ibot_head") for k in y_models_ranks[0]["teacher"])
+y_ck_two = load_ckpt(Y_TWO, "epoch_0001.pth")
+assert (y_ck_two["step"], y_ck_two["world_size"], len(y_ck_two["rng_per_rank"])) == (15, 2, 2) and not any(k.startswith("ibot_head") for k in y_ck_two["student"])
+print("OK (y) two real ranks (tied, --no_gram --cyclic_ark_teacher, batch 1 per rank, 1 cycle): both ranks exit 0 and train the 15 release steps (blends after steps 6, 10, 13, 15), calling the DINO head exactly twice "
+      "a step (the teacher's under no_grad, the student's with 8 rows more, its local crops); the student's DDP modules are exactly backbone and dino_head, each DistributedDataParallel with "
+      "find_unused_parameters 0; student and teacher end bitwise alike on both ranks, with no ibot_head key; the step-15 checkpoint holds both ranks' RNG states")
+
 
 # (k) launch scripts ------------------------------------------------------------------------------------------------------------
 scripts = [os.path.join(REPO, "chain", f) for f in ("ssl_common.sh", "pilot_a.sh", "pilot_b.sh", "main.sh", "constlr.sh", "hires.sh")]
