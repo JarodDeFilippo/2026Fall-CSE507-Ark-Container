@@ -2910,6 +2910,292 @@ print("OK (z) resume: a --weight_decay_end run stopped after cycle 1 and resumed
       "whose args lack the key reads as none (refused with the flag, resumed without it); --branch_from a 0.4 run without the flag is refused naming the key, nothing created")
 
 
+# (aa) student augmentation flags: --global_crops_scale / --local_crops_scale, --intensity_aug, --no_blur, --blur_sigma, --no_horizontal_flips, --rotate_limit -----------------------------------------------------------------------
+# The lab's Ark+ student augmentation (base/dataloader.py build_ts_transformations: RandomResizedCrop, ShiftScaleRotate(rotate_limit=10) at its default p 0.5, OneOf([RandomBrightnessContrast(), RandomGamma()], p=0.3)) on the trainer's student crops;
+# every default leaves every crop bitwise as before, from the same RNG draws in the same order. The planned run: --global_crops_scale 0.15 1 --local_crops_scale 0.05 0.15 --intensity_aug ark --no_blur --no_horizontal_flips --rotate_limit 10, in
+# (x)'s mode (--no_gram --cyclic_ark_teacher, clean teacher views) with the tied head. (d) and (e) check the two new transforms against albumentations 2.0.8, the version the container pins (containers/gaudi/requirements.txt)
+import pickle
+import warnings
+from unittest import mock
+
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")  # albumentations checks PyPI for a newer version on import otherwise
+import albucore
+import albumentations as A
+import albumentations.augmentations.pixel.functional as fpixel
+import cv2
+
+AA_KEYS = ("global_crops_scale", "local_crops_scale", "intensity_aug", "no_blur", "blur_sigma", "no_horizontal_flips", "rotate_limit")
+AA_DEFAULTS = ((0.25, 1.0), (0.04, 0.25), "jitter", False, (0.1, 1.0), False, 0.0)
+AA_PLANNED = ["--global_crops_scale", "0.15", "1", "--local_crops_scale", "0.05", "0.15", "--intensity_aug", "ark", "--no_blur", "--no_horizontal_flips", "--rotate_limit", "10"]
+AA_PLANNED_VALUES = ((0.15, 1.0), (0.05, 0.15), "ark", True, None, True, 10.0)
+AA_MODE = ["--no_gram", "--cyclic_ark_teacher", "--no_ibot_separate_head"]  # the planned run's mode: (x)'s with the tied head
+AA_LINE = ("augmentation (student crops): global crop scale (0.15, 1), local crop scale (0.05, 0.15); intensity ark (Ark+'s OneOf brightness / contrast 0.2 or gamma (80, 120), p 0.3); blur off; horizontal flips off; "
+           "rotation up to +/-10 degrees at p 0.5, reflect-101 corners, the same rotation on each global crop's clean teacher / Gram copy")
+
+# (a) parse: the defaults are ARG_DEFAULTS (tuples, what a checkpoint without the keys reads as); all seven are --resume-locked and none is branch-free; the planned run's flags parse to its values and change nothing else; a range with MIN > MAX, 0 or
+# beyond 1 (scales) or NaN, a --blur_sigma with --no_blur or with a zero or reversed range, another --intensity_aug, and a --rotate_limit below 0, at 90 or NaN each exit 2 naming the flag
+assert tuple(getattr(P(), k) for k in AA_KEYS) == AA_DEFAULTS == tuple(ssl_pretrain.ARG_DEFAULTS[k] for k in AA_KEYS)
+assert all(type(getattr(P(), k)) is type(v) for k, v in zip(AA_KEYS, AA_DEFAULTS))  # tuples, never lists: a resumed run's args must compare equal to the checkpoint's
+assert set(AA_KEYS) <= set(ssl_pretrain.RESUME_MATCH) and not set(AA_KEYS) & set(ssl_pretrain.BRANCH_FREE)
+aa_parsed = P(*AA_PLANNED)
+assert tuple(getattr(aa_parsed, k) for k in AA_KEYS) == AA_PLANNED_VALUES and vars(aa_parsed) == dict(vars(P()), **dict(zip(AA_KEYS, AA_PLANNED_VALUES)))  # the seven change nothing else
+assert type(aa_parsed.global_crops_scale) is tuple and type(aa_parsed.local_crops_scale) is tuple and type(aa_parsed.rotate_limit) is float
+for aa_flags, aa_change in ((("--global_crops_scale", "0.3", "0.9"), dict(global_crops_scale=(0.3, 0.9))), (("--global_crops_scale", "1", "1"), dict(global_crops_scale=(1.0, 1.0))),
+                            (("--local_crops_scale", "0.02", "0.5"), dict(local_crops_scale=(0.02, 0.5))), (("--intensity_aug", "ark"), dict(intensity_aug="ark")),
+                            (("--no_blur",), dict(no_blur=True, blur_sigma=None)), (("--blur_sigma", "0.5", "2"), dict(blur_sigma=(0.5, 2.0))), (("--no_horizontal_flips",), dict(no_horizontal_flips=True)),
+                            (("--rotate_limit", "7.5"), dict(rotate_limit=7.5)), (("--rotate_limit", "89.9"), dict(rotate_limit=89.9))):  # each alone changes its own key (--no_blur the sigma too: none) and nothing else
+    assert vars(P(*aa_flags)) == dict(vars(P()), **aa_change), aa_flags
+assert vars(P("--rotate_limit", "0", "--blur_sigma", "0.1", "1", "--intensity_aug", "jitter", "--global_crops_scale", "0.25", "1", "--local_crops_scale", "0.04", "0.25")) == vars(P())  # the defaults, given as well: the same run
+for aa_extra, aa_flags in ((["--global_crops_scale", "0.5", "0.4"], ("--global_crops_scale",)), (["--global_crops_scale", "0", "1"], ("--global_crops_scale",)), (["--global_crops_scale", "-0.1", "1"], ("--global_crops_scale",)),
+                           (["--global_crops_scale", "0.5", "1.5"], ("--global_crops_scale",)), (["--global_crops_scale", "nan", "1"], ("--global_crops_scale",)), (["--global_crops_scale", "0.5", "nan"], ("--global_crops_scale",)),
+                           (["--local_crops_scale", "0.3", "0.2"], ("--local_crops_scale",)), (["--local_crops_scale", "0", "0.25"], ("--local_crops_scale",)), (["--local_crops_scale", "0.04", "1.5"], ("--local_crops_scale",)),
+                           (["--local_crops_scale", "nan", "0.25"], ("--local_crops_scale",)), (["--no_blur", "--blur_sigma", "0.1", "1"], ("--no_blur", "--blur_sigma")),
+                           (["--blur_sigma", "0", "1"], ("--blur_sigma",)), (["--blur_sigma", "2", "1"], ("--blur_sigma",)), (["--blur_sigma", "nan", "1"], ("--blur_sigma",)), (["--blur_sigma", "0.1", "inf"], ("--blur_sigma",)),
+                           (["--intensity_aug", "other"], ("--intensity_aug",)), (["--rotate_limit", "-1"], ("--rotate_limit",)), (["--rotate_limit", "90"], ("--rotate_limit",)), (["--rotate_limit", "nan"], ("--rotate_limit",)),
+                           (["--rotate_limit", "inf"], ("--rotate_limit",))):
+    with contextlib.redirect_stderr(io.StringIO()) as aa_err:
+        assert raises(SystemExit, P, *aa_extra) == "2", aa_extra
+    aa_complaint = aa_err.getvalue().split("error: ", 1)[1]
+    assert all(flag in aa_complaint for flag in aa_flags), (aa_extra, aa_err.getvalue())
+print("OK (aa) parse: the seven settings default to (0.25, 1.0), (0.04, 0.25), jitter, blur on, (0.1, 1.0), flips on, no rotation (= ARG_DEFAULTS, tuples, what a checkpoint without the keys reads as), are --resume-locked and not "
+      "branch-free; the planned run's flags parse to (0.15, 1.0), (0.05, 0.15), ark, --no_blur (sigma none), --no_horizontal_flips, 10.0 and change nothing else, each flag alone changes only its own key, the defaults given as well are the "
+      "same run; a scale with MIN > MAX, 0, above 1 or NaN, a --blur_sigma with --no_blur (naming both) or with 0, a reversed, a NaN or an infinite range, another --intensity_aug, and a --rotate_limit of -1, 90, NaN or inf each exit 2 naming the flag")
+
+# (b) the defaults leave every crop bitwise as before: DataAugmentationCXR() against the same transform with every new kwarg given at its default value, on the same image from the same python / numpy / torch seeds, with the clean teacher views, without
+# the Gram crops, without the Gram size: every crop list is bitwise the same and so are the RNG states after (nothing extra is drawn); the decode side is 1024; a default run() prints no augmentation line
+def aa_crops(aug):  # the crop dict from fixed seeds, and the torch / python / numpy RNG states after it
+    out = ng_seeded(aug, ng_image)
+    return out, (torch.get_rng_state(), random.getstate(), np.random.get_state())
+
+
+AA_EXPLICIT = dict(intensity="jitter", blur_sigma=(0.1, 1.0), rotate_limit=0, horizontal_flips=True, global_crops_scale=(0.25, 1.0), local_crops_scale=(0.04, 0.25))
+aa_seeded = ng_seeded(torch.get_rng_state)  # torch's state right after the seeding every crop starts from
+for aa_extra in ({}, dict(teacher_no_distortions=True), dict(emit_gram_teacher_crops=False), dict(gram_teacher_crops_size=None)):
+    aa_default_out = aa_crops(DataAugmentationCXR(**aa_extra))
+    assert same_state(aa_default_out, aa_crops(DataAugmentationCXR(**aa_extra, **AA_EXPLICIT))), aa_extra  # every crop list, and the RNG states after
+    assert len(aa_default_out[0]["global_crops"]) == 2 and len(aa_default_out[0]["local_crops"]) == 8 and not torch.equal(aa_default_out[1][0], aa_seeded), aa_extra  # not vacuous: the crops are made and the generator moved
+assert DataAugmentationCXR().decode_min_side == DataAugmentationCXR(**AA_EXPLICIT).decode_min_side == 1024 and isinstance(DataAugmentationCXR().rotate, torch.nn.Identity)
+aa_ark = aa_crops(DataAugmentationCXR(intensity="ark"))
+assert not same_state(aa_ark, aa_crops(DataAugmentationCXR())) and not same_state(aa_crops(DataAugmentationCXR(rotate_limit=10)), aa_crops(DataAugmentationCXR()))  # the control: a non-default setting does change the crops
+assert not same_state(aa_crops(DataAugmentationCXR(blur_sigma=None)), aa_crops(DataAugmentationCXR())) and "augmentation" not in text_a1 and "augmentation" not in text_b  # a default run prints no new line
+aa_planned_kw = dict(intensity="ark", blur_sigma=None, rotate_limit=10, horizontal_flips=False, global_crops_scale=(0.15, 1.0), local_crops_scale=(0.05, 0.15))
+aa_planned_out = aa_crops(DataAugmentationCXR(**aa_planned_kw))
+assert same_state(aa_planned_out, aa_crops(pickle.loads(pickle.dumps(DataAugmentationCXR(**aa_planned_kw)))))  # a loader worker started by spawn gets the same transform
+assert [tuple(c.shape) for c in aa_planned_out[0]["global_crops"]] == [(3, 224, 224)] * 2 and [tuple(c.shape) for c in aa_planned_out[0]["local_crops"]] == [(3, 96, 96)] * 8
+assert [tuple(c.shape) for c in aa_planned_out[0]["gram_teacher_crops"]] == [(3, 448, 448)] * 2 and all(torch.isfinite(c).all() for k in ("global_crops", "local_crops", "gram_teacher_crops") for c in aa_planned_out[0][k])
+print("OK (aa) defaults bitwise: DataAugmentationCXR() and the same transform with intensity jitter, blur sigma (0.1, 1.0), no rotation, flips on and the default scales given give bitwise the same crops (global, teacher, Gram, local) and the same "
+      "torch / python / numpy RNG states after, from the same seeds, with the clean teacher views, with no Gram crops and with no Gram size; the decode side is 1024 and the rotation an Identity; a non-default intensity, rotation or no blur changes the "
+      "crops (the control); a default run() prints no augmentation line; the planned run's transform pickles (spawn workers) and makes 224 / 96 / 448 crops, all finite")
+
+# (c) the decode side follows the minimum crop scales: the STAGE_A_CROPS override (1024 for 224 / 96 / 448) holds at Stage A's scales 0.25 / 0.04 only; below them the rule's own value is used
+aa_decode = lambda sizes, **kwargs: DataAugmentationCXR(global_crops_size=sizes[0], local_crops_size=sizes[1], gram_teacher_crops_size=sizes[2], **kwargs).decode_min_side
+AA_SMALL = dict(global_crops_scale=(0.15, 1.0), local_crops_scale=(0.05, 0.15))
+assert aa_decode((224, 96, 448)) == 1024 and aa_decode((512, 224, 512)) == 1344 and aa_decode((512, 224, 1024)) == 2368  # at the default scales: as before
+assert aa_decode((224, 96, 448), **AA_SMALL) == 1344 == ssl_data.decode_min_side(448, 0.15, R)  # the global crops' rule: ceil(448 / (sqrt(0.15) x sqrt(3/4)) / 64) x 64
+assert [math.ceil(c / (math.sqrt(s) * math.sqrt(3 / 4)) / 64) * 64 for c, s in ((224, 0.15), (96, 0.05))] == [704, 512] and aa_decode((224, 96, 224), **AA_SMALL) == 1024  # both crops' own rules are below the 1024 floor, which wins
+assert aa_decode((224, 96, 448), global_crops_scale=(0.15, 1.0)) == 1344 and aa_decode((224, 96, 448), local_crops_scale=(0.05, 0.25)) == 1088  # one smaller minimum is enough to drop the override (1088: the unoverridden rule)
+for aa_name, aa_extra, aa_phrase, aa_side in (("AA_D1", [], "Gram teacher 448; JPEG decode min side 1344", 1344), ("AA_D2", ["--pre_resize", "64"], "Gram teacher 448; pre-resize 64x64 (whole image squashed to a square before the random crops, Ark loader convention), so JPEG decode min side 64", 64),
+                                              ("AA_D3", ["--decode_min_side", "1024"], "Gram teacher 448; JPEG decode min side 1024", 1024)):  # run() up to its first step, the 224 / 96 / 448 crops of every tiny run here
+    aa_text = v_start(os.path.join(TMP, aa_name), "--global_crops_scale", "0.15", "1", "--local_crops_scale", "0.05", "0.15", *aa_extra)
+    assert "crops: global 224, local 96 (x8), " + aa_phrase in aa_text, aa_text
+    assert json.load(open(os.path.join(TMP, aa_name, "args.json")))["decode_min_side"] == aa_side  # recorded as the side actually used
+print("OK (aa) decode side: 224 / 96 / 448 gives 1024 at the default scales (512 / 224 / 512 1344, 512 / 224 / 1024 2368, as before) and 1344 at global 0.15 / local 0.05 (the global crops' ceil(448 / (sqrt(0.15) x sqrt(3/4)) / 64) x 64); "
+      "224 / 96 / 224 at those scales 1024 (the floor); a smaller minimum on one of the two is enough to drop the override (local 0.05 alone: 1088, global 0.15 alone: 1344); run() with --global_crops_scale 0.15 1 --local_crops_scale "
+      "0.05 0.15 prints JPEG decode min side 1344 and records it in args.json, and --pre_resize 64 (64) or --decode_min_side 1024 (1024) still wins")
+
+# (d) ArkIntensity against albumentations 2.0.8: for fixed draws, the LUT it applies to a one-channel ramp of every gray level is albucore.multiply_add's (brightness / contrast: within 1 gray level, albucore computes in float64 so a value on an exact boundary
+# may truncate one lower or higher) and fpixel.gamma_transform's (gamma: exactly). The draws are pinned by patching torch.rand (the step's and the branch's coin) and Tensor.uniform_ (the parameters), in the order ArkIntensity makes them
+@contextlib.contextmanager
+def aa_draws(rands=(), uniforms=()):  # torch.rand(1) answers from `rands`, Tensor.uniform_(a, b) from `uniforms`, in order
+    rands, uniforms = iter(rands), iter(uniforms)
+    with mock.patch.object(torch, "rand", lambda *a, **k: torch.tensor([next(rands)])), mock.patch.object(torch.Tensor, "uniform_", lambda self, a, b: self.fill_(next(uniforms))):
+        yield
+
+
+AA_RAMP = np.tile(np.arange(256, dtype=np.uint8), (4, 1))  # every gray level, one channel (4 x 256)
+aa_ramp_img = Image.fromarray(AA_RAMP)
+aa_worst, aa_changed = 0, 0
+for aa_alpha in (0.8, 0.9, 1.0, 1.1, 1.2):
+    for aa_beta in (-51.0, -25.5, 0.0, 25.5, 51.0):  # beta = U(-0.2, 0.2) x 255
+        with aa_draws(rands=[0.0, 0.0], uniforms=[aa_alpha - 1.0, aa_beta / 255]):  # applies (0.0 < p) and brightness / contrast (0.0 < 0.5); the draws: the contrast (alpha - 1), then the brightness (beta / 255)
+            aa_got = np.asarray(ssl_data.ArkIntensity()(aa_ramp_img))
+        aa_want = albucore.multiply_add(AA_RAMP, aa_alpha, aa_beta, inplace=False)
+        aa_worst = max(aa_worst, int(np.abs(aa_got.astype(int) - aa_want.astype(int)).max()))
+        aa_changed += not np.array_equal(aa_got, AA_RAMP)
+assert aa_worst <= 1 and aa_changed == 24, (aa_worst, aa_changed)  # 24 of the 25 grid points are not the identity (alpha 1, beta 0 is), so the comparison is not vacuous
+for aa_gamma in (80.0, 87.5, 95.0, 100.0, 105.0, 112.5, 120.0):  # percent, as RandomGamma(gamma_limit=(80, 120)) draws them (all exact in float32)
+    with aa_draws(rands=[0.0, 0.9], uniforms=[aa_gamma]):  # applies, and 0.9 >= 0.5: gamma
+        aa_got = np.asarray(ssl_data.ArkIntensity()(aa_ramp_img))
+    assert np.array_equal(aa_got, fpixel.gamma_transform(AA_RAMP, aa_gamma / 100)), aa_gamma
+    assert aa_gamma == 100.0 or not np.array_equal(aa_got, AA_RAMP), aa_gamma
+with aa_draws(rands=[0.9]):  # a coin above p leaves the very same image
+    assert ssl_data.ArkIntensity()(aa_ramp_img) is aa_ramp_img
+aa_gray, aa_python_numpy = Image.new("L", (8, 8), 128), (random.getstate(), np.random.get_state())
+torch.manual_seed(0)
+aa_intensity = ssl_data.ArkIntensity()
+aa_hits = sum(int(np.asarray(aa_intensity(aa_gray))[0, 0] != 128) for _ in range(2000))
+assert abs(aa_hits / 2000 - 0.3) < 0.04 and same_state((random.getstate(), np.random.get_state()), aa_python_numpy), aa_hits  # applied at p 0.3; python's and numpy's RNGs untouched
+print("OK (aa) ArkIntensity against albumentations 2.0.8: over a 5 x 5 grid of fixed (alpha, beta) (24 of them not the identity) its LUT on a ramp of all 256 gray levels is albucore.multiply_add's (largest difference %d, 1 allowed), over 7 gammas "
+      "(80 to 120) exactly fpixel.gamma_transform's; a coin above 0.3 leaves the image alone; over 2000 seeded calls on a mid-gray image %.3f of the outputs differ from the input (0.3 +/- 0.04) and the python and numpy RNG states "
+      "are unchanged" % (aa_worst, aa_hits / 2000))
+
+# (e) RandomRotationReflect: a constant image stays that constant everywhere (no black corner), at its size, whatever the angle; on a smooth image it is Ark+'s ShiftScaleRotate with border_mode BORDER_REFLECT_101 within 1 gray level at fixed angles, while the
+# container's albumentations 2.0.8 default (no border_mode: constant 0) leaves black corners, which is why it is not copied; the angles are uniform in [-D, D] and the rotation is applied at p 0.5
+aa_const, aa_angles, aa_real_rotate = Image.new("L", (80, 60), 200), [], v2.functional.rotate  # a constant, non-square image
+
+
+def aa_recording_rotate(img, angle, *args, **kwargs):  # every angle the transform rotates by
+    aa_angles.append(angle)
+    return aa_real_rotate(img, angle, *args, **kwargs)
+
+
+torch.manual_seed(0)
+with mock.patch.object(v2.functional, "rotate", aa_recording_rotate):
+    for _ in range(200):
+        aa_rotated_const = ssl_data.RandomRotationReflect(10, p=1.0)(aa_const)
+        assert aa_rotated_const.size == aa_const.size == (80, 60) and aa_rotated_const.mode == "L" and (np.asarray(aa_rotated_const) == 200).all()  # the same size, constant everywhere
+assert len(aa_angles) == 200 and max(abs(a) for a in aa_angles) <= 10 and min(aa_angles) < -9 and max(aa_angles) > 9 and abs(np.mean(aa_angles)) < 1.5  # uniform in [-10, 10]
+aa_yy, aa_xx = np.mgrid[0:60, 0:80]
+aa_smooth = (128 + 100 * np.sin(aa_xx / 17.0) * np.cos(aa_yy / 11.0)).astype(np.uint8)  # 60 x 80, smooth, 28 to 228
+aa_smooth_img, aa_smooth3 = Image.fromarray(aa_smooth), np.stack([aa_smooth] * 3, -1)
+
+
+def aa_albumentations(angle, **kwargs):  # Ark+'s ShiftScaleRotate with the rotation pinned at `angle` and no shift or scale, on the 3-channel copy: channel 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # "ShiftScaleRotate is a special case of Affine transform"
+        return A.ShiftScaleRotate(shift_limit=0, scale_limit=0, rotate_limit=(angle, angle), p=1.0, **kwargs)(image=aa_smooth3)["image"][..., 0].astype(int)
+
+
+aa_ours = {}
+for aa_a in (10.0, -10.0, 7.3):
+    with aa_draws(rands=[0.0], uniforms=[aa_a]):  # applies (0.0 < 0.5), then the angle
+        aa_ours[aa_a] = np.asarray(ssl_data.RandomRotationReflect(10, p=1.0)(aa_smooth_img)).astype(int)
+    aa_want = aa_albumentations(float(np.float32(aa_a)), border_mode=cv2.BORDER_REFLECT_101)  # the draw goes through a float32 tensor
+    assert aa_ours[aa_a].shape == aa_want.shape == (60, 80) and np.abs(aa_ours[aa_a] - aa_want).max() <= 1, aa_a  # within 1 gray level everywhere
+    assert np.abs(aa_ours[aa_a] - aa_smooth).max() > 20 and aa_ours[aa_a].min() >= aa_smooth.min(), aa_a  # it did rotate, and the corners are reflected image, not fill
+aa_container_default = aa_albumentations(10.0)  # no border_mode: the container's albumentations 2.0.8 default, BORDER_CONSTANT with fill 0
+assert aa_container_default[0, 0] == 0 and aa_smooth[0, 0] > 0 and aa_ours[10.0][0, 0] > 0  # black corners there, none here
+torch.manual_seed(0)
+aa_rotation = ssl_data.RandomRotationReflect(10)
+aa_applied = sum(aa_rotation(aa_smooth_img) is not aa_smooth_img for _ in range(2000))
+assert aa_rotation.p == 0.5 and abs(aa_applied / 2000 - 0.5) < 0.04, aa_applied
+print("OK (aa) RandomRotationReflect: 200 rotations of a constant 80 x 60 image by uniform angles in [-10, 10] (%.1f to %.1f, mean %.2f) stay that constant everywhere at 80 x 60; on a smooth image at 10, -10 and 7.3 degrees it equals "
+      "A.ShiftScaleRotate(rotate_limit=(a, a), border_mode=BORDER_REFLECT_101) within 1 gray level everywhere, while the container's default (no border_mode) leaves the corner pixel at 0; over 2000 seeded calls it "
+      "rotates %.3f of them (0.5 +/- 0.04)" % (min(aa_angles), max(aa_angles), np.mean(aa_angles), aa_applied / 2000))
+
+# (f) the shared rotation: DataAugmentationCXR(rotate_limit=10, teacher_no_distortions=True) with Gram crops on (448 at global 224). RandomRotationReflect.__call__ is spied (each call's input and output) and every piece of the pipeline logs its name: per image
+# crop 1's geometry, its rotation, its distortions, crop 2's likewise, then for each of the 8 locals geometry, rotation, distortions (10 rotations); each is handed the rotated crop, and the clean teacher crop and the Gram crop of each global crop are
+# bitwise the normalized resizes of that rotated crop, so they carry the student's rotation
+aa_aug = DataAugmentationCXR(rotate_limit=10, teacher_no_distortions=True)
+assert isinstance(aa_aug.rotate, ssl_data.RandomRotationReflect) and (aa_aug.rotate.degrees, aa_aug.rotate.p) == (10, 0.5)
+aa_aug.rotate.p = 1.0  # forced on, so each of the ten calls rotates
+aa_events, aa_rotate_in, aa_rotate_out, aa_geometry, aa_handed = [], [], [], [], {}
+aa_real_call = ssl_data.RandomRotationReflect.__call__
+
+
+def aa_spy_rotate(self, img):  # RandomRotationReflect.__call__: logged, its input and output recorded
+    out = aa_real_call(self, img)
+    aa_events.append("rotate")
+    aa_rotate_in.append(img)
+    aa_rotate_out.append(out)
+    return out
+
+
+def aa_logged(name, fn):  # a pipeline piece that logs its name when it returns, and records what it was handed (and what a crop + flip made)
+    def wrapped(arg):
+        out = fn(arg)
+        aa_events.append(name)
+        aa_handed.setdefault(name, []).append(arg)
+        if name.startswith("geometric"):
+            aa_geometry.append(out)
+        return out
+    return wrapped
+
+
+for aa_attr in ("geometric_augmentation_global", "geometric_augmentation_local", "global_transfo1", "global_transfo2", "local_transfo"):
+    setattr(aa_aug, aa_attr, aa_logged(aa_attr, getattr(aa_aug, aa_attr)))
+with mock.patch.object(ssl_data.RandomRotationReflect, "__call__", aa_spy_rotate):
+    aa_out = ng_seeded(aa_aug, ng_image)
+assert aa_events == ["geometric_augmentation_global", "rotate", "global_transfo1", "geometric_augmentation_global", "rotate", "global_transfo2"] + ["geometric_augmentation_local", "rotate", "local_transfo"] * 8, aa_events
+assert len(aa_rotate_out) == 10 and all(a is b for a, b in zip(aa_rotate_in, aa_geometry))  # 2 + 8 rotations, each of a crop + flip's output
+assert aa_handed["global_transfo1"][0] is aa_rotate_out[0] and aa_handed["global_transfo2"][0] is aa_rotate_out[1] and all(a is b for a, b in zip(aa_handed["local_transfo"], aa_rotate_out[2:]))  # the student's crops are made from the rotated ones
+for aa_i in range(2):
+    assert aa_rotate_out[aa_i].size == aa_geometry[aa_i].size == (448, 448) and not np.array_equal(np.asarray(aa_rotate_out[aa_i]), np.asarray(aa_geometry[aa_i]))  # the 448 crop was really rotated
+    assert torch.equal(aa_out["global_crops_teacher"][aa_i], aa_aug.normalize(aa_aug.resize_global(aa_rotate_out[aa_i])))  # the clean teacher crop: the rotated crop, resized to 224, normalized
+    assert torch.equal(aa_out["gram_teacher_crops"][aa_i], aa_aug.normalize(aa_aug.resize_gram_teacher(aa_rotate_out[aa_i])))  # the Gram crop: the same rotated crop at 448
+assert any(not torch.equal(c, s) for c, s in zip(aa_out["global_crops_teacher"], aa_out["global_crops"]))  # the student's crops are the distorted ones (a distortion may skip one crop: they apply at p 0.8 / 0.5)
+print("OK (aa) shared rotation: per image RandomRotationReflect is called 10 times (2 global crops, 8 local), in the order crop 1 geometry / rotation / distortions, crop 2 likewise, then each local's geometry / rotation / distortions, each "
+      "rotating the output of a crop + flip and handed on to its distortions; the two 448 crops really change, and each global crop's clean teacher crop is bitwise normalize(resize to 224 of the rotated crop) and its Gram crop "
+      "bitwise normalize(resize to 448 of the same rotated crop)")
+
+# (g) end to end in the planned run's mode, tiny: the planned augmentation flags with --no_gram --cyclic_ark_teacher --no_ibot_separate_head, 1 cycle on (x)'s data. It completes, prints the augmentation line once, and records the seven (args.json: tuples as lists;
+# the checkpoint: tuples). A --resume without --rotate_limit 10, and one without --intensity_aug ark, each refuse naming only that key; the same line resumes; a --branch_from without --rotate_limit is refused naming it. A default checkpoint whose
+# args lack the seven keys (written before the flags) resumes as the defaults and refuses any of them
+AA_E = os.path.join(TMP, "AA_E")
+aa_summary, aa_text = xgo(AA_E, *AA_MODE, *AA_PLANNED, "--stop_after_epochs", "1")
+aa_lines, aa_info, aa_ck = aa_text.splitlines(), json.load(open(os.path.join(AA_E, "args.json"))), load_ckpt(AA_E, "epoch_0001.pth")
+assert (aa_summary["step"], aa_summary["epoch"], aa_summary["epoch_length"]) == (15, 1, 15) and sorted(os.listdir(os.path.join(AA_E, "ckpt"))) == ["epoch_0001.pth"]
+assert aa_lines.count(AA_LINE) == 1 and sum(line.startswith("augmentation") for line in aa_lines) == 1, aa_text  # the one new line, printed once
+assert [aa_info[k] for k in AA_KEYS] == [[0.15, 1.0], [0.05, 0.15], "ark", True, None, True, 10.0] and aa_info["decode_min_side"] == 1344 and "JPEG decode min side 1344" in aa_text  # args.json: tuples as lists
+assert tuple(aa_ck["args"][k] for k in AA_KEYS) == AA_PLANNED_VALUES and type(aa_ck["args"]["global_crops_scale"]) is tuple and type(aa_ck["args"]["local_crops_scale"]) is tuple  # the checkpoint keeps tuples, which --resume compares
+aa_before = open(os.path.join(AA_E, "args.json")).read()
+aa_without = lambda flag: [a for i, a in enumerate(AA_PLANNED) if i not in (AA_PLANNED.index(flag), AA_PLANNED.index(flag) + 1)]  # the planned flags minus a valued flag and its value
+for aa_flag, aa_diff in (("--rotate_limit", "rotate_limit: checkpoint 10.0, now 0.0"), ("--intensity_aug", "intensity_aug: checkpoint 'ark', now 'jitter'")):
+    aa_message = raises(ValueError, xgo, AA_E, *AA_MODE, *aa_without(aa_flag), "--resume", "--stop_after_epochs", "2")
+    assert "cannot --resume" in aa_message and aa_message.endswith("differs from the checkpoint in " + aa_diff), aa_message  # only that key differs
+assert open(os.path.join(AA_E, "args.json")).read() == aa_before  # the refusals left the record alone
+assert "nothing to do: 1 epochs done, --stop_after_epochs 1" in xgo(AA_E, *AA_MODE, *AA_PLANNED, "--resume", "--stop_after_epochs", "1")[1]  # the same line resumes (the tuples compare equal)
+AA_BR = os.path.join(TMP, "AA_BR")  # a Gram branch of the cycle-1 checkpoint that differs from it in --rotate_limit only
+aa_message = raises(ValueError, xgo, AA_BR, "--branch_from", os.path.join(AA_E, "ckpt", "epoch_0001.pth"), *AA_MODE[1:], *aa_without("--rotate_limit"), "--gram_refresh_steps", "100", "--stop_after_epochs", "2")
+assert "cannot --branch_from" in aa_message and aa_message.endswith("differs from the checkpoint in rotate_limit: checkpoint 10.0, now 0.0") and not os.path.exists(AA_BR), aa_message
+
+
+def aa_via_json(out, *extra):  # run() handed a Namespace that went through JSON, the ranges as lists, as the two-rank drivers hand it (and (v) resumes in-process what they save); returns what it printed
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ssl_pretrain.run(SimpleNamespace(**json.loads(json.dumps(vars(make_args(out, *extra))))), TINY_VIT, TINY_HEADS, X_CFG)
+    return buf.getvalue()
+
+
+assert "nothing to do: 1 epochs done, --stop_after_epochs 1" in aa_via_json(AA_E, *AA_MODE, *AA_PLANNED, "--resume", "--stop_after_epochs", "1")  # the planned line as lists resumes its tuple checkpoint
+AA_UC = os.path.join(TMP, "AA_UC")  # (z)'s default run as written before the flags existed: its args lack the seven keys
+shutil.copytree(Z_D, AA_UC)
+aa_ck_old = load_ckpt(AA_UC, "epoch_0002.pth")
+assert tuple(aa_ck_old["args"].pop(k) for k in AA_KEYS) == AA_DEFAULTS and not set(AA_KEYS) & set(aa_ck_old["args"])
+torch.save(aa_ck_old, os.path.join(AA_UC, "ckpt", "epoch_0002.pth"))
+assert "nothing to do: 2 epochs done" in xgo(AA_UC, *Z_LINE, "--resume")[1]  # it reads as the defaults: a default line resumes ...
+for aa_flags, aa_diff in ((["--rotate_limit", "10"], "rotate_limit: checkpoint 0.0, now 10.0"), (["--no_blur"], "no_blur: checkpoint False, now True"), (["--intensity_aug", "ark"], "intensity_aug: checkpoint 'jitter', now 'ark'"),
+                          (["--global_crops_scale", "0.15", "1"], "global_crops_scale: checkpoint (0.25, 1.0), now (0.15, 1.0)"), (["--no_horizontal_flips"], "no_horizontal_flips: checkpoint False, now True")):
+    assert aa_diff in raises(ValueError, xgo, AA_UC, *Z_LINE, *aa_flags, "--resume"), aa_flags  # ... and a line with any of them off the default does not
+aa_text_json = aa_via_json(AA_UC, *Z_LINE, "--resume")  # the default ranges as lists are the defaults: the same run (no refusal) and no augmentation line
+assert "nothing to do: 2 epochs done" in aa_text_json and "augmentation" not in aa_text_json, aa_text_json
+print("OK (aa) end to end (--no_gram --cyclic_ark_teacher --no_ibot_separate_head, the planned flags, 1 cycle of 15 steps): it completes, prints the augmentation line once, records global (0.15, 1.0), local (0.05, 0.15), ark, no_blur true with blur_sigma "
+      "null, no_horizontal_flips true, rotate_limit 10 in args.json (tuples as lists) and as tuples in the checkpoint, and decode side 1344; a --resume without --rotate_limit 10 and one without --intensity_aug ark each raise naming only that "
+      "key with args.json untouched, the same line resumes (also when run() is handed its args as a JSON round trip leaves them, the ranges as lists, which it turns back into tuples), a --branch_from without --rotate_limit is refused naming it; "
+      "a default checkpoint whose args lack the seven keys resumes as the defaults (as lists too, with no augmentation line) and refuses --rotate_limit 10, --no_blur, --intensity_aug ark, --global_crops_scale 0.15 1 and --no_horizontal_flips")
+
+# (h) --no_horizontal_flips: RandomHorizontalFlip with p 0.0 in both geometric pipelines (0.5 by default); the planned settings build the pipelines they name; run() hands DataAugmentationCXR every setting
+for aa_kwargs, aa_p in (({}, 0.5), (dict(horizontal_flips=False), 0.0)):
+    aa_made_aug = DataAugmentationCXR(**aa_kwargs)
+    for aa_pipeline in (aa_made_aug.geometric_augmentation_global, aa_made_aug.geometric_augmentation_local):
+        assert isinstance(aa_pipeline.transforms[0], v2.RandomResizedCrop) and isinstance(aa_pipeline.transforms[1], v2.RandomHorizontalFlip) and aa_pipeline.transforms[1].p == aa_p, aa_kwargs
+aa_planned_aug = DataAugmentationCXR(**aa_planned_kw)
+assert aa_planned_aug.geometric_augmentation_global.transforms[0].scale == (0.15, 1.0) and aa_planned_aug.geometric_augmentation_local.transforms[0].scale == (0.05, 0.15)
+assert all(t.p == 0.0 for t in (aa_planned_aug.geometric_augmentation_global.transforms[1], aa_planned_aug.geometric_augmentation_local.transforms[1]))
+assert all(isinstance(t, ssl_data.ArkIntensity) for t in (aa_planned_aug.global_transfo1.transforms[1], aa_planned_aug.global_transfo2.transforms[1], aa_planned_aug.local_transfo.transforms[0]))  # no color jitter ...
+assert all(isinstance(t, torch.nn.Identity) for t in (aa_planned_aug.global_transfo1.transforms[2], aa_planned_aug.local_transfo.transforms[1])) and isinstance(aa_planned_aug.rotate, ssl_data.RandomRotationReflect)  # ... and no blur
+aa_made, aa_real_aug = [], ssl_pretrain.DataAugmentationCXR
+with mock.patch.object(ssl_pretrain, "DataAugmentationCXR", lambda **kwargs: (aa_made.append(kwargs), aa_real_aug(**kwargs))[1]):  # run() up to its first step, three times
+    v_start(os.path.join(TMP, "AA_W0"))
+    v_start(os.path.join(TMP, "AA_W1"), *AA_PLANNED)
+    v_start(os.path.join(TMP, "AA_W2"), "--blur_sigma", "0.5", "2")
+aa_wiring = lambda kwargs: tuple(kwargs[k] for k in ("global_crops_scale", "local_crops_scale", "intensity", "blur_sigma", "horizontal_flips", "rotate_limit"))
+assert [aa_wiring(kwargs) for kwargs in aa_made] == [((0.25, 1.0), (0.04, 0.25), "jitter", (0.1, 1.0), True, 0.0), ((0.15, 1.0), (0.05, 0.15), "ark", None, False, 10.0), ((0.25, 1.0), (0.04, 0.25), "jitter", (0.5, 2.0), True, 0.0)], aa_made
+print("OK (aa) flips and wiring: the crop + flip pipelines hold RandomHorizontalFlip with p 0.5 by default and 0.0 with horizontal_flips=False (global and local); the planned settings build RandomResizedCrops of scale (0.15, 1.0) / (0.05, 0.15), "
+      "no flip, ArkIntensity in place of the color jitter in all three distortion pipelines, an Identity in place of the blur and a RandomRotationReflect for the rotation; run() hands DataAugmentationCXR the scales, intensity, blur sigma (none under --no_blur), "
+      "flips and rotation limit of the default run, the planned run and a --blur_sigma 0.5 2 run")
+
+
 # (k) launch scripts ------------------------------------------------------------------------------------------------------------
 scripts = [os.path.join(REPO, "chain", f) for f in ("ssl_common.sh", "pilot_a.sh", "pilot_b.sh", "main.sh", "constlr.sh", "hires.sh")]
 scripts.append(os.path.join(REPO, "run_d1_8s_timing_gaudi.sh"))

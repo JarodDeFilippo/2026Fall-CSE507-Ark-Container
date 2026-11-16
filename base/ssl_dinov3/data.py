@@ -26,7 +26,9 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 # decode_min_side(), which raises it with the crop sizes (2368 for 512 / 224 / 1024).
 DECODE_MIN_SIDE = 1024
 # Stage A's crop sizes (pilots, main, constlr) keep DECODE_MIN_SIDE exactly: those runs resume across this change (constlr is extended
-# indefinitely) and the decode side is not locked on --resume. decode_min_side() alone would give them 1088.
+# indefinitely) and the decode side is not locked on --resume. decode_min_side() alone would give them 1088. The override holds only at
+# Stage A's minimum crop scales too (global 0.25, local 0.04): at any other minimum the rule's own value is used (1344 for 224 / 96 / 448
+# at global 0.15 / local 0.05, whose smaller crop regions a 1024 decode would upsample).
 STAGE_A_CROPS = (224, 96, 448)
 
 
@@ -117,6 +119,50 @@ class SSLImageDataset(Dataset):
         return self.transform(img), ()
 
 
+class RandomRotationReflect:
+    """Ark+'s ShiftScaleRotate(rotate_limit=D) at its default p 0.5 (base/dataloader.py build_ts_transformations), the rotation only (no shift or scale: the random resized crops cover
+    those): with probability p the crop is rotated by an angle drawn uniformly in [-D, D] degrees about its centre, bilinear (albumentations' default cv2.INTER_LINEAR), same size, the
+    corners filled by reflect-101 (cv2.BORDER_REFLECT_101, the image mirrored about its edge pixels): padded by reflection by more than any corner reaches, rotated, cut back. The container's
+    albumentations 2.0.8 ShiftScaleRotate defaults to border_mode 0 (cv2.BORDER_CONSTANT, fill 0: black corners), while albumentations 1.x, which Ark's code was written against, defaulted to
+    BORDER_REFLECT_101; reflect-101 is chosen here so no black wedges enter the crops (Jarod, 2026-11-16). Torch RNG only, like the v2 transforms, so the loader's per-worker and set_epoch
+    seeding covers it; a grayscale PIL image in, a PIL image out."""
+
+    def __init__(self, degrees, p=0.5):
+        self.degrees, self.p = degrees, p
+
+    def __call__(self, img):
+        if torch.rand(1).item() >= self.p:
+            return img
+        angle = float(torch.empty(1).uniform_(-self.degrees, self.degrees))
+        w, h = img.size
+        m = math.ceil(max(w, h) * abs(math.sin(math.radians(angle))) / 2) + 2  # a corner moves out by less than max(w, h) / 2 x sin(angle); + 2 for the interpolation
+        out = v2.functional.rotate(v2.functional.pad(img, [m], padding_mode="reflect"), angle, interpolation=v2.InterpolationMode.BILINEAR)
+        return v2.functional.center_crop(out, [h, w])
+
+
+class ArkIntensity:
+    """Ark+'s student intensity step (build_ts_transformations), OneOf([RandomBrightnessContrast(), RandomGamma()], p=0.3) with albumentations 2.0.8's defaults: with probability 0.3 one of
+    the two, with equal odds (OneOf weights them by their default p, 0.5 each), else nothing. Brightness / contrast: alpha = 1 + U(-0.2, 0.2), then beta = U(-0.2, 0.2) x 255 (brightness_by_max;
+    albumentations draws them in that order), out = in x alpha + beta clipped to [0, 255] and truncated to uint8 (albucore multiply_add's uint8 LUT; note the contrast scales about 0, not the
+    mean, as albumentations does). Gamma: g = U(80, 120) / 100, out = (in / 255) ** g x 255 truncated (gamma_transform's LUT). Torch RNG only, like the v2 transforms; a grayscale PIL image in,
+    a PIL image out."""
+
+    def __init__(self, p=0.3, brightness_limit=0.2, contrast_limit=0.2, gamma_limit=(80, 120)):
+        self.p, self.brightness_limit, self.contrast_limit, self.gamma_limit = p, brightness_limit, contrast_limit, gamma_limit
+
+    def __call__(self, img):
+        if torch.rand(1).item() >= self.p:
+            return img
+        if torch.rand(1).item() < 0.5:
+            alpha = 1.0 + float(torch.empty(1).uniform_(-self.contrast_limit, self.contrast_limit))
+            beta = float(torch.empty(1).uniform_(-self.brightness_limit, self.brightness_limit)) * 255
+            lut = np.clip(np.arange(256, dtype=np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+        else:
+            gamma = float(torch.empty(1).uniform_(*self.gamma_limit)) / 100
+            lut = ((np.arange(0, 256.0 / 255, 1.0 / 255) ** gamma) * 255).astype(np.uint8)
+        return img.point(lut.tolist())
+
+
 class DataAugmentationCXR:
     """DataAugmentationDINO with gram_teacher_no_distortions=True, share_color_jitter=False,
     local_crops_subset_of_global_crops=False, teacher_no_color_jitter=False and the CXR values below.
@@ -127,7 +173,11 @@ class DataAugmentationCXR:
     bitwise those of the Gram run with the same sizes.
     teacher_no_distortions=True (--teacher_clean_view) is Meta's teacher_no_color_jitter for every photometric step: "global_crops_teacher" holds the
     two global crops' geometry only (the student's RandomResizedCrop + flip, i.e. the undistorted base the Gram crops are cut from, resized to the
-    global size), with no color jitter and no blur; it draws no RNG, so every other crop is bitwise the same as with False."""
+    global size), with no color jitter and no blur; it draws no RNG, so every other crop is bitwise the same as with False.
+    The student-augmentation kwargs default to the crops above, bitwise and from the same RNG draws in the same order: intensity="ark" swaps the color jitter for Ark+'s OneOf brightness /
+    contrast or gamma (ArkIntensity), blur_sigma=None drops the blur (nn.Identity, which draws nothing), and rotate_limit=D > 0 adds Ark+'s rotation (RandomRotationReflect, up to +/-D degrees at
+    p 0.5) to every global and local crop right after its crop + flip: the clean teacher crops, the Gram crops and the default teacher view are made from the global crops' rotated bases, so
+    they carry exactly the student's rotation of that crop."""
 
     def __init__(
         self,
@@ -142,10 +192,16 @@ class DataAugmentationCXR:
         std=IMAGENET_STD,
         emit_gram_teacher_crops=True,
         teacher_no_distortions=False,
+        intensity="jitter",  # "ark": ArkIntensity (Ark+'s OneOf brightness / contrast or gamma, p 0.3) instead of the color jitter
+        blur_sigma=(0.1, 1.0),  # None: no blur at all
+        rotate_limit=0,  # D > 0: Ark+'s rotation, up to +/-D degrees at p 0.5, on every global and local crop; 0: none
     ):
+        if intensity not in ("jitter", "ark"):
+            raise ValueError(f"intensity must be 'jitter' or 'ark', got {intensity!r}")
         self.local_crops_number = local_crops_number
         self.emit_gram_teacher_crops = emit_gram_teacher_crops
         self.teacher_no_distortions = teacher_no_distortions
+        self.rotate = RandomRotationReflect(rotate_limit) if rotate_limit > 0 else nn.Identity()  # off: no rotation is built and nothing is drawn
         bicubic = v2.InterpolationMode.BICUBIC
         flip = 0.5 if horizontal_flips else 0.0
 
@@ -168,7 +224,7 @@ class DataAugmentationCXR:
         global_rrc, local_rrc = self.geometric_augmentation_global.transforms[0], self.geometric_augmentation_local.transforms[0]
         self.decode_min_side = max(decode_min_side(global_crop_max_size, global_rrc.scale[0], global_rrc.ratio),
                                    decode_min_side(local_crops_size, local_rrc.scale[0], local_rrc.ratio))
-        if (global_crops_size, local_crops_size, gram_teacher_crops_size) == STAGE_A_CROPS:
+        if (global_crops_size, local_crops_size, gram_teacher_crops_size) == STAGE_A_CROPS and (global_rrc.scale[0], local_rrc.scale[0]) == (0.25, 0.04):  # Stage A's scales too (see STAGE_A_CROPS)
             self.decode_min_side = DECODE_MIN_SIDE
 
         # gram_teacher_no_distortions=True as the Gram-anchor config (ssl_default_config False): the gram crop gets no
@@ -182,10 +238,10 @@ class DataAugmentationCXR:
 
         # CXR (RAD-DINO-style) value; DINOv3 default ColorJitter(0.4, 0.4, 0.2, 0.1) + RandomGrayscale(p=0.2).
         # No saturation/hue/grayscale here: the images are already grayscale.
-        color_jittering = v2.RandomApply([v2.ColorJitter(brightness=0.2, contrast=0.2)], p=0.8)
+        color_jittering = v2.RandomApply([v2.ColorJitter(brightness=0.2, contrast=0.2)], p=0.8) if intensity == "jitter" else ArkIntensity()
         # CXR (RAD-DINO-style) value; DINOv3 default sigma (0.1, 2.0). Upstream's GaussianBlur passes `1 - p` to
-        # RandomApply (applies with prob 1-p); at p=0.5 both readings agree.
-        blur = v2.RandomApply([v2.GaussianBlur(kernel_size=9, sigma=(0.1, 1.0))], p=0.5)
+        # RandomApply (applies with prob 1-p); at p=0.5 both readings agree. blur_sigma None: no blur step at all (Identity draws nothing).
+        blur = v2.RandomApply([v2.GaussianBlur(kernel_size=9, sigma=blur_sigma)], p=0.5) if blur_sigma is not None else nn.Identity()
 
         # grayscale PIL -> 1-channel float -> 3 equal channels -> ImageNet mean/std
         self.normalize = v2.Compose(
@@ -202,9 +258,11 @@ class DataAugmentationCXR:
         output = {}
 
         # global crops (same RNG call order as DataAugmentationDINO.__call__)
-        im1_base = self.geometric_augmentation_global(image)
+        # with rotate_limit > 0 each crop's rotation is drawn right after its crop + flip and before its distortions: crop 1 geometry, rotation, transfo1; crop 2 likewise;
+        # the clean teacher crops and the Gram crops are made from the rotated bases, so they carry the student's rotation
+        im1_base = self.rotate(self.geometric_augmentation_global(image))
         global_crop_1 = self.global_transfo1(im1_base)
-        im2_base = self.geometric_augmentation_global(image)
+        im2_base = self.rotate(self.geometric_augmentation_global(image))
         global_crop_2 = self.global_transfo2(im2_base)
         output["global_crops"] = [global_crop_1, global_crop_2]
         if self.teacher_no_distortions:  # the same crop + flip, resized as the student's is before its distortions, and none of them
@@ -220,7 +278,7 @@ class DataAugmentationCXR:
             ]
 
         output["local_crops"] = [
-            self.local_transfo(self.geometric_augmentation_local(image)) for _ in range(self.local_crops_number)
+            self.local_transfo(self.rotate(self.geometric_augmentation_local(image))) for _ in range(self.local_crops_number)
         ]
         output["offsets"] = ()
         return output

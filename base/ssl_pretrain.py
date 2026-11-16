@@ -93,6 +93,15 @@ step short of W), so a run stopped earlier (--stop_after_epochs) has followed on
 value the step applied (the schedule's entry for it, before each group's wd_multiplier; --weight_decay itself on every row of a default run), and one line says so at the start. Locked on --resume (a checkpoint
 without the key reads as None), recorded in args.json and matched by --branch_from; a negative, NaN or infinite W is refused.
 
+--global_crops_scale MIN MAX, --local_crops_scale MIN MAX, --intensity_aug {jitter,ark}, --no_blur, --blur_sigma MIN MAX, --no_horizontal_flips and --rotate_limit D set the student's crops and augmentations, so a run can use the
+lab's Ark+ ones (base/dataloader.py build_ts_transformations) where they differ from the CXR defaults: the two RandomResizedCrop area ranges (Meta's crops.global_crops_scale / local_crops_scale; default 0.25 1.0 and 0.04 0.25),
+--intensity_aug ark (OneOf(RandomBrightnessContrast, RandomGamma) at p 0.3 in place of the color jitter: ssl_dinov3/data.py ArkIntensity), the blur dropped or given another sigma range (default 0.1 1.0), no horizontal flip, and
+--rotate_limit D (Ark+'s ShiftScaleRotate(rotate_limit=D) at p 0.5, the rotation only, the corners filled by reflect-101: RandomRotationReflect): every global and local crop is rotated right after its crop + flip, and the clean teacher /
+Gram copy of a global crop is cut from the rotated crop, so it carries the student's rotation. The defaults (0.25 1.0, 0.04 0.25, jitter, blur on at 0.1 1.0, flips on, no rotation) are today's crops, bitwise and from the same RNG draws in
+the same order; a run with any of the seven off its default prints one `augmentation (student crops):` line. All seven are locked on --resume (a checkpoint without the keys reads as the defaults), recorded in args.json and matched by
+--branch_from. The JPEG decode side now follows the minimum crop scales too (the 1024 of 224 / 96 / 448 is Stage A's, at its scales 0.25 and 0.04), so 224 / 96 / 448 at --global_crops_scale 0.15 1 decodes at 1344 unless --pre_resize or
+--decode_min_side sets it.
+
 --cyclic_ark_teacher is the Ark+ / Foundation X teacher transplanted into this trainer (Jarod, 2026-10-26). A cycle replaces the mixed-batch epoch: the
 --data_set datasets in turn, largest first by image count (computed and logged; on the four CXR sets MIMIC, CheXpert, ChestXray14, VinDrCXR, whatever the
 --data_set order; a tie keeps that order), every batch from one dataset. Per dataset the cycle runs its release pass, one full pass over the dataset with
@@ -147,7 +156,7 @@ is then N, since the whole image is squashed to N anyway: printed on the crops: 
 on --resume and a --branch_from source must match it (a checkpoint without the key reads as 0); an --init_from_checkpoint source is not compared.
 
 --decode_min_side N (default 0: off; chain/newdata512_cropsrc.sh passes 1024) sets the JPEG decode side by hand (the PIL draft target: a JPEG is decoded at 1/2, 1/4 or 1/8 size while both sides stay >= N)
-where the crop sizes would give another: 1024 for 224 / 96 / 448, 1344 for 512 / 224 / 512 (the local crops'), 2368 for 512 / 224 / 1024. 0 keeps that rule, so every earlier launch line is unchanged. A PNG is
+where the crop sizes would give another: at the default crop scales 1024 for 224 / 96 / 448, 1344 for 512 / 224 / 512 (the local crops'), 2368 for 512 / 224 / 1024 (smaller --global_crops_scale / --local_crops_scale minimums raise them). 0 keeps that rule, so every earlier launch line is unchanged. A PNG is
 decoded at its own size whatever N is (Image.draft exists for JPEG and MPO only), so it moves MIMIC, CheXpert and VinDrCXR, not ChestXray14, PadChest, TAIXRay or ReXGradient. Recorded as decode_min_side in args.json
 (the side actually used, as always); it changes the inputs, so it is locked on --resume and a --branch_from source must match it (a checkpoint without the key reads as 0). Refused with --pre_resize, which sets the side itself.
 
@@ -201,21 +210,24 @@ LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "i
 # teacher rule, teacher views, head parameters, lock passes, checkpoint record); a --branch_from must match them too (none is branch-free)
 # pre_resize: the image the crops are cut from (squashed to N x N first; 0: the full decode); like the crop sizes it changes the inputs, so a --branch_from must match it too
 # decode_min_side: the JPEG decode side when set by hand (0: follows the crop sizes); likewise
+# global_crops_scale / local_crops_scale / intensity_aug / no_blur / blur_sigma / no_horizontal_flips / rotate_limit: the student's crop ranges and augmentations (they change every crop, like the crop sizes), so a --branch_from must match them too (none is branch-free)
 RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_lr_scaling", "warmup_epochs",
                 "weight_decay", "momentum_teacher", "teacher_temp_warmup_epochs", "gram_weight", "global_crops_size",
                 "local_crops_size", "gram_teacher_size", "gram_refresh_steps", "freeze_backbone_epochs", "local_crops_number",
                 "seed", "bf16", "world_size", "init_from_checkpoint", "init_new_heads_from", "no_gram", "branch_from", "drop_path_rate",
                 "rope_rescale_coords", "untie_local_cls_norm", "cyclic_ark_teacher", "ark_teacher_momentum", "teacher_clean_view", "heads",
-                "lock_half_pass", "keep_all_checkpoints", "gram_teacher_from", "pre_resize", "decode_min_side", "no_ibot_separate_head", "weight_decay_end")
+                "lock_half_pass", "keep_all_checkpoints", "gram_teacher_from", "pre_resize", "decode_min_side", "no_ibot_separate_head", "weight_decay_end",
+                "global_crops_scale", "local_crops_scale", "intensity_aug", "no_blur", "blur_sigma", "no_horizontal_flips", "rotate_limit")
 # checkpoints written before the crop-size flags existed (pilots, main, constlr) were all trained at these
 CROP_DEFAULTS = dict(global_crops_size=224, local_crops_size=96, gram_teacher_size=448)
 # keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off, no --branch_from (nor
 # --gram_teacher_from), no --init_new_heads_from, no recipe setting (drop path 0, no RoPE rescale, tied CLS norm), no --pre_resize (crops cut from the full decode), no --decode_min_side (the decode side
-# follows the crop sizes), a separate iBOT head (--no_ibot_separate_head off), a constant weight decay (no --weight_decay_end), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads, no lock passes, the pruned checkpoint record)
+# follows the crop sizes), a separate iBOT head (--no_ibot_separate_head off), a constant weight decay (no --weight_decay_end), the CXR crops (scales 0.25-1 global / 0.04-0.25 local, color jitter, blur sigma 0.1-1, flips, no rotation: the seven student-augmentation flags off), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads, no lock passes, the pruned checkpoint record)
 ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None, drop_path_rate=0.0, rope_rescale_coords=None, untie_local_cls_norm=False,
                     cyclic_ark_teacher=False, ark_teacher_momentum=None, teacher_clean_view=False, heads="shared", lock_half_pass=False,
                     keep_all_checkpoints=False, gram_teacher_from=None, init_new_heads_from=None, pre_resize=0, decode_min_side=0,
-                    no_ibot_separate_head=False, weight_decay_end=None)
+                    no_ibot_separate_head=False, weight_decay_end=None, global_crops_scale=(0.25, 1.0), local_crops_scale=(0.04, 0.25),
+                    intensity_aug="jitter", no_blur=False, blur_sigma=(0.1, 1.0), no_horizontal_flips=False, rotate_limit=0.0)
 # what a --branch_from start may differ from its source in (check_resume skips these): the Gram switch and knobs the branch turns on, the path itself,
 # the source's own init provenance (its full state is restored; a branch cannot pass --init_from_checkpoint or --init_new_heads_from, so they would always differ)
 # and the Gram teacher's own source (a no-Gram trunk has none)
@@ -306,8 +318,26 @@ def parse_args(argv=None):
     p.add_argument("--pre_resize", type=int, default=0,
                    help="squash each image to N x N after decode and before the random crops, the Ark loader convention (base/dataloader.py); 0 = crop from the full decode")
     p.add_argument("--decode_min_side", type=int, default=0,
-                   help="the JPEG decode side (PIL draft target), in place of the one the crop sizes give (1024 for 224 / 96 / 448, 1344 for 512 / 224 / 512, 2368 for 512 / 224 / 1024); "
+                   help="the JPEG decode side (PIL draft target), in place of the one the crop sizes give (at the default crop scales 1024 for 224 / 96 / 448, 1344 for 512 / 224 / 512, 2368 for 512 / 224 / 1024; smaller crop scale minimums raise them); "
                         "0 = follow the crops. PNGs are decoded at their own size whatever it is. Refused with --pre_resize, which sets the side itself")
+    p.add_argument("--global_crops_scale", type=float, nargs=2, metavar=("MIN", "MAX"), default=(0.25, 1.0),
+                   help="the area range, as fractions of the image, of the two global crops' RandomResizedCrop: 0 < MIN <= MAX <= 1 (Meta's crops.global_crops_scale; DINOv3's default is 0.32 1.0, this trainer's 0.25 1.0). "
+                        "The minimum also sets the JPEG decode side (see --decode_min_side)")
+    p.add_argument("--local_crops_scale", type=float, nargs=2, metavar=("MIN", "MAX"), default=(0.04, 0.25),
+                   help="the area range of the local crops' RandomResizedCrop: 0 < MIN <= MAX <= 1 (Meta's crops.local_crops_scale; DINOv2's ssl_default_config is 0.05 0.32, this trainer's 0.04 0.25). "
+                        "The minimum also sets the JPEG decode side (see --decode_min_side)")
+    p.add_argument("--intensity_aug", choices=("jitter", "ark"), default="jitter",
+                   help="the student's intensity step: jitter (default; ColorJitter brightness / contrast 0.2 at p 0.8) or ark (Ark+'s base/dataloader.py build_ts_transformations: "
+                        "OneOf(RandomBrightnessContrast, RandomGamma) with albumentations 2.0.8's defaults, at p 0.3)")
+    p.add_argument("--no_blur", action="store_true",
+                   help="no Gaussian blur on any crop (default: p 0.5 on the first global crop and on every local crop; Ark+'s build_ts_transformations has none)")
+    p.add_argument("--blur_sigma", type=float, nargs=2, metavar=("MIN", "MAX"), default=None,
+                   help="the blur's sigma range: 0 < MIN <= MAX (default 0.1 1.0; DINOv3's is 0.1 2.0). Refused with --no_blur, which has no blur to set it for")
+    p.add_argument("--no_horizontal_flips", action="store_true",
+                   help="no horizontal flip on any crop (default: p 0.5 on every global and local crop; Ark+'s build_ts_transformations has none)")
+    p.add_argument("--rotate_limit", type=float, metavar="D", default=0.0,
+                   help="Ark+'s rotation (build_ts_transformations' ShiftScaleRotate(rotate_limit=D) at its default p 0.5, the rotation only): every global and local crop is rotated with probability 0.5 by a uniform angle "
+                        "in [-D, D] degrees about its centre, bilinear, the corners filled by reflect-101; each global crop's clean teacher / Gram copy is cut from the rotated crop. D in [0, 90); 0 = none (default)")
     p.add_argument("--drop_path_rate", type=float, default=0.0,
                    help="student stochastic depth, in [0, 1) (Meta's DINOv3 recipe: 0.3); train mode only")
     p.add_argument("--rope_rescale_coords", type=parse_rescale, default=None,
@@ -359,6 +389,20 @@ def parse_args(argv=None):
         p.error(f"--decode_min_side must be 0 (off) or a size in pixels, got {args.decode_min_side}")
     if args.decode_min_side and args.pre_resize:  # the whole image is squashed to pre_resize x pre_resize, which is then the side the JPEG is decoded at
         p.error("--decode_min_side cannot be combined with --pre_resize (the decode side is then the squash size)")
+    for name in ("global_crops_scale", "local_crops_scale"):
+        scale = tuple(getattr(args, name))  # tuples everywhere: argparse gives a list when the flag is given, and a resumed run's args must compare equal
+        if not 0.0 < scale[0] <= scale[1] <= 1.0:  # a RandomResizedCrop's area fractions (NaN fails every comparison)
+            p.error(f"--{name} must satisfy 0 < MIN <= MAX <= 1, got {scale[0]:g} {scale[1]:g}")
+        setattr(args, name, scale)
+    if args.no_blur:  # no blur step at all: the sigma range has nothing to act on, so an explicit one is a mistake, not a no-op
+        if args.blur_sigma is not None:
+            p.error("--blur_sigma cannot be combined with --no_blur (there is no blur to set the sigma range of)")
+    else:
+        args.blur_sigma = (0.1, 1.0) if args.blur_sigma is None else tuple(args.blur_sigma)
+        if not (0.0 < args.blur_sigma[0] <= args.blur_sigma[1] and math.isfinite(args.blur_sigma[1])):  # GaussianBlur's own rule (positive, MIN <= MAX); NaN fails it, and an infinite MAX would draw infinite sigmas
+            p.error(f"--blur_sigma must satisfy 0 < MIN <= MAX (finite), got {args.blur_sigma[0]:g} {args.blur_sigma[1]:g}")
+    if not (math.isfinite(args.rotate_limit) and 0.0 <= args.rotate_limit < 90.0):  # 0 is off; NaN and inf fail the test
+        p.error(f"--rotate_limit must be a finite number of degrees in [0, 90) (0: no rotation), got {args.rotate_limit}")
     if args.pretrained_weights is None and args.init_from_checkpoint is None and args.branch_from is None:
         p.error("--pretrained_weights is required unless --init_from_checkpoint is given (or --branch_from)")
     if args.gram_teacher_from is not None:  # the Gram teacher of a branch's start, from an earlier checkpoint of its source's run
@@ -595,6 +639,9 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     """Train (or resume) as args say; returns dict(step, epoch, gram_refreshes, peak_lr, epoch_length). The keyword
     arguments are the test seam: a tiny ViT / heads, an in-memory datasets config, no image-existence check."""
     args = argparse.Namespace(**vars(args))
+    for name in ("global_crops_scale", "local_crops_scale", "blur_sigma"):  # tuples, as parse_args makes them: a Namespace that went through JSON (the two-rank test drivers') holds lists, which a --resume would find unequal to a checkpoint's tuples
+        if getattr(args, name) is not None:
+            setattr(args, name, tuple(getattr(args, name)))
     stop_epoch = args.stop_after_epochs = check_args(args)
     # a --resume of a run that has its own epoch checkpoint restores that one (check_resume compares the recorded init / branch path), so the
     # init or branch source file is read, and must exist, only when the run starts
@@ -702,8 +749,10 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
 
     transform = DataAugmentationCXR(local_crops_number=args.local_crops_number, global_crops_size=args.global_crops_size,
                                     local_crops_size=args.local_crops_size, gram_teacher_crops_size=args.gram_teacher_size,
-                                    emit_gram_teacher_crops=not args.no_gram, teacher_no_distortions=args.teacher_clean_view)
-    decode_side = args.pre_resize or args.decode_min_side or transform.decode_min_side  # --pre_resize N: N (the image is squashed to N x N after the decode); --decode_min_side N: N; else follows the crop sizes: 1024 for 224 / 96 / 448 (as before), 1344 for 512 / 224 / 512, 2368 for 512 / 224 / 1024
+                                    emit_gram_teacher_crops=not args.no_gram, teacher_no_distortions=args.teacher_clean_view,
+                                    global_crops_scale=args.global_crops_scale, local_crops_scale=args.local_crops_scale, horizontal_flips=not args.no_horizontal_flips,
+                                    intensity=args.intensity_aug, blur_sigma=args.blur_sigma, rotate_limit=args.rotate_limit)
+    decode_side = args.pre_resize or args.decode_min_side or transform.decode_min_side  # --pre_resize N: N (the image is squashed to N x N after the decode); --decode_min_side N: N; else follows the crop sizes and minimum scales: at the default scales 1024 for 224 / 96 / 448 (as before), 1344 for 512 / 224 / 512, 2368 for 512 / 224 / 1024
     cut_note = (f"global crops cut at {args.global_crops_size}, no resize" if args.gram_teacher_size == args.global_crops_size else
                 f"global crops cut at {args.gram_teacher_size} and resized to {args.global_crops_size}, as in the Gram runs")
     gram_crops_note = f"no Gram teacher ({cut_note})" if args.no_gram else f"Gram teacher {args.gram_teacher_size}"
@@ -711,6 +760,12 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                        if args.pre_resize else "")
     say(f"crops: global {args.global_crops_size}, local {args.local_crops_size} (x{args.local_crops_number}), "
         f"{gram_crops_note}; {pre_resize_note}JPEG decode min side {decode_side}")
+    if any(getattr(args, k) != ARG_DEFAULTS[k] for k in ("global_crops_scale", "local_crops_scale", "intensity_aug", "no_blur", "blur_sigma", "no_horizontal_flips", "rotate_limit")):  # the defaults print nothing new
+        intensity_note = "ark (Ark+'s OneOf brightness / contrast 0.2 or gamma (80, 120), p 0.3)" if args.intensity_aug == "ark" else "jitter (brightness / contrast 0.2, p 0.8)"
+        blur_note = "off" if args.blur_sigma is None else f"sigma ({args.blur_sigma[0]:g}, {args.blur_sigma[1]:g}) at p 0.5"
+        rotation_note = (f"up to +/-{args.rotate_limit:g} degrees at p 0.5, reflect-101 corners, the same rotation on each global crop's clean teacher / Gram copy" if args.rotate_limit else "off")
+        say(f"augmentation (student crops): global crop scale ({args.global_crops_scale[0]:g}, {args.global_crops_scale[1]:g}), local crop scale ({args.local_crops_scale[0]:g}, {args.local_crops_scale[1]:g}); "
+            f"intensity {intensity_note}; blur {blur_note}; horizontal flips {'off' if args.no_horizontal_flips else 'on'}; rotation {rotation_note}")
     if datasets_config is None:
         datasets_config = get_config(args.datasets_config)
     dataset = build_dataset(args.data_set, datasets_config, transform, check_exists=check_exists and main, decode_side=decode_side, pre_resize=args.pre_resize)
