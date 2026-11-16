@@ -828,26 +828,24 @@ COS_HEADERS = {"MIMIC": "image_path,dicom_id,study_id", "CheXpert": "Path,Sex,Ag
 COS_PASS_END = ['MIMIC', 'ReXGradient', 'CheXpert', 'TAIXRay', 'PadChest', 'ChestXray14']  # the smoke cycle's passes but the last (the cut lists tie, so the --data_set order: VinDrCXR, the short one, last)
 COS_SHORT = {"VinDrCXR": 15000}  # the real list's size, below SMOKE_ROWS: the smoke keeps it whole (29 steps on 8 cards)
 COS_COLUMNS = "step,epoch,dino_global,dino_local,koleo,ibot,gram,total,lr,wd,momentum,teacher_temp,gram_weight,step_time,data_time,dataset,dino_whole"
-# the rows the stub trainer writes for each line: (step, dino_global, dino_local, total, step_time, data_time, dataset, dino_whole); the first, step 0, holds the compile. Values exact in binary, so Python's sums are awk's
-COS_ROWS = {"fp32": [(0, 9.0, 9.5, 30.0, 41.0, 6.0, "MIMIC:release", 9.75), (4, 8.0, 8.5, 20.0, 2.0, 0.25, "MIMIC:release", 8.75), (9, 7.0, 7.5, 18.0, 2.5, 0.75, "MIMIC:release", 7.75),
-                     (14, 6.0, 6.5, 14.0, 3.0, 1.25, "ReXGradient:release", 6.75), (19, 5.0, 5.5, 12.0, 2.0, 0.5, "ReXGradient:release", 5.75), (24, 4.0, 4.5, 10.0, 1.5, 0.25, "CheXpert:release", 4.75)],
-            "bf16": [(0, 9.25, 9.75, 30.5, 35.0, 5.0, "MIMIC:release", 9.5), (4, 8.25, 8.75, 20.5, 1.5, 0.25, "MIMIC:release", 8.5), (9, 7.25, 7.75, 18.5, 1.75, 0.5, "MIMIC:release", 7.5),
-                     (14, 6.25, 6.75, 14.5, 2.25, 1.0, "ReXGradient:release", 6.5), (19, 5.25, 5.75, 12.5, 1.5, 0.5, "ReXGradient:release", 5.5), (24, 4.25, 4.75, 10.5, 1.25, 0.25, "CheXpert:release", 4.5)]}
+# the rows the stub trainer writes: (step, dino_global, dino_local, total, step_time, data_time, dataset, dino_whole); the first, step 0, holds the compile. Values exact in binary, so Python's sums are awk's
+COS_ROWS = [(0, 9.0, 9.5, 30.0, 41.0, 6.0, "MIMIC:release", 9.75), (4, 8.0, 8.5, 20.0, 2.0, 0.25, "MIMIC:release", 8.75), (9, 7.0, 7.5, 18.0, 2.5, 0.75, "MIMIC:release", 7.75),
+            (14, 6.0, 6.5, 14.0, 3.0, 1.25, "ReXGradient:release", 6.75), (19, 5.0, 5.5, 12.0, 2.0, 0.5, "ReXGradient:release", 5.75), (24, 4.0, 4.5, 10.0, 1.5, 0.25, "CheXpert:release", 4.75)]
 COS_GAUDI_STUB = r'''#!/usr/bin/env bash
 out=; prev=; for a in "$@"; do [[ $prev == --output_dir ]] && out=${a#/workspace/}; prev=$a; done
 mkdir -p "$PWD/$out"
 printf "%s\n" "$@" > "$PWD/$out/argv.txt"; printf "%s" "${EXTRA_BINDS:-}" > "$PWD/$out/extra_binds.txt"
-if [[ -n ${FAKE_TRAINER:-} ]]; then  # what the trainer leaves behind in its run dir and prints, then its exit; the line is bf16 if --bf16 is among its args
-  kind=fp32; base=80; for a in "$@"; do [[ $a == --bf16 ]] && { kind=bf16; base=60; }; done
+if [[ -n ${FAKE_TRAINER:-} ]]; then  # what the trainer leaves behind in its run dir and prints, then its exit
+  base=80
   mkdir -p "$PWD/$out/ckpt" "$PWD/$out/export"; touch "$PWD/$out/ckpt/epoch_0001.pth" "$PWD/$out/export/teacher_backbone_epoch_0001.pth"; echo '{}' > "$PWD/$out/args.json"
   for a in "$@"; do  # --export_pass_end_every: the trainer's pass-end exports of the cycle, after each of its passes but the last (4 bytes each here)
     if [[ $a == --export_pass_end_every ]]; then mkdir -p "$PWD/$out/export/pass_end"; for d in MIMIC ReXGradient CheXpert TAIXRay PadChest ChestXray14; do printf abcd > "$PWD/$out/export/pass_end/teacher_backbone_epoch_0001_after_$d.pth"; echo "pass-end export after step 1: /workspace/$out/export/pass_end/teacher_backbone_epoch_0001_after_$d.pth (2.5 s to write)"; done; fi
   done
-  cp "$FAKE_CSV_DIR/$kind.csv" "$PWD/$out/ssl_losses.csv"
+  cp "$FAKE_CSV" "$PWD/$out/ssl_losses.csv"
   for step in 1 5 389; do for r in 0 1 2 3 4 5 6 7; do echo "peak_memory rank=$r step=$step GiB=${FAKE_PEAK:-$((base + step / 100 + r)).50}"; done; done  # FAKE_PEAK=unavailable: the trainer found no counter
   sleep 1
   [[ -z ${FAKE_ERR:-} ]] || echo "$FAKE_ERR" >&2
-  if [[ $kind == fp32 ]]; then exit "${FAKE_RC_FP32:-0}"; else exit "${FAKE_RC_BF16:-0}"; fi
+  exit "${FAKE_RC:-0}"
 fi
 '''
 COS_HLSMI_STUB = r'''#!/usr/bin/env bash
@@ -874,7 +872,7 @@ def cos_list(path, name, rows):
 def smoke_repo(tmp, trainer=True, rows=SMOKE_ROWS + 50):
     """A fake repo for the cos100 smoke: the real launcher, ssl_common.sh, Ark's common.sh and gaudi_hlsmi.sh, a recording gaudi.sh (FAKE_TRAINER: it also plays the trainer), a card check that records it ran, the stock weights, the
     trainer's text (trainer=False: without --teacher_whole_image_size), base/datasets_config_taix_original.yaml as the real file with its two absolute lists moved under tmp, and the seven lists it names: `rows` images each,
-    VinDrCXR's 15,000. The two CSVs the stub trainer writes, an hl-smi stub on PATH and the datasets-new directory."""
+    VinDrCXR's 15,000. The CSV the stub trainer writes, an hl-smi stub on PATH and the datasets-new directory."""
     root = os.path.join(tmp, "repo")
     for name in ("chain/newdata224_cos100.sh", "chain/ssl_common.sh", "experiment_scripts/common.sh", "gaudi_hlsmi.sh"):
         put(os.path.join(root, name), open(os.path.join(REPO, name)).read(), stat.S_IMODE(os.stat(os.path.join(REPO, name)).st_mode))
@@ -895,8 +893,7 @@ def smoke_repo(tmp, trainer=True, rows=SMOKE_ROWS + 50):
         else:  # the other five: relative to base/
             cos_list(os.path.join(root, "base", listing), name, count)
     put(os.path.join(root, "base", NATIVE_YAML), config)
-    for kind, rows_of in COS_ROWS.items():
-        put(os.path.join(tmp, "csv", kind + ".csv"), COS_COLUMNS + "\n" + "".join("%d,0,%s,%s,0.5,3.0,0.0,%s,0.0,0.04,1.0,0.04,0.0,%s,%s,%s,%s\n" % row for row in rows_of))
+    put(os.path.join(tmp, "run.csv"), COS_COLUMNS + "\n" + "".join("%d,0,%s,%s,0.5,3.0,0.0,%s,0.0,0.04,1.0,0.04,0.0,%s,%s,%s,%s\n" % row for row in COS_ROWS))
     put(os.path.join(tmp, "bin", "hl-smi"), COS_HLSMI_STUB, 0o755)
     os.makedirs(os.path.join(tmp, "datasets-new"), exist_ok=True)
     return root
@@ -915,7 +912,7 @@ def smoke_script(tmp, root, datasets="datasets-new"):
 def smoke_env(tmp, cards=8, **extra):
     env = {k: v for k, v in ENV.items() if not k.startswith(("FAKE_", "HLSMI_"))}
     return dict(env, SLURM_JOB_GPUS=",".join(str(card) for card in range(cards)), SLURM_JOB_ID="4242", USER="tester", PATH=os.path.join(tmp, "bin") + os.pathsep + env["PATH"],
-                HLSMI_COUNT=os.path.join(tmp, "hlsmi_count"), FAKE_CSV_DIR=os.path.join(tmp, "csv"), **extra)
+                HLSMI_COUNT=os.path.join(tmp, "hlsmi_count"), FAKE_CSV=os.path.join(tmp, "run.csv"), **extra)
 
 
 def smoke_run(script, root, env, cwd=None):
@@ -943,7 +940,7 @@ def test_newdata224_cos100_smoke_header():
     text = open(SMOKE_COS).read()
     lines = text.splitlines()
     sbatch = [line[len("#SBATCH "):] for line in lines if line.startswith("#SBATCH ")]
-    assert sbatch == ["--job-name=d1-8-newdata224-cos100-smoke", "-A grp_jliang12", "-p gaudi", "-q public", "-t 01:00:00", "-N 1", "--gres=gpu:hl225:8", "-c 144", "--mem=480G"], lines
+    assert sbatch == ["--job-name=d1-8-newdata224-cos100-smoke", "-A grp_jliang12", "-p gaudi", "-q public", "-t 00:30:00", "-N 1", "--gres=gpu:hl225:8", "-c 144", "--mem=480G"], lines
     run = [line[len("#SBATCH "):] for line in open(os.path.join(REPO, "run_d1_8_newdata224_cos100_gaudi.sh")).read().splitlines() if line.startswith("#SBATCH ")]
     assert [s for s in sbatch if not s.startswith(("--job-name", "-t "))] == [s for s in run if not s.startswith(("--job-name", "-t "))]  # the run's account, partition, QOS, node, cards, CPUs and memory
     code = [line for line in lines if line and not line.startswith("#")]
@@ -953,8 +950,9 @@ def test_newdata224_cos100_smoke_header():
     assert not any("main_lr" in line or "stop_after.txt" in line for line in code)  # no settings file
     for line in ("STEPS_PER_DATASET=60  #", "BATCH=64  #"):  # the two settings, one line each, once, near the top
         assert text.count("\n" + line) == 1 and text.index("\n" + line) < text.index("\nFLAGS=("), line
-    for needle in ("sbatch run_d1_8_newdata224_cos100_smoke_gaudi.sh", "report only", "grep -E '^(SMOKE|peak_memory)'", "29 steps", "30,720", "REPORT ONLY", "not measured", "dino_whole", "\nsmoke_line fp32 --export_pass_end_every 1\n", "\nsmoke_line bf16 --bf16\n"):
+    for needle in ("sbatch run_d1_8_newdata224_cos100_smoke_gaudi.sh", "grep -E '^(SMOKE|peak_memory)'", "29 steps", "30,720", "not measured", "dino_whole", "The 30 min limit", "--export_pass_end_every 1 --gram_teacher_size"):
         assert needle in text, needle
+    assert "bf16" not in text.lower() and "smoke_line" not in text  # one line, fp32 as the run: no report-only bf16 line any more (Jarod, 2026-11-16)
     assert "newdata224_cos100_smoke" not in [line.split("#")[0].strip() for line in open(os.path.join(REPO, "chain", "phases.txt"))]  # not a chain phase
 
 
@@ -968,28 +966,24 @@ def test_newdata224_cos100_smoke_lines():
         assert run_argv == cos_expected(), run_argv
         result = smoke_run(smoke_script(tmp, root), root, dict(env, FAKE_TRAINER="1"), cwd=tempfile.mkdtemp(dir=tmp))  # from elsewhere, as sbatch does
         assert result.returncode == 0 and result.stderr == "", (result.stdout, result.stderr)
-        fp32, bf16 = (recorded(root, SMOKE_DIR + "/" + kind) for kind in ("fp32", "bf16"))
-        assert fp32 is not None and bf16 is not None
-        assert changed(fp32, run_argv) == {"--output_dir", "--datasets_config", "--stop_after_epochs", "--print_freq", "--log_peak_memory"}, changed(fp32, run_argv)  # the run's line, with exactly these
-        assert changed(bf16, fp32) == {"--output_dir", "--bf16", "--export_pass_end_every"}, changed(bf16, fp32)  # the pass-end exports: on the fp32 line only (the run's value there)
-        assert flags(fp32)["--export_pass_end_every"] == flags(run_argv)["--export_pass_end_every"] == [["1"]] and "--export_pass_end_every" not in flags(bf16)
-        assert flags(fp32)["--output_dir"] == [["/workspace/%s/fp32" % SMOKE_DIR]] and flags(bf16)["--output_dir"] == [["/workspace/%s/bf16" % SMOKE_DIR]]
+        smoke = recorded(root, SMOKE_DIR)  # the one line, the smoke dir its run dir
+        assert smoke is not None and len(glob.glob(os.path.join(root, "**", "argv.txt"), recursive=True)) == 2  # the run's and the smoke's: one launch each
+        assert changed(smoke, run_argv) == {"--output_dir", "--datasets_config", "--stop_after_epochs", "--print_freq", "--log_peak_memory"}, changed(smoke, run_argv)  # the run's line, with exactly these
+        assert flags(smoke)["--export_pass_end_every"] == flags(run_argv)["--export_pass_end_every"] == [["1"]] and "--bf16" not in flags(smoke)  # the pass-end exports as the run's; fp32 as the run
         config = "/workspace/%s/datasets_config_smoke.yaml" % SMOKE_DIR
-        assert flags(fp32)["--datasets_config"] == flags(bf16)["--datasets_config"] == [[config]] and flags(run_argv)["--datasets_config"] == [[NATIVE_YAML]]
-        assert flags(fp32)["--stop_after_epochs"] == [["1"]] and flags(fp32)["--print_freq"] == [["5"]] and flags(fp32)["--log_peak_memory"] == [[]] and "--bf16" not in flags(fp32) and flags(bf16)["--bf16"] == [[]]
-        assert fp32[:fp32.index("--output_dir")] == run_argv[:run_argv.index("--output_dir")]  # the cards, the trainer, the seven datasets, the weights, the batch of 64, the workers and the seed: the run's
-        assert flags(fp32)["--batch_size_per_gpu"] == [["64"]] and flags(fp32)["--data_set"] == [[name] for name in SEVEN] and flags(fp32)["--gram_teacher_size"] == [["224"]]
-        run_parsed, parsed, parsed_bf16 = parse(run_argv), parse(fp32), parse(bf16)
-        assert ssl_pretrain.check_args(parsed) == ssl_pretrain.check_args(parsed_bf16) == 1 and ssl_pretrain.check_args(run_parsed) == 100  # one cycle each, of the run's 100-cycle schedule
-        assert parsed.freeze_backbone_epochs == parsed_bf16.freeze_backbone_epochs == 0 and parsed.print_freq == 5 and parsed.log_peak_memory and not parsed.bf16 and parsed_bf16.bf16
+        assert flags(smoke)["--output_dir"] == [["/workspace/" + SMOKE_DIR]] and flags(smoke)["--datasets_config"] == [[config]] and flags(run_argv)["--datasets_config"] == [[NATIVE_YAML]]
+        assert flags(smoke)["--stop_after_epochs"] == [["1"]] and flags(smoke)["--print_freq"] == [["5"]] and flags(smoke)["--log_peak_memory"] == [[]]
+        assert smoke[:smoke.index("--output_dir")] == run_argv[:run_argv.index("--output_dir")]  # the cards, the trainer, the seven datasets, the weights, the batch of 64, the workers and the seed: the run's
+        assert flags(smoke)["--batch_size_per_gpu"] == [["64"]] and flags(smoke)["--data_set"] == [[name] for name in SEVEN] and flags(smoke)["--gram_teacher_size"] == [["224"]]
+        run_parsed, parsed = parse(run_argv), parse(smoke)
+        assert ssl_pretrain.check_args(parsed) == 1 and ssl_pretrain.check_args(run_parsed) == 100  # one cycle of the run's 100-cycle schedule
+        assert parsed.freeze_backbone_epochs == 0 and parsed.export_pass_end_every == 1 and parsed.print_freq == 5 and parsed.log_peak_memory and not parsed.bf16
         assert {k for k in vars(run_parsed) if vars(run_parsed)[k] != vars(parsed)[k]} == {"output_dir", "datasets_config", "stop_after_epochs", "print_freq", "log_peak_memory"}  # every other trainer setting, defaults included
-        assert {k for k in vars(parsed) if vars(parsed)[k] != vars(parsed_bf16)[k]} == {"output_dir", "bf16", "export_pass_end_every"} and (parsed.export_pass_end_every, parsed_bf16.export_pass_end_every) == (1, 0)
         # a throwaway dir that cannot be the run's, nor resume into it
         assert SMOKE_DIR != RUN_COS and not SMOKE_DIR.startswith(RUN_COS) and not RUN_COS.startswith(SMOKE_DIR)
-        for kind in ("fp32", "bf16"):
-            assert open(os.path.join(root, SMOKE_DIR, kind, "extra_binds.txt")).read() == "/scratch/tester/datasets-new:/scratch/tester/datasets-new:ro"
+        assert open(os.path.join(root, SMOKE_DIR, "extra_binds.txt")).read() == "/scratch/tester/datasets-new:/scratch/tester/datasets-new:ro"
         assert os.path.exists(os.path.join(root, "cards_checked"))
-        assert "SMOKE plan: 8 cards x per-card batch 64 (global batch 512), one cycle a line over lists cut to 30720 rows (60 steps a dataset; a shorter list is kept whole), smoke dir " + SMOKE_DIR in result.stdout
+        assert "SMOKE plan: 8 cards x per-card batch 64 (global batch 512), one cycle over lists cut to 30720 rows (60 steps a dataset; a shorter list is kept whole), smoke dir " + SMOKE_DIR in result.stdout
 
 
 def test_newdata224_cos100_smoke_lists():
@@ -1011,22 +1005,22 @@ def test_newdata224_cos100_smoke_lists():
             assert open(cut).readline() == open(original).readline() and sum(1 for _ in open(cut)) == len(kept) + (name in COS_HEADERS), name  # the header row kept where there is one, none added where not
             steps = len(build_data_loader(range(len(kept)), 64, 0, 0, 8, 100, False, None)[0])  # the pass the trainer cuts from the list: 8 ranks, batch 64, both drop_last
             assert steps == (29 if short else 60), (name, steps)
-        assert sorted(os.listdir(os.path.join(root, SMOKE_DIR))) == ["bf16", "datasets_config_smoke.yaml", "fp32", "lists"] and len(os.listdir(os.path.join(root, SMOKE_DIR, "lists"))) == 7
+        assert sorted(os.listdir(os.path.join(root, SMOKE_DIR))) == ["args.json", "argv.txt", "datasets_config_smoke.yaml", "extra_binds.txt", "hlsmi.txt", "lists", "ssl_losses.csv", "train.log"]  # the cut lists beside the run's files
+        assert len(os.listdir(os.path.join(root, SMOKE_DIR, "lists"))) == 7
 
 
-def cos_summary(kind):
-    """The summary lines the smoke prints for a line, from the stub's rows: the speed and projection over the rows after step 0, then each dataset in the CSV's order."""
-    rows = COS_ROWS[kind]
-    after = rows[1:]
-    lines = ["SMOKE %s speed: %.3f s/step, data wait %.3f s/step (the mean of the %d rows after step 0, which holds the compile; each row is the mean over the steps since the row before)"
-             % (kind, sum(r[4] for r in after) / len(after), sum(r[5] for r in after) / len(after), len(after)),
-             "SMOKE %s projection: %.1f h = %.3f s/step x 238000 steps / 3600: arithmetic on the mean of this smoke, not a measurement of the run"
-             % (kind, sum(r[4] for r in after) / len(after) * 238000 / 3600, sum(r[4] for r in after) / len(after))]
-    for dataset in dict.fromkeys(r[6] for r in rows):
-        mine, later = [r for r in rows if r[6] == dataset], [r for r in after if r[6] == dataset]
+def cos_summary():
+    """The summary lines the smoke prints from the stub's rows: the speed and projection over the rows after step 0, then each dataset in the CSV's order."""
+    after = COS_ROWS[1:]
+    lines = ["SMOKE speed: %.3f s/step, data wait %.3f s/step (the mean of the %d rows after step 0, which holds the compile; each row is the mean over the steps since the row before)"
+             % (sum(r[4] for r in after) / len(after), sum(r[5] for r in after) / len(after), len(after)),
+             "SMOKE projection: %.1f h = %.3f s/step x 238000 steps / 3600: arithmetic on the mean of this smoke, not a measurement of the run"
+             % (sum(r[4] for r in after) / len(after) * 238000 / 3600, sum(r[4] for r in after) / len(after))]
+    for dataset in dict.fromkeys(r[6] for r in COS_ROWS):
+        mine, later = [r for r in COS_ROWS if r[6] == dataset], [r for r in after if r[6] == dataset]
         last = mine[-1]
-        lines.append("SMOKE %s dataset %s: %d rows, mean %.3f s/step, data wait %.3f s/step; last row: dino_global %.4f, dino_local %.4f, dino_whole %.4f, total %.4f"
-                     % (kind, dataset, len(later), sum(r[4] for r in later) / len(later), sum(r[5] for r in later) / len(later), last[1], last[2], last[7], last[3]))
+        lines.append("SMOKE dataset %s: %d rows, mean %.3f s/step, data wait %.3f s/step; last row: dino_global %.4f, dino_local %.4f, dino_whole %.4f, total %.4f"
+                     % (dataset, len(later), sum(r[4] for r in later) / len(later), sum(r[5] for r in later) / len(later), last[1], last[2], last[7], last[3]))
     return lines
 
 
@@ -1037,35 +1031,31 @@ def test_newdata224_cos100_smoke_summary():
         result = smoke_run(script, root, smoke_env(tmp, FAKE_TRAINER="1"))
         lines = result.stdout.splitlines()
         assert result.returncode == 0 and result.stderr == "", (result.stdout, result.stderr)
-        for kind, base in (("fp32", 83.5), ("bf16", 63.5)):
-            run_dir = os.path.join(root, SMOKE_DIR, kind)
-            for rank in range(8):  # the allocator peak per rank: the largest of its printed values (base + step / 100 + rank, at steps 1 / 5 / 389)
-                assert "SMOKE %s allocator peak, rank %d: %.2f GiB" % (kind, rank, base + rank) in lines, (kind, rank, lines)
-            peaks = {int(l.split("card index ")[1].split(":")[0]): int(l.split("peak ")[1].split(" MiB")[0]) for l in lines if l.startswith("SMOKE %s hl-smi card index" % kind)}
-            assert sorted(peaks) == list(range(8)), peaks  # the allocated cards
-            assert all(peaks[i] >= 768 + i * 10 and (peaks[i] - 768 - i * 10) % 1000 == 0 for i in peaks), peaks  # the largest of several samples (the stub's reading grows by 1000 MiB a call)
-            for expected in cos_summary(kind):
-                assert expected in lines, (expected, lines)
-            assert sorted(os.listdir(run_dir)) == ["args.json", "argv.txt", "extra_binds.txt", "hlsmi.txt", "ssl_losses.csv", "train.log"], os.listdir(run_dir)  # ckpt/ and export/ are gone, the evidence stays
-            assert "peak_memory rank=7 step=389 GiB=%.2f" % (base + 7) in open(os.path.join(run_dir, "train.log")).read()
-        assert [l for l in lines if "pass-end export time" in l] == ["SMOKE fp32 pass-end export time: 6 files, mean 2.5 s to write each, 0.2 min per exporting cycle (6 files): 0.42 h over 100 cycles at "
-                                                                   "--export_pass_end_every 1, half that at 2 (arithmetic on this smoke's mean)"], lines  # the trainer's per-file seconds (2.5 each here), fp32 only
-        assert sorted(l for l in lines if l.startswith("SMOKE") and "pass-end export " in l and "time" not in l) == sorted("SMOKE fp32 pass-end export teacher_backbone_epoch_0001_after_%s.pth: 4 bytes" % d for d in COS_PASS_END), lines  # fp32 only, reported before the cleanup (glob order is the locale's)
-        assert "SMOKE fp32 verdict: FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines
-        assert "SMOKE bf16 verdict (report only): FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines
-        assert max(i for i, l in enumerate(lines) if l.startswith("SMOKE fp32")) < min(i for i, l in enumerate(lines) if l.startswith("SMOKE bf16 "))  # fp32 first, its whole summary before bf16's
-        assert not any(l.startswith("SMOKE") and " fp32 " not in l and " bf16 " not in l for l in lines if not l.startswith("SMOKE plan"))  # every other SMOKE line names its line
-        # the trainer found no allocator counter (its lines say GiB=unavailable): no peak is made up from them, the summary says so per rank in both lines, and the hl-smi peaks, the speed and the verdict are all still there
-        shutil.rmtree(os.path.join(root, SMOKE_DIR))
+        run_dir = os.path.join(root, SMOKE_DIR)
+        for rank in range(8):  # the allocator peak per rank: the largest of its printed values (80 + step / 100 + rank, at steps 1 / 5 / 389)
+            assert "SMOKE allocator peak, rank %d: %.2f GiB" % (rank, 83.5 + rank) in lines, (rank, lines)
+        peaks = {int(l.split("card index ")[1].split(":")[0]): int(l.split("peak ")[1].split(" MiB")[0]) for l in lines if l.startswith("SMOKE hl-smi card index")}
+        assert sorted(peaks) == list(range(8)), peaks  # the allocated cards
+        assert all(peaks[i] >= 768 + i * 10 and (peaks[i] - 768 - i * 10) % 1000 == 0 for i in peaks), peaks  # the largest of several samples (the stub's reading grows by 1000 MiB a call)
+        for expected in cos_summary():
+            assert expected in lines, (expected, lines)
+        assert [l for l in lines if "pass-end export time" in l] == ["SMOKE pass-end export time: 6 files, mean 2.5 s to write each, 0.2 min per exporting cycle (6 files): 0.42 h over 100 cycles at "
+                                                                   "--export_pass_end_every 1, half that at 2 (arithmetic on this smoke's mean)"], lines  # the trainer's per-file seconds (2.5 each here)
+        assert sorted(l for l in lines if l.startswith("SMOKE") and "pass-end export " in l and "time" not in l) == sorted("SMOKE pass-end export teacher_backbone_epoch_0001_after_%s.pth: 4 bytes" % d for d in COS_PASS_END), lines  # reported before the cleanup (glob order is the locale's)
+        assert "SMOKE verdict: FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines and lines[-1].startswith("SMOKE verdict: ")
+        assert not any("bf16" in l or "fp32" in l for l in lines if l.startswith("SMOKE")), lines
+        assert sorted(os.listdir(run_dir)) == ["args.json", "argv.txt", "datasets_config_smoke.yaml", "extra_binds.txt", "hlsmi.txt", "lists", "ssl_losses.csv", "train.log"], os.listdir(run_dir)  # ckpt/ and export/ are gone, the evidence stays
+        assert "peak_memory rank=7 step=389 GiB=90.50" in open(os.path.join(run_dir, "train.log")).read()
+        # the trainer found no allocator counter (its lines say GiB=unavailable): no peak is made up from them, the summary says so per rank, and the hl-smi peaks, the speed and the verdict are all still there
+        shutil.rmtree(run_dir)
         result = smoke_run(script, root, smoke_env(tmp, FAKE_TRAINER="1", FAKE_PEAK="unavailable"))
         lines = result.stdout.splitlines()
         assert result.returncode == 0, result.stderr
-        for kind in ("fp32", "bf16"):
-            assert [l for l in lines if l.startswith("SMOKE %s allocator peak" % kind)] == [
-                "SMOKE %s allocator peak, rank %d: unavailable (no allocator counter on this stack: the hl-smi peaks below are the measure)" % (kind, rank) for rank in range(8)], lines
-            assert len([l for l in lines if l.startswith("SMOKE %s hl-smi card index" % kind)]) == 8 and cos_summary(kind)[0] in lines
-            assert "peak_memory rank=7 step=389 GiB=unavailable" in open(os.path.join(root, SMOKE_DIR, kind, "train.log")).read()
-        assert "SMOKE fp32 verdict: FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines and not any("0.00 GiB" in l for l in lines)
+        assert [l for l in lines if l.startswith("SMOKE allocator peak")] == [
+            "SMOKE allocator peak, rank %d: unavailable (no allocator counter on this stack: the hl-smi peaks below are the measure)" % rank for rank in range(8)], lines
+        assert len([l for l in lines if l.startswith("SMOKE hl-smi card index")]) == 8 and cos_summary()[0] in lines
+        assert "peak_memory rank=7 step=389 GiB=unavailable" in open(os.path.join(run_dir, "train.log")).read()
+        assert "SMOKE verdict: FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines and not any("0.00 GiB" in l for l in lines)
 
 
 def test_newdata224_cos100_smoke_exit_codes():
@@ -1080,23 +1070,12 @@ def test_newdata224_cos100_smoke_exit_codes():
             result = smoke_run(script, root, smoke_env(tmp, FAKE_TRAINER="1", **extra))
             return result, result.stdout.splitlines()
 
-        # the fp32 line decides the exit code, whatever it is; the bf16 line runs anyway and reports
-        result, lines = attempt(FAKE_RC_FP32="1", FAKE_ERR=oom)
-        assert result.returncode == 1 and "SMOKE fp32 verdict: OUT OF MEMORY: 8 cards x per-card batch 64 (exit 1); the log above has the error" in lines and not any("FITS" in l and "fp32" in l for l in lines)
-        assert recorded(root, SMOKE_DIR + "/bf16") is not None and "SMOKE bf16 verdict (report only): FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines  # still ran, and passed: no effect on the exit code
-        result, lines = attempt(FAKE_RC_FP32="3", FAKE_ERR=boom)
-        assert result.returncode == 3 and "SMOKE fp32 verdict: FAILED (exit 3) and not obviously memory: read the log above" in lines and recorded(root, SMOKE_DIR + "/bf16") is not None
-        result, lines = attempt(FAKE_RC_FP32="1", FAKE_RC_BF16="1", FAKE_ERR=oom)  # both failed: the exit code is fp32's, not bf16's
-        assert result.returncode == 1 and any(l.startswith("SMOKE bf16 verdict (report only): OUT OF MEMORY") for l in lines)
-        result, lines = attempt(FAKE_RC_FP32="3", FAKE_RC_BF16="1", FAKE_ERR=boom)
-        assert result.returncode == 3 and any(l.startswith("SMOKE bf16 verdict (report only): FAILED (exit 1)") for l in lines)
-        # a failing bf16 line alone changes nothing: exit 0, its verdict marked report only
-        result, lines = attempt(FAKE_RC_BF16="1", FAKE_ERR=oom)
-        assert result.returncode == 0 and "SMOKE bf16 verdict (report only): OUT OF MEMORY: 8 cards x per-card batch 64 (exit 1); the log above has the error" in lines
-        assert "SMOKE fp32 verdict: FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines
-        result, lines = attempt(FAKE_RC_BF16="2", FAKE_ERR=boom)
-        assert result.returncode == 0 and "SMOKE bf16 verdict (report only): FAILED (exit 2) and not obviously memory: read the log above" in lines
-        assert "SMOKE fp32 verdict: FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines
+        # the trainer's exit code is the script's, and the verdict says which kind of failure it was; the cleanup runs either way
+        result, lines = attempt(FAKE_RC="1", FAKE_ERR=oom)
+        assert result.returncode == 1 and "SMOKE verdict: OUT OF MEMORY: 8 cards x per-card batch 64 (exit 1); the log above has the error" in lines and not any("FITS" in l for l in lines)
+        result, lines = attempt(FAKE_RC="3", FAKE_ERR=boom)
+        assert result.returncode == 3 and "SMOKE verdict: FAILED (exit 3) and not obviously memory: read the log above" in lines
+        assert not os.path.exists(os.path.join(root, SMOKE_DIR, "ckpt")) and not os.path.exists(os.path.join(root, SMOKE_DIR, "export"))
 
 
 def test_newdata224_cos100_smoke_refusals():
