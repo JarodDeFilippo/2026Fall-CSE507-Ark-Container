@@ -3195,6 +3195,328 @@ print("OK (aa) flips and wiring: the crop + flip pipelines hold RandomHorizontal
       "no flip, ArkIntensity in place of the color jitter in all three distortion pipelines, an Identity in place of the blur and a RandomRotationReflect for the rotation; run() hands DataAugmentationCXR the scales, intensity, blur sigma (none under --no_blur), "
       "flips and rotation limit of the default run, the planned run and a --blur_sigma 0.5 2 run")
 
+# (ab) whole-image teacher target: --teacher_whole_image_size S (needs --pre_resize N) and --whole_image_dino_weight W ---------------------------------------------------------------------------------
+# Ark+'s whole-image teacher as one more DINO target: the loader emits each sample's whole squash resized to S x S (no RNG draw), the EMA teacher scores it in one extra no-grad forward with its own
+# Sinkhorn-Knopp call, and every student crop is scored against its own sample's target, the DINO terms at 2 / T, 16 / T, 10 W / T with T = 18 + 10 W. The pairing checks (c), (e) use an identity
+# network (ab_stub.py below): flat gray images, one level per sample, the CLS token a one-hot of the level and the DINO head the identity, so a crop scored against its own sample's whole image costs
+# about 0 nats and against another's about 10
+AB_KEYS = ("teacher_whole_image_size", "whole_image_dino_weight")
+AB_STUB_DIR = os.path.join(TMP, "ab_stub")
+os.makedirs(AB_STUB_DIR)
+with open(os.path.join(AB_STUB_DIR, "ab_stub.py"), "w") as f:
+    f.write('''"""The identity network of test_ssl_pretrain.py (ab)'s pairing checks, written by it: flat gray images, one level per sample (LEVELS, a factor of about 2 apart). The CLS token is the one-hot of
+the LEVELS entry nearest the image's mean gray level (log scale) times a trainable scale, the DINO head the identity (trainable), so a student crop's logits peak at its own sample's prototype and so
+does the teacher's whole-image target."""
+import copy
+
+import torch
+from torch import nn
+
+from ssl_dinov3.data import IMAGENET_MEAN, IMAGENET_STD, DataAugmentationCXR, SSLImageDataset, build_data_loader, make_collate_fn, set_epoch
+from ssl_dinov3.meta import SSLMetaArch
+
+LEVELS = (2, 4, 8, 16, 32, 64, 128, 250)
+
+
+def level_of(x):  # [N, 3, H, W] normalized crops -> each one's mean gray level (0..255)
+    return (x[:, 0].mean((1, 2)) * IMAGENET_STD[0] + IMAGENET_MEAN[0]) * 255
+
+
+def nearest(x, levels=None):  # -> per crop, the index of the level (default LEVELS) nearest its mean, log scale
+    levels = torch.tensor(LEVELS, dtype=torch.float32) if levels is None else levels
+    return (level_of(x).clamp(min=1).log()[:, None] - levels.log()[None]).abs().argmin(1)
+
+
+class Backbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(1.0))
+
+    def one(self, x):
+        cls = nn.functional.one_hot(nearest(x), len(LEVELS)).to(x.dtype) * self.scale
+        return dict(x_norm_clstoken=cls, x_storage_tokens=cls.new_zeros(len(x), 0, len(LEVELS)),
+                    x_norm_patchtokens=cls[:, None].expand(-1, (x.shape[-2] // 16) * (x.shape[-1] // 16), -1))
+
+    def forward(self, x, masks=None, is_training=True):  # the student's list forward and the teachers' tensor forward
+        return [self.one(t) for t in x] if isinstance(x, list) else self.one(x)
+
+
+class Head(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.last_layer = nn.Linear(len(LEVELS), len(LEVELS), bias=False)
+        with torch.no_grad():
+            self.last_layer.weight.copy_(torch.eye(len(LEVELS)))
+
+    def forward(self, x):
+        return self.last_layer(x)
+
+
+def meta(weight=1.0):  # the tied head (no ibot_head), no Gram teacher, the teacher a frozen copy (as build_models makes it); weight None: no whole-image target
+    student = nn.ModuleDict(dict(backbone=Backbone(), dino_head=Head()))
+    teacher = copy.deepcopy(student).requires_grad_(False)
+    return SSLMetaArch(student, teacher, None, n_local_crops=8, whole_image_dino_weight=weight).train()
+
+
+def transform():  # the planned crops scaled down (global 32 cut at 32, local 16, clean teacher views, scales 0.15-1 / 0.05-0.15, rotation, no flip, no blur), the whole image at 48 of a 64 squash.
+    # The color jitter, not --intensity_aug ark: ark's additive brightness shift (up to 51 gray levels) can move a dark flat crop to another sample's level, the jitter's factor (0.8 to 1.2) cannot
+    return DataAugmentationCXR(global_crops_size=32, local_crops_size=16, gram_teacher_crops_size=32, emit_gram_teacher_crops=False, teacher_no_distortions=True, global_crops_scale=(0.15, 1.0),
+                               local_crops_scale=(0.05, 0.15), horizontal_flips=False, blur_sigma=None, rotate_limit=10, whole_image_size=48)
+
+
+def batch(paths, rank, world_size, batch_size):  # (this rank's first batch's dataset indices, that batch) through the real dataset (squash to 64), DistributedSampler, loader and collate
+    loader, sampler = build_data_loader(SSLImageDataset(paths, transform(), 64, 64), batch_size, 0, rank, world_size, 100, False, make_collate_fn(global_crops_size=32, teacher_crops=True))
+    set_epoch(loader, sampler, 0, 100, rank)
+    return list(sampler)[:batch_size], next(iter(loader))
+
+
+def own_whole_image(batch, key, n_crops):  # per crop of batch[key] (n_crops x B, crop-major), the batch entry of the whole image nearest it: [n_crops, B]; own pairing is arange(B) in every row
+    whole_levels = level_of(batch["collated_whole_images"])
+    return nearest(batch[key], whole_levels).view(n_crops, -1)
+''')
+sys.path.append(AB_STUB_DIR)
+import ab_stub  # noqa: E402
+
+# (a) parse: none by default (= ARG_DEFAULTS, what a checkpoint without the keys reads as), both --resume-locked and not branch-free; S alone gives W = 1.0 and changes nothing else; S needs --pre_resize, a
+# multiple of 16 of at most N; W needs S and must be finite and > 0; each refusal exits 2 naming the flag
+assert tuple(getattr(P(), k) for k in AB_KEYS) == (None, None) == tuple(ssl_pretrain.ARG_DEFAULTS[k] for k in AB_KEYS)
+assert set(AB_KEYS) <= set(ssl_pretrain.RESUME_MATCH) and not set(AB_KEYS) & set(ssl_pretrain.BRANCH_FREE)
+AB_PLANNED = ["--pre_resize", "512", "--teacher_whole_image_size", "448"]  # the planned run's pair (its whole-image weight: the default 1.0)
+assert vars(P(*AB_PLANNED)) == dict(vars(P("--pre_resize", "512")), teacher_whole_image_size=448, whole_image_dino_weight=1.0)
+assert vars(P(*AB_PLANNED, "--whole_image_dino_weight", "2")) == dict(vars(P(*AB_PLANNED)), whole_image_dino_weight=2.0) and vars(P(*AB_PLANNED, "--whole_image_dino_weight", "1")) == vars(P(*AB_PLANNED))
+assert P("--pre_resize", "512", "--teacher_whole_image_size", "512").teacher_whole_image_size == 512 and P("--pre_resize", "64", "--teacher_whole_image_size", "16").teacher_whole_image_size == 16  # S = N, and one patch
+AB_NEEDS = ("--teacher_whole_image_size", "--pre_resize")
+for ab_extra, ab_flags in ((["--teacher_whole_image_size", "448"], AB_NEEDS), (["--decode_min_side", "1024", "--teacher_whole_image_size", "448"], AB_NEEDS),
+                           (["--pre_resize", "512", "--teacher_whole_image_size", "440"], AB_NEEDS), (["--pre_resize", "512", "--teacher_whole_image_size", "528"], AB_NEEDS),
+                           (["--pre_resize", "512", "--teacher_whole_image_size", "0"], AB_NEEDS), (["--pre_resize", "512", "--teacher_whole_image_size", "-16"], AB_NEEDS),
+                           (["--whole_image_dino_weight", "1"], ("--whole_image_dino_weight", "--teacher_whole_image_size")),
+                           (["--pre_resize", "512", "--whole_image_dino_weight", "1"], ("--whole_image_dino_weight", "--teacher_whole_image_size")),
+                           *(([*AB_PLANNED, "--whole_image_dino_weight", w], ("--whole_image_dino_weight",)) for w in ("0", "-1", "nan", "inf"))):
+    with contextlib.redirect_stderr(io.StringIO()) as ab_err:
+        assert raises(SystemExit, P, *ab_extra) == "2", ab_extra
+    ab_complaint = ab_err.getvalue().split("error: ", 1)[1]
+    assert all(flag in ab_complaint for flag in ab_flags), (ab_extra, ab_err.getvalue())
+print("OK (ab) parse: --teacher_whole_image_size and --whole_image_dino_weight are none by default (= ARG_DEFAULTS), --resume-locked and not branch-free; --pre_resize 512 --teacher_whole_image_size 448 gives W 1.0 and changes "
+      "nothing else (W 2 only W; W 1 given is the same run); S = N and S = 16 parse; S without --pre_resize (also with --decode_min_side), not a multiple of 16, above N, 0 or negative, W without S, and W of 0, -1, NaN or inf "
+      "each exit 2 naming the flag")
+
+# (b) the loader output: DataAugmentationCXR(whole_image_size=48) on a 64 x 64 squash adds "whole_image", bitwise PIL's bicubic resize of the whole squash to 48 x 48, normalized, and nothing else: every other crop
+# and the RNG states after are bitwise those without it (it draws nothing), at the defaults and at the planned settings; through SSLImageDataset (--pre_resize 64) it is the decoded image squashed to 64, then
+# resized to 48; the collate stacks it per sample (entry b = sample b's) and changes no other key; the transform pickles (spawn workers)
+ab_square = ng_image.resize((64, 64), Image.BICUBIC)  # a --pre_resize 64 squash, as SSLImageDataset hands it to the transform
+ab_normalize = DataAugmentationCXR().normalize
+
+
+def ab_crops(aug, img=ab_square):  # the crop dict from fixed seeds, and the torch / python / numpy RNG states after it
+    out = ng_seeded(aug, img)
+    return out, (torch.get_rng_state(), random.getstate(), np.random.get_state())
+
+
+for ab_kw in ({}, dict(teacher_no_distortions=True), aa_planned_kw, dict(aa_planned_kw, teacher_no_distortions=True, emit_gram_teacher_crops=False, gram_teacher_crops_size=224)):
+    ab_off, ab_on = ab_crops(DataAugmentationCXR(**ab_kw)), ab_crops(DataAugmentationCXR(**ab_kw, whole_image_size=48))
+    ab_whole = ab_on[0].pop("whole_image")
+    assert "whole_image" not in ab_off[0] and same_state(ab_on, ab_off), ab_kw  # every other crop, and the RNG states after: bitwise as without
+    assert tuple(ab_whole.shape) == (3, 48, 48) and torch.equal(ab_whole, ab_normalize(ab_square.resize((48, 48), Image.BICUBIC))), ab_kw
+assert same_state(ab_crops(DataAugmentationCXR(whole_image_size=None)), ab_crops(DataAugmentationCXR())) and DataAugmentationCXR(whole_image_size=48).decode_min_side == 1024
+assert same_state(ab_crops(pickle.loads(pickle.dumps(DataAugmentationCXR(whole_image_size=48)))), ab_crops(DataAugmentationCXR(whole_image_size=48)))
+ab_png = os.path.join(CFG["ChestXray14"]["data_dir"], "x0.png")  # an 8-bit PNG (no JPEG draft), 300 x 400
+ab_item = ng_seeded(ssl_data.SSLImageDataset([ab_png], DataAugmentationCXR(whole_image_size=48), 64, 64).__getitem__, 0)[0]
+with Image.open(ab_png) as ab_img:
+    assert torch.equal(ab_item["whole_image"], ab_normalize(ab_img.convert("L").resize((64, 64), Image.BICUBIC).resize((48, 48), Image.BICUBIC)))
+ab_samples = [(ng_seeded(DataAugmentationCXR(whole_image_size=48), Image.fromarray(np.random.RandomState(10 + i).randint(0, 255, (64, 64), dtype=np.uint8))), ()) for i in range(4)]  # four different squashes
+ab_with = ng_seeded(make_collate_fn(teacher_crops=True), ab_samples)
+ab_without = ng_seeded(make_collate_fn(teacher_crops=True), [({k: v for k, v in s.items() if k != "whole_image"}, t) for s, t in ab_samples])
+assert "collated_whole_images" not in ab_without and same_state({k: v for k, v in ab_with.items() if k != "collated_whole_images"}, ab_without)
+assert tuple(ab_with["collated_whole_images"].shape) == (4, 3, 48, 48) and ab_with["collated_whole_images"].dtype == torch.float32
+assert all(torch.equal(ab_with["collated_whole_images"][b], ab_samples[b][0]["whole_image"]) for b in range(4)) and len({ab_with["collated_whole_images"][b].sum().item() for b in range(4)}) == 4
+print("OK (ab) loader: DataAugmentationCXR(whole_image_size=48) on a 64 x 64 squash adds whole_image = normalize(PIL bicubic resize to 48 x 48 of the whole squash), bitwise, and leaves every other crop and the torch / python / numpy "
+      "RNG states bitwise as without it (default, clean teacher views, the planned settings, no Gram crops); whole_image_size=None is the default transform; it pickles; through SSLImageDataset with --pre_resize 64 it is the "
+      "decoded PNG squashed to 64 then resized to 48; the collate adds collated_whole_images [4, 3, 48, 48] float32, entry b = sample b's, and every other key is bitwise as without")
+
+# (c) the pairing at the collate step and at the loss, one rank: 8 flat images at the 8 levels, one batch of 8 through the real dataset, sampler and collate (the planned crops scaled down, ab_stub.transform). Every
+# crop j x B + b, the clean teacher crops, the student's global and its local ones, is nearest whole image b, its own sample's; with the identity network the whole-image loss is about 0 with the batch's own whole
+# images and about 10 nats a pair with them permuted (a derangement, a reversal, one swap: 2 of 8 samples), while every other loss term is bitwise the same: the crop targets do not see the whole images
+AB_DATA = os.path.join(TMP, "ab_data")
+os.makedirs(AB_DATA)
+ab_paths = []
+for ab_i, ab_level in enumerate(ab_stub.LEVELS):  # flat images of several shapes, one gray level each
+    ab_paths.append(os.path.join(AB_DATA, "l%d.png" % ab_i))
+    Image.new("L", (120 - 7 * ab_i, 90 + 5 * ab_i), ab_level).save(ab_paths[-1])
+ab_idx, ab_batch = ab_stub.batch(ab_paths, 0, 1, 8)
+assert sorted(ab_idx) == list(range(8)) and ab_idx != list(range(8)), ab_idx  # every image once, shuffled: batch order is not list order
+assert torch.allclose(ab_stub.level_of(ab_batch["collated_whole_images"]), torch.tensor([float(ab_stub.LEVELS[i]) for i in ab_idx]), atol=0.01)  # entry b is the whole image of sample b
+for ab_key, ab_n in (("collated_global_crops_teacher", 2), ("collated_global_crops", 2), ("collated_local_crops", 8)):
+    assert (ab_stub.own_whole_image(ab_batch, ab_key, ab_n) == torch.arange(8)).all(), ab_key  # every crop is nearest its own sample's whole image (the student's despite their color jitter)
+ab_meta = ab_stub.meta()
+ab_own = ab_meta.forward_backward(ab_batch, teacher_temp=0.04)[1]
+assert ab_own["dino_whole_loss"] < 0.01, ab_own
+ab_moved_losses = []
+for ab_perm, ab_low in ((torch.arange(8).roll(1), 9.9), (torch.arange(8).flip(0), 9.9), (torch.tensor([1, 0, 2, 3, 4, 5, 6, 7]), 2.4)):
+    ab_moved = ab_meta.forward_backward(dict(ab_batch, collated_whole_images=ab_batch["collated_whole_images"][ab_perm]), teacher_temp=0.04)[1]
+    assert ab_low < ab_moved["dino_whole_loss"] < ab_low + 0.2, (ab_perm, ab_moved)  # about 10 nats per mismatched sample: 10 x 8 / 8, 10 x 2 / 8
+    assert all(same_state(ab_moved[k], ab_own[k]) for k in ab_own if k != "dino_whole_loss"), ab_perm
+    ab_moved_losses.append(ab_moved["dino_whole_loss"].item())
+for ab_bad_meta, ab_bad_batch in ((ab_stub.meta(None), ab_batch), (ab_meta, {k: v for k, v in ab_batch.items() if k != "collated_whole_images"})):  # whole images without a weight, a weight without them
+    assert "whole_image_dino_weight" in raises(AssertionError, ab_bad_meta.forward_backward, ab_bad_batch, teacher_temp=0.04)
+print("OK (ab) pairing, one rank: of 8 flat images at 8 levels (batch order %s), each crop j x B + b (2 clean teacher, 2 student global, 8 student local per sample) is nearest whole image b; with the identity network "
+      "the whole-image loss is %.4f with the batch's own whole images, %.2f / %.2f with them rolled by one / reversed and %.2f with one pair swapped, every other term bitwise the same; a batch with whole images and no weight, "
+      "and a weight with no whole images, each raise" % (ab_idx, ab_own["dino_whole_loss"].item(), *ab_moved_losses))
+
+# (d) the real tiny ViT (tied head, no Gram) on (c)'s batch. The teacher's DINO head runs twice under no_grad (the crops' 2 x B + n rows, then the B whole images), the student's once; the target is [1, B, K], each
+# row an assignment (sums to 1), without a graph, bitwise SK(head(backbone CLS)) of the whole images. The crop terms are bitwise those of the same meta without the target; the total is 2 / T, 16 / T, 10 W / T of the three
+# DINO terms plus KoLeo and iBOT, T = 18 + 10 W (W 1 and 2). Gradients: every student parameter gets one, no teacher parameter does, and the whole-image term alone reaches the student's backbone and head
+y_calls.clear()
+ab_tiny = y_meta(False, whole_image_dino_weight=1.0)
+ab_n = len(ab_batch["mask_indices_list"])
+DINOHead.forward = y_head_forward
+try:
+    ab_loss, ab_dict = ab_tiny.forward_backward(ab_batch, teacher_temp=0.04)
+finally:
+    DINOHead.forward = y_real_head_forward
+assert y_calls == [(2 * 8 + ab_n, False), (8, False), (2 * 8 + 8 * 8 + ab_n, True)], y_calls  # the teacher's crops, the teacher's whole images (no grad), the student's crops
+assert all(p.grad is not None for p in ab_tiny.student.parameters()) and all(p.grad is None and not p.requires_grad for p in ab_tiny.teacher.parameters())
+ab_target = ab_tiny.get_teacher_whole_output(ab_batch["collated_whole_images"], teacher_temp=0.04)
+with torch.no_grad():
+    ab_manual = ab_tiny.dino_loss.sinkhorn_knopp_teacher(ab_tiny.teacher.dino_head(ab_tiny.teacher.backbone(ab_batch["collated_whole_images"], is_training=True)["x_norm_clstoken"]), teacher_temp=0.04)
+assert tuple(ab_target.shape) == (1, 8, TINY_HEADS["out_dim"]) and ab_target.grad_fn is None and not ab_target.requires_grad and torch.equal(ab_target[0], ab_manual)
+assert torch.allclose(ab_target.sum(-1), torch.ones(1, 8))
+ab_off_dict = y_meta(False).forward_backward({k: v for k, v in ab_batch.items() if k != "collated_whole_images"}, teacher_temp=0.04)[1]
+assert set(ab_dict) == set(ab_off_dict) | {"dino_whole_loss"} and all(same_state(ab_dict[k], ab_off_dict[k]) for k in ab_off_dict), (ab_dict, ab_off_dict)
+for ab_w in (1.0, 2.0):
+    ab_loss_w, ab_dict_w = (ab_loss, ab_dict) if ab_w == 1.0 else y_meta(False, whole_image_dino_weight=ab_w).forward_backward(ab_batch, teacher_temp=0.04)
+    ab_t = 18 + 10 * ab_w
+    ab_want = (16 * ab_dict_w["dino_local_crops_loss"].item() + 2 * ab_dict_w["dino_global_crops_loss"].item() + 10 * ab_w * ab_dict_w["dino_whole_loss"].item()) / ab_t \
+        + 0.1 * 2 * ab_dict_w["koleo_loss"].item() + ab_dict_w["ibot_loss"].item()
+    assert math.isclose(ab_loss_w.item(), ab_want, rel_tol=1e-6) and same_state(ab_dict_w["dino_whole_loss"], ab_dict["dino_whole_loss"]), (ab_w, ab_loss_w.item(), ab_want)
+ab_real_losses = SSLMetaArch.compute_losses
+ab_whole_only = lambda self, **kwargs: (lambda total, losses: (losses["dino_whole_loss"], losses))(*ab_real_losses(self, **kwargs))  # backprop the whole-image term alone
+ab_alone = y_meta(False, whole_image_dino_weight=1.0)
+with mock.patch.object(SSLMetaArch, "compute_losses", ab_whole_only):
+    ab_alone.forward_backward(ab_batch, teacher_temp=0.04)
+assert all(p.grad is None for p in ab_alone.teacher.parameters())
+assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in ab_alone.student.backbone.parameters()) and any(p.grad is not None and p.grad.abs().sum() > 0 for p in ab_alone.student.dino_head.parameters())
+print("OK (ab) meta, tiny ViT: the teacher's DINO head runs on the crops (2 x B + n = %d rows) and then the B = 8 whole images, both under no_grad, the student's once (%d rows); the target is [1, 8, %d], rows summing to 1, "
+      "no graph, bitwise SK(head(CLS)) of the whole images; the crop terms (DINO global / local, KoLeo, iBOT) are bitwise those without the target and the total is (2 g + 16 l + 10 W w) / (18 + 10 W) + 0.2 koleo + ibot at W 1 "
+      "and 2; every student parameter gets a grad and no teacher parameter does; the whole-image term alone reaches the student's backbone and DINO head, never the teacher" % (2 * 8 + ab_n, 2 * 8 + 8 * 8 + ab_n, TINY_HEADS["out_dim"]))
+
+# (e) end to end in the planned run's mode, tiny ((aa)(g)'s line at 32 / 16 / 32 px, --pre_resize 64, --teacher_whole_image_size 48): 1 cycle, then resumed to 2. It prints the whole-image line once and dino_w on every step
+# line; ssl_losses.csv gains dino_whole as its 17th column (every earlier column in its place), finite on every row, and the resume keeps cycle 1's rows; args.json and the checkpoint record S 48 and W 1.0. A --resume
+# without the pair, or with W 2, refuses naming only those keys; a --branch_from without the pair refuses naming them; a checkpoint whose args lack the keys reads as none: the line without the pair resumes, with it refuses
+AB_LINE = [*AA_MODE, *AA_PLANNED, "--global_crops_size", "32", "--local_crops_size", "16", "--gram_teacher_size", "32", "--pre_resize", "64", "--teacher_whole_image_size", "48"]
+AB_WITHOUT = AB_LINE[:-2]  # the same line with no whole-image target
+AB_WHOLE_LINE = ("whole-image teacher (--teacher_whole_image_size): the EMA teacher also scores each sample's whole 64x64 squash resized to 48x48 (its own Sinkhorn-Knopp call), a DINO target for every student crop at weight 1; "
+                 "DINO global / local / whole-image terms weighted 0.0714 / 0.5714 / 0.3571; ssl_losses.csv gains a last column, dino_whole")
+AB_E = os.path.join(TMP, "AB_E")
+ab_summary, ab_text = xgo(AB_E, *AB_LINE, "--stop_after_epochs", "1")
+ab_rows1 = read_csv(AB_E)
+assert (ab_summary["step"], ab_summary["epoch"], ab_summary["epoch_length"]) == (15, 1, 15) and ab_text.splitlines().count(AB_WHOLE_LINE) == 1, ab_text
+ab_step_lines = [line for line in ab_text.splitlines() if line.startswith("step ")]
+assert ab_step_lines and all(" dino_w " in line for line in ab_step_lines) and "dino_w" not in xgo(os.path.join(TMP, "AB_OFF"), *AB_WITHOUT, "--stop_after_epochs", "1")[1]
+ab_summary, ab_text = xgo(AB_E, *AB_LINE, "--resume", "--stop_after_epochs", "2")
+ab_rows = read_csv(AB_E)
+assert ab_summary["step"] == 30 and ab_rows[0] == CSV_HEADER.split(",") + ["dino_whole"] and all(len(r) == 17 for r in ab_rows) and ab_rows[:len(ab_rows1)] == ab_rows1  # cycle 1's rows kept as written
+assert all(math.isfinite(float(r[16])) and float(r[16]) > 0 and r[15].endswith(":release") for r in ab_rows[1:]) and {r[1] for r in ab_rows[1:]} == {"0", "1"}
+ab_info, ab_ck = json.load(open(os.path.join(AB_E, "args.json"))), load_ckpt(AB_E, "epoch_0002.pth")
+assert [ab_info[k] for k in AB_KEYS] == [48, 1.0] == [ab_ck["args"][k] for k in AB_KEYS] and ab_info["pre_resize"] == 64
+ab_before = open(os.path.join(AB_E, "args.json")).read()
+assert raises(ValueError, xgo, AB_E, *AB_WITHOUT, "--resume", "--stop_after_epochs", "3").endswith(
+    "differs from the checkpoint in teacher_whole_image_size: checkpoint 48, now None; whole_image_dino_weight: checkpoint 1.0, now None")
+assert raises(ValueError, xgo, AB_E, *AB_LINE, "--whole_image_dino_weight", "2", "--resume", "--stop_after_epochs", "3").endswith("differs from the checkpoint in whole_image_dino_weight: checkpoint 1.0, now 2.0")
+assert open(os.path.join(AB_E, "args.json")).read() == ab_before and "nothing to do: 2 epochs done" in xgo(AB_E, *AB_LINE, "--resume", "--stop_after_epochs", "2")[1]
+AB_BR = os.path.join(TMP, "AB_BR")  # a Gram branch of the cycle-2 checkpoint that differs from it in the pair only
+ab_message = raises(ValueError, xgo, AB_BR, "--branch_from", os.path.join(AB_E, "ckpt", "epoch_0002.pth"), *AB_WITHOUT[1:], "--gram_refresh_steps", "100", "--stop_after_epochs", "3")
+assert "cannot --branch_from" in ab_message and ab_message.endswith("teacher_whole_image_size: checkpoint 48, now None; whole_image_dino_weight: checkpoint 1.0, now None") and not os.path.exists(AB_BR), ab_message
+AB_UC = os.path.join(TMP, "AB_UC")  # AB_E's run as if written before the flags existed: its args lack the two keys
+shutil.copytree(AB_E, AB_UC)
+ab_ck_old = load_ckpt(AB_UC, "epoch_0002.pth")
+assert tuple(ab_ck_old["args"].pop(k) for k in AB_KEYS) == (48, 1.0)
+torch.save(ab_ck_old, os.path.join(AB_UC, "ckpt", "epoch_0002.pth"))
+assert raises(ValueError, xgo, AB_UC, *AB_LINE, "--resume", "--stop_after_epochs", "2").endswith("teacher_whole_image_size: checkpoint None, now 48; whole_image_dino_weight: checkpoint None, now 1.0")
+assert "nothing to do: 2 epochs done" in xgo(AB_UC, *AB_WITHOUT, "--resume", "--stop_after_epochs", "2")[1]
+print("OK (ab) end to end (the planned flags at 32 / 16 / 32 px, --pre_resize 64 --teacher_whole_image_size 48): 1 cycle then resumed to 2 (30 steps); the whole-image line printed once (weights 0.0714 / 0.5714 / 0.3571 = 2 / 28, "
+      "16 / 28, 10 / 28), dino_w on every step line (none without the flag); ssl_losses.csv's header is the 16 columns + dino_whole, %d rows of 17 fields with a finite dino_whole, cycle 1's rows kept by the resume; args.json and the "
+      "checkpoint hold 48 and 1.0; a --resume without the pair or with W 2 refuses naming only those keys (args.json untouched), the same line resumes, a --branch_from without the pair refuses naming them; args without the keys "
+      "read as none (the line without the pair resumes, with it refuses)" % (len(ab_rows) - 1))
+
+# (f) two real ranks (gloo on this CPU, loopback rendezvous). Pairing: each rank takes 4 of (c)'s 8 images through the real DistributedSampler, loader and collate; on each, every crop is nearest its own sample's whole image,
+# and with the identity network the whole-image loss is about 0 with its own whole images and about 10 nats a pair with the other rank's or its own rolled by one (the Sinkhorn-Knopp all_reduce spans both ranks: the 8
+# prototypes are balanced over the 8 images of the world, not the 4 of a rank). Run: (e)'s line on 2 ranks at batch 1 per rank, 1 cycle, under (y)'s driver: both ranks train the 15 steps, the teacher's DINO head runs
+# on the crops and then the 1 whole image under no_grad, the student's with 8 rows more than the teacher's crop call; student and teacher end bitwise alike on both ranks; the CSV has dino_whole on every row
+AB_DRIVER = os.path.join(TMP, "ab_driver.py")
+with open(AB_DRIVER, "w") as f:
+    f.write('''# one rank of a real two-process (gloo, CPU) pairing check of the whole-image teacher target, written by test_ssl_pretrain.py (ab); argv: base dir, spec json
+import json, os, sys
+import torch
+import torch.distributed as dist
+
+base, spec = sys.argv[1], json.load(open(sys.argv[2]))
+sys.path[:0] = [base, spec["stub_dir"]]
+os.chdir(base)
+import ab_stub
+
+rank = int(os.environ["RANK"])
+dist.init_process_group("gloo", rank=rank, world_size=2)
+idx, batch = ab_stub.batch(spec["paths"], rank, 2, 4)  # this rank's 4 images
+whole = batch["collated_whole_images"]
+gathered = [torch.empty_like(whole) for _ in range(2)]
+dist.all_gather(gathered, whole)
+meta, losses = ab_stub.meta(), {}
+for name, images in (("own", whole), ("other_rank", gathered[1 - rank]), ("rolled", whole.roll(1, 0))):  # the same three steps on both ranks, in this order (each runs the Sinkhorn-Knopp all_reduces)
+    losses[name] = {k: v.item() for k, v in meta.forward_backward(dict(batch, collated_whole_images=images), teacher_temp=0.04)[1].items()}
+found = dict(idx=idx, losses=losses, whole_levels=ab_stub.level_of(whole).tolist(),
+             nearest={key: ab_stub.own_whole_image(batch, key, n).tolist() for key, n in (("collated_global_crops_teacher", 2), ("collated_global_crops", 2), ("collated_local_crops", 8))})
+with open(os.path.join(spec["dump"], "ab_rank%d.json" % rank), "w") as f:
+    json.dump(found, f)
+dist.destroy_process_group()
+''')
+
+
+def ab_two_ranks(driver, spec):  # the driver on two real ranks with this spec; returns both ranks' output after checking they exit 0
+    path = os.path.join(spec["dump"], "spec.json")
+    with open(path, "w") as f:
+        json.dump(spec, f)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        env = dict(os.environ, WORLD_SIZE="2", MASTER_ADDR="127.0.0.1", MASTER_PORT=str(s.getsockname()[1]))
+    procs = [subprocess.Popen([sys.executable, driver, BASE, path], env=dict(env, RANK=str(r), LOCAL_RANK=str(r)), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) for r in range(2)]
+    try:
+        outputs = [p.communicate(timeout=180)[0] for p in procs]
+    finally:
+        for p in procs:
+            p.kill()  # a rank stuck in a collective must not outlive the test
+            p.wait()
+    assert [p.returncode for p in procs] == [0, 0], outputs
+    return outputs
+
+
+ab_dump = os.path.join(TMP, "ab_dump")
+os.makedirs(ab_dump)
+ab_two_ranks(AB_DRIVER, dict(stub_dir=AB_STUB_DIR, paths=ab_paths, dump=ab_dump))
+ab_found = [json.load(open(os.path.join(ab_dump, "ab_rank%d.json" % r))) for r in range(2)]
+assert sorted(ab_found[0]["idx"] + ab_found[1]["idx"]) == list(range(8))  # each rank its own 4 of the 8 images
+for ab_rank_found in ab_found:
+    assert all(abs(level - ab_stub.LEVELS[i]) < 0.01 for level, i in zip(ab_rank_found["whole_levels"], ab_rank_found["idx"])), ab_rank_found  # entry b: this rank's sample b's whole image
+    assert all(row == [0, 1, 2, 3] for rows in ab_rank_found["nearest"].values() for row in rows), ab_rank_found["nearest"]
+    ab_l = ab_rank_found["losses"]
+    assert ab_l["own"]["dino_whole_loss"] < 0.01 and all(9.9 < ab_l[k]["dino_whole_loss"] < 10.1 for k in ("other_rank", "rolled")), ab_l
+    assert all(ab_l[k][name] == ab_l["own"][name] for k in ("other_rank", "rolled") for name in ab_l["own"] if name != "dino_whole_loss"), ab_l
+AB_TWO = os.path.join(TMP, "AB_TWO")
+y_dump_ab = os.path.join(TMP, "y_dump_ab")
+os.makedirs(y_dump_ab)
+ab_two_ranks(Y_DRIVER, dict(args=vars(make_args(AB_TWO, *AB_LINE, "--batch_size_per_gpu", "1", "--stop_after_epochs", "1")), vit=TINY_VIT, heads=TINY_HEADS, cfg=X_CFG, dump=y_dump_ab))
+ab_y_found = [json.load(open(os.path.join(y_dump_ab, "found_rank%d.json" % r))) for r in range(2)]
+for ab_rank_found in ab_y_found:
+    assert [(name, phase) for name, phase, _ in ab_rank_found["steps"]] == Y_PATTERN and ab_rank_found["blends"] == Y_ENDS, ab_rank_found
+    assert all(len(calls) == 3 and [grad for _, grad in calls] == [False, False, True] and calls[1][0] == 1 and calls[2][0] - calls[0][0] == 8 for _, _, calls in ab_rank_found["steps"]), ab_rank_found["steps"]
+assert same_state(*[torch.load(os.path.join(y_dump_ab, "models_rank%d.pt" % r), weights_only=False) for r in range(2)])
+ab_two_rows = read_csv(AB_TWO)
+assert ab_two_rows[0][-1] == "dino_whole" and len(ab_two_rows) > 1 and all(len(r) == 17 and math.isfinite(float(r[16])) for r in ab_two_rows[1:])
+print("OK (ab) two real ranks: pairing: each rank's 4 of the 8 images (%s / %s) give whole image b = its own sample b and every crop nearest it; the whole-image loss is %.4f / %.4f with each rank's own whole images, %.2f / %.2f "
+      "with the other rank's and %.2f / %.2f with its own rolled by one, every other term the same (the Sinkhorn-Knopp spans both ranks); run: (e)'s line at batch 1 per rank trains 1 cycle on both, the teacher's DINO head on "
+      "the crops and then the 1 whole image under no_grad, the student's with 8 rows more; student and teacher end bitwise alike on both ranks; %d CSV rows with dino_whole"
+      % (ab_found[0]["idx"], ab_found[1]["idx"], *(f["losses"]["own"]["dino_whole_loss"] for f in ab_found), *(f["losses"]["other_rank"]["dino_whole_loss"] for f in ab_found),
+         *(f["losses"]["rolled"]["dino_whole_loss"] for f in ab_found), len(ab_two_rows) - 1))
+
 
 # (k) launch scripts ------------------------------------------------------------------------------------------------------------
 scripts = [os.path.join(REPO, "chain", f) for f in ("ssl_common.sh", "pilot_a.sh", "pilot_b.sh", "main.sh", "constlr.sh", "hires.sh")]

@@ -102,6 +102,15 @@ the same order; a run with any of the seven off its default prints one `augmenta
 --branch_from. The JPEG decode side now follows the minimum crop scales too (the 1024 of 224 / 96 / 448 is Stage A's, at its scales 0.25 and 0.04), so 224 / 96 / 448 at --global_crops_scale 0.15 1 decodes at 1344 unless --pre_resize or
 --decode_min_side sets it.
 
+--teacher_whole_image_size S (needs --pre_resize N; S a multiple of 16, at most N) adds Ark+'s whole-image teacher as one more DINO target: the loader also emits each sample's whole N x N squash
+resized, not cropped, to S x S (bicubic, normalized, nothing else, no RNG draw; DataAugmentationCXR whole_image_size, collated per sample as collated_whole_images), and SSLMetaArch runs the EMA
+teacher's backbone and DINO head on it in one extra no-grad forward with its own Sinkhorn-Knopp call, so the two crop targets (DINO and iBOT) are bitwise unchanged. Every student crop, global
+and local, is scored against its own sample's whole-image target: Meta's pair average extended to the 10 new pairs, the global, local and whole-image DINO terms weighted 2 / T, 16 / T and
+10 W / T with T = 18 + 10 W (--whole_image_dino_weight W, default 1.0 with the flag, > 0; refused without it). Gradients reach the student only (the teacher is frozen and runs under no_grad).
+One line says so at the start, the step line shows dino_w, and ssl_losses.csv gains a last column, dino_whole (the whole-image loss, a global mean over the ranks like the others) after dataset,
+so every column before it keeps its place; without the flag there is no such column. Both are locked on --resume (a checkpoint without the keys reads as none), recorded in args.json and
+matched by --branch_from. Off by default: bitwise as before.
+
 --cyclic_ark_teacher is the Ark+ / Foundation X teacher transplanted into this trainer (Jarod, 2026-10-26). A cycle replaces the mixed-batch epoch: the
 --data_set datasets in turn, largest first by image count (computed and logged; on the four CXR sets MIMIC, CheXpert, ChestXray14, VinDrCXR, whatever the
 --data_set order; a tie keeps that order), every batch from one dataset. Per dataset the cycle runs its release pass, one full pass over the dataset with
@@ -194,7 +203,8 @@ CLIP_GRAD = 3.0  # dinov3 optim.clip_grad, applied per student submodule
 FREEZE_LAST_LAYER_EPOCHS = 1  # dinov3 optim.freeze_last_layer_epochs
 # dino_global .. total: global means over ranks (Ark-style: host-built tensor all-reduced); step_time / data_time: see run()
 # dataset: the batch's dataset under --cyclic_ark_teacher, "-" otherwise (last, so the 15 columns before it are the ones they always were)
-CSV_HEADER = ["step", "epoch", "dino_global", "dino_local", "koleo", "ibot", "gram", "total", "lr", "wd", "momentum",
+# dino_whole: --teacher_whole_image_size only, appended after dataset, so every column before it keeps its place; a run without the flag has none
+CSV_HEADER =["step", "epoch", "dino_global", "dino_local", "koleo", "ibot", "gram", "total", "lr", "wd", "momentum",
               "teacher_temp", "gram_weight", "step_time", "data_time", "dataset"]
 LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "ibot_loss", "gram_loss")
 # what shapes the run: a --resume must match its checkpoint on these (the other flags may change between invocations).
@@ -211,23 +221,27 @@ LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "i
 # pre_resize: the image the crops are cut from (squashed to N x N first; 0: the full decode); like the crop sizes it changes the inputs, so a --branch_from must match it too
 # decode_min_side: the JPEG decode side when set by hand (0: follows the crop sizes); likewise
 # global_crops_scale / local_crops_scale / intensity_aug / no_blur / blur_sigma / no_horizontal_flips / rotate_limit: the student's crop ranges and augmentations (they change every crop, like the crop sizes), so a --branch_from must match them too (none is branch-free)
+# teacher_whole_image_size / whole_image_dino_weight: the whole-image DINO target and its weight in the loss, so a --branch_from must match them too (not branch-free)
 RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_lr_scaling", "warmup_epochs",
                 "weight_decay", "momentum_teacher", "teacher_temp_warmup_epochs", "gram_weight", "global_crops_size",
                 "local_crops_size", "gram_teacher_size", "gram_refresh_steps", "freeze_backbone_epochs", "local_crops_number",
                 "seed", "bf16", "world_size", "init_from_checkpoint", "init_new_heads_from", "no_gram", "branch_from", "drop_path_rate",
                 "rope_rescale_coords", "untie_local_cls_norm", "cyclic_ark_teacher", "ark_teacher_momentum", "teacher_clean_view", "heads",
                 "lock_half_pass", "keep_all_checkpoints", "gram_teacher_from", "pre_resize", "decode_min_side", "no_ibot_separate_head", "weight_decay_end",
-                "global_crops_scale", "local_crops_scale", "intensity_aug", "no_blur", "blur_sigma", "no_horizontal_flips", "rotate_limit")
+                "global_crops_scale", "local_crops_scale", "intensity_aug", "no_blur", "blur_sigma", "no_horizontal_flips", "rotate_limit",
+                "teacher_whole_image_size", "whole_image_dino_weight")
 # checkpoints written before the crop-size flags existed (pilots, main, constlr) were all trained at these
 CROP_DEFAULTS = dict(global_crops_size=224, local_crops_size=96, gram_teacher_size=448)
 # keys a checkpoint written before these flags lacks (check_resume reads them as): the crop sizes above, --no_gram off, no --branch_from (nor
 # --gram_teacher_from), no --init_new_heads_from, no recipe setting (drop path 0, no RoPE rescale, tied CLS norm), no --pre_resize (crops cut from the full decode), no --decode_min_side (the decode side
-# follows the crop sizes), a separate iBOT head (--no_ibot_separate_head off), a constant weight decay (no --weight_decay_end), the CXR crops (scales 0.25-1 global / 0.04-0.25 local, color jitter, blur sigma 0.1-1, flips, no rotation: the seven student-augmentation flags off), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads, no lock passes, the pruned checkpoint record)
+# follows the crop sizes), a separate iBOT head (--no_ibot_separate_head off), a constant weight decay (no --weight_decay_end), the CXR crops (scales 0.25-1 global / 0.04-0.25 local, color jitter, blur sigma 0.1-1, flips, no rotation: the seven student-augmentation flags off),
+# no whole-image teacher target (--teacher_whole_image_size and its weight none), and the mixed-batch mode (per-step EMA teacher on the student's crops, shared heads, no lock passes, the pruned checkpoint record)
 ARG_DEFAULTS = dict(CROP_DEFAULTS, no_gram=False, branch_from=None, drop_path_rate=0.0, rope_rescale_coords=None, untie_local_cls_norm=False,
                     cyclic_ark_teacher=False, ark_teacher_momentum=None, teacher_clean_view=False, heads="shared", lock_half_pass=False,
                     keep_all_checkpoints=False, gram_teacher_from=None, init_new_heads_from=None, pre_resize=0, decode_min_side=0,
                     no_ibot_separate_head=False, weight_decay_end=None, global_crops_scale=(0.25, 1.0), local_crops_scale=(0.04, 0.25),
-                    intensity_aug="jitter", no_blur=False, blur_sigma=(0.1, 1.0), no_horizontal_flips=False, rotate_limit=0.0)
+                    intensity_aug="jitter", no_blur=False, blur_sigma=(0.1, 1.0), no_horizontal_flips=False, rotate_limit=0.0,
+                    teacher_whole_image_size=None, whole_image_dino_weight=None)
 # what a --branch_from start may differ from its source in (check_resume skips these): the Gram switch and knobs the branch turns on, the path itself,
 # the source's own init provenance (its full state is restored; a branch cannot pass --init_from_checkpoint or --init_new_heads_from, so they would always differ)
 # and the Gram teacher's own source (a no-Gram trunk has none)
@@ -335,6 +349,11 @@ def parse_args(argv=None):
                    help="the blur's sigma range: 0 < MIN <= MAX (default 0.1 1.0; DINOv3's is 0.1 2.0). Refused with --no_blur, which has no blur to set it for")
     p.add_argument("--no_horizontal_flips", action="store_true",
                    help="no horizontal flip on any crop (default: p 0.5 on every global and local crop; Ark+'s build_ts_transformations has none)")
+    p.add_argument("--teacher_whole_image_size", type=int, metavar="S", default=None,
+                   help="an extra DINO target for every student crop (Ark+'s whole-image teacher): the EMA teacher's backbone and DINO head on each sample's whole --pre_resize squash, resized (not cropped) to "
+                        "S x S, bicubic, normalized only; its own Sinkhorn-Knopp call. Needs --pre_resize N; S a multiple of 16 of at most N. Default: none")
+    p.add_argument("--whole_image_dino_weight", type=float, metavar="W", default=None,
+                   help="--teacher_whole_image_size only: the weight W > 0 of each whole-image pair in the DINO pair average, global / local / whole-image terms at 2 / T, 16 / T, 10 W / T with T = 18 + 10 W (default 1.0)")
     p.add_argument("--rotate_limit", type=float, metavar="D", default=0.0,
                    help="Ark+'s rotation (build_ts_transformations' ShiftScaleRotate(rotate_limit=D) at its default p 0.5, the rotation only): every global and local crop is rotated with probability 0.5 by a uniform angle "
                         "in [-D, D] degrees about its centre, bilinear, the corners filled by reflect-101; each global crop's clean teacher / Gram copy is cut from the rotated crop. D in [0, 90); 0 = none (default)")
@@ -389,6 +408,19 @@ def parse_args(argv=None):
         p.error(f"--decode_min_side must be 0 (off) or a size in pixels, got {args.decode_min_side}")
     if args.decode_min_side and args.pre_resize:  # the whole image is squashed to pre_resize x pre_resize, which is then the side the JPEG is decoded at
         p.error("--decode_min_side cannot be combined with --pre_resize (the decode side is then the squash size)")
+    if args.teacher_whole_image_size is None:  # no whole-image target: its weight has nothing to act on, so an explicit one is a mistake, not a no-op
+        if args.whole_image_dino_weight is not None:
+            p.error("--whole_image_dino_weight needs --teacher_whole_image_size (there is no whole-image target to weight)")
+    else:
+        size = args.teacher_whole_image_size
+        if not args.pre_resize:
+            p.error("--teacher_whole_image_size needs --pre_resize N (the whole image is the N x N squash, resized to S x S)")
+        if not (0 < size <= args.pre_resize and size % PATCH_SIZE == 0):
+            p.error(f"--teacher_whole_image_size must be a positive multiple of the patch size {PATCH_SIZE} of at most --pre_resize {args.pre_resize}, got {size}")
+        if args.whole_image_dino_weight is None:
+            args.whole_image_dino_weight = 1.0
+        if not (math.isfinite(args.whole_image_dino_weight) and args.whole_image_dino_weight > 0):  # NaN and inf fail the test
+            p.error(f"--whole_image_dino_weight must be a finite number > 0, got {args.whole_image_dino_weight}")
     for name in ("global_crops_scale", "local_crops_scale"):
         scale = tuple(getattr(args, name))  # tuples everywhere: argparse gives a list when the flag is given, and a resumed run's args must compare equal
         if not 0.0 < scale[0] <= scale[1] <= 1.0:  # a RandomResizedCrop's area fractions (NaN fails every comparison)
@@ -743,7 +775,7 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     student_unwrapped = unwrap(student)
     meta = SSLMetaArch(student, teacher, gram_teacher, n_local_crops=args.local_crops_number,
                        gram_loss_weight=args.gram_weight,
-                       autocast_dtype=torch.bfloat16 if args.bf16 else None).to(device)
+                       autocast_dtype=torch.bfloat16 if args.bf16 else None, whole_image_dino_weight=args.whole_image_dino_weight).to(device)
     meta.train()
     optimizer = build_optimizer(get_params_groups(student))
 
@@ -751,7 +783,7 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                                     local_crops_size=args.local_crops_size, gram_teacher_crops_size=args.gram_teacher_size,
                                     emit_gram_teacher_crops=not args.no_gram, teacher_no_distortions=args.teacher_clean_view,
                                     global_crops_scale=args.global_crops_scale, local_crops_scale=args.local_crops_scale, horizontal_flips=not args.no_horizontal_flips,
-                                    intensity=args.intensity_aug, blur_sigma=args.blur_sigma, rotate_limit=args.rotate_limit)
+                                    intensity=args.intensity_aug, blur_sigma=args.blur_sigma, rotate_limit=args.rotate_limit, whole_image_size=args.teacher_whole_image_size)
     decode_side = args.pre_resize or args.decode_min_side or transform.decode_min_side  # --pre_resize N: N (the image is squashed to N x N after the decode); --decode_min_side N: N; else follows the crop sizes and minimum scales: at the default scales 1024 for 224 / 96 / 448 (as before), 1344 for 512 / 224 / 512, 2368 for 512 / 224 / 1024
     cut_note = (f"global crops cut at {args.global_crops_size}, no resize" if args.gram_teacher_size == args.global_crops_size else
                 f"global crops cut at {args.gram_teacher_size} and resized to {args.global_crops_size}, as in the Gram runs")
@@ -766,6 +798,12 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
         rotation_note = (f"up to +/-{args.rotate_limit:g} degrees at p 0.5, reflect-101 corners, the same rotation on each global crop's clean teacher / Gram copy" if args.rotate_limit else "off")
         say(f"augmentation (student crops): global crop scale ({args.global_crops_scale[0]:g}, {args.global_crops_scale[1]:g}), local crop scale ({args.local_crops_scale[0]:g}, {args.local_crops_scale[1]:g}); "
             f"intensity {intensity_note}; blur {blur_note}; horizontal flips {'off' if args.no_horizontal_flips else 'on'}; rotation {rotation_note}")
+    whole = args.teacher_whole_image_size is not None
+    if whole:  # the default prints nothing new
+        terms = (2, 2 * args.local_crops_number, (2 + args.local_crops_number) * args.whole_image_dino_weight)  # SSLMetaArch.compute_losses' pair counts (2 / T, 16 / T, 10 W / T at 8 local crops)
+        say(f"whole-image teacher (--teacher_whole_image_size): the EMA teacher also scores each sample's whole {args.pre_resize}x{args.pre_resize} squash resized to "
+            f"{args.teacher_whole_image_size}x{args.teacher_whole_image_size} (its own Sinkhorn-Knopp call), a DINO target for every student crop at weight {args.whole_image_dino_weight:g}; "
+            f"DINO global / local / whole-image terms weighted " + " / ".join(f"{t / sum(terms):.4f}" for t in terms) + "; ssl_losses.csv gains a last column, dino_whole")
     if datasets_config is None:
         datasets_config = get_config(args.datasets_config)
     dataset = build_dataset(args.data_set, datasets_config, transform, check_exists=check_exists and main, decode_side=decode_side, pre_resize=args.pre_resize)
@@ -882,14 +920,15 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
     summary = lambda: dict(step=step, epoch=epochs_done, gram_refreshes=list(gram_refreshes),
                            peak_lr=sch["peak_lr"], epoch_length=epoch_length)
     csv_path = os.path.join(out, "ssl_losses.csv")
+    csv_header = CSV_HEADER + ["dino_whole"] * whole  # --teacher_whole_image_size (locked on --resume, so a resumed CSV always had the column)
     if main:  # fresh: overwrite. Resume: keep the rows of finished steps, drop those of the interrupted epoch
         kept = []
         if step and os.path.exists(csv_path):  # a row written before the dataset column (15 columns, a mixed-batch run) keeps its place with "-" there
             with open(csv_path, newline="") as f:
-                kept = [r + ["-"] * (len(CSV_HEADER) - len(r)) for r in list(csv.reader(f))[1:]
-                        if len(r) in (len(CSV_HEADER) - 1, len(CSV_HEADER)) and r[0].isdigit() and int(r[0]) < step]
+                kept = [r + ["-"] * (len(csv_header) - len(r)) for r in list(csv.reader(f))[1:]
+                        if len(r) in (len(csv_header) - 1, len(csv_header)) and r[0].isdigit() and int(r[0]) < step]
         with open(csv_path, "w", newline="") as f:
-            csv.writer(f).writerows([CSV_HEADER] + kept)
+            csv.writer(f).writerows([csv_header] + kept)
 
     if args.max_steps and step >= args.max_steps:
         say(f"nothing to do: {step} steps done, --max_steps {args.max_steps}")
@@ -995,10 +1034,12 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                 # (synNodeCreateWithId failed for node: concat).
                 # --no_gram: no gram_loss key; its column is 0.0, never blank (the report builder parses the CSV as numbers)
                 local = [0.0 if args.no_gram and k == "gram_loss" else loss_dict[k].item() for k in LOSS_KEYS] + [loss.item()]
+                if whole:  # --teacher_whole_image_size: the whole-image DINO loss, last (the CSV's dino_whole column)
+                    local.append(loss_dict["dino_whole_loss"].item())
                 stats = torch.tensor(local, dtype=torch.float32, device=device)
                 if accelerator.distributed:
                     accelerator.all_reduce(stats)
-                dg, dl, ko, ib, gr, total = (v / world_size for v in stats.cpu().tolist())  # the host sync
+                dg, dl, ko, ib, gr, total, *dw = (v / world_size for v in stats.cpu().tolist())  # the host sync; dw: [dino_whole] or []
                 now = time.time()
                 # under HPU lazy mode one step can't be timed without a sync, so these are per-step means over the
                 # steps since the previous row (this sync closes the window)
@@ -1008,8 +1049,8 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                 if main:
                     with open(csv_path, "a", newline="") as f:
                         csv.writer(f).writerow([it, epoch, dg, dl, ko, ib, gr, total, lr, wd,
-                                                momentum, temp, args.gram_weight, step_time, data_time, tag])
-                    print(f"step {step}/{total_steps} epoch {epoch} | dino_g {dg:.4f} dino_l {dl:.4f} koleo {ko:.4f} "
+                                                momentum, temp, args.gram_weight, step_time, data_time, tag] + dw)
+                    print(f"step {step}/{total_steps} epoch {epoch} | dino_g {dg:.4f} dino_l {dl:.4f} " + "".join(f"dino_w {v:.4f} " for v in dw) + f"koleo {ko:.4f} "
                           f"ibot {ib:.4f} gram {gr:.5f} total {total:.4f} | lr {lr:.3e} temp {temp:.4f} | "
                           f"{step_time:.3f}s/step data {data_time:.3f}s | elapsed {now - t_start:.0f}s"
                           + (f" | {tag}" if args.cyclic_ark_teacher else ""), flush=True)

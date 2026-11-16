@@ -7,7 +7,11 @@ bicubic resize without antialias, constant Gram weight. Method bodies follow Met
 gram_teacher=None is the no-Gram mode (--no_gram): no Gram teacher forward, no Gram loss term, no gram_loss key.
 Ours, from the batch (ssl_pretrain.py puts them there; a batch without them runs exactly as before): "collated_global_crops_teacher"
 (--teacher_clean_view) are the global crops the EMA teacher scores instead of the student's, and "dataset" (--cyclic_ark_teacher) picks the
-head pair when dino_head / ibot_head are nn.ModuleDicts keyed by dataset name (--heads per_dataset; teacher and student alike)."""
+head pair when dino_head / ibot_head are nn.ModuleDicts keyed by dataset name (--heads per_dataset; teacher and student alike).
+"collated_whole_images" (--teacher_whole_image_size, with whole_image_dino_weight W) adds a DINO target per sample: the EMA teacher's backbone and DINO head
+on the whole image, one extra no-grad forward with its own Sinkhorn-Knopp call (so the two crop targets are bitwise unchanged), scored against every
+student crop, global and local; compute_losses extends Meta's pair average to it: the global, local and whole-image terms are weighted 2 / T, 16 / T and
+10 W / T with T = 18 + 10 W (the pair counts, 2 x 1 global, 2 x 8 local and 10 whole-image pairs at W each)."""
 import contextlib
 
 import torch
@@ -18,7 +22,7 @@ from dinov3.loss import DINOLoss, GramLoss, KoLeoLoss, iBOTPatchLoss
 
 class SSLMetaArch(nn.Module):
     def __init__(self, student, teacher, gram_teacher, *, n_local_crops=8, patch_size=16, gram_loss_weight=2.0,
-                 dino_loss_weight=1.0, koleo_loss_weight=0.1, ibot_loss_weight=1.0, autocast_dtype=None):
+                 dino_loss_weight=1.0, koleo_loss_weight=0.1, ibot_loss_weight=1.0, autocast_dtype=None, whole_image_dino_weight=None):
         super().__init__()
         assert n_local_crops > 0
         # The vendored iBOT Sinkhorn-Knopp all_reduces unconditionally, so even one process needs a process group;
@@ -57,6 +61,8 @@ class SSLMetaArch(nn.Module):
         self.gram_global_teacher_resize_antialias = False
         # ours: optional bf16 autocast around the forward passes only (Meta uses FSDP mixed precision instead)
         self.autocast_dtype = autocast_dtype
+        # ours: --whole_image_dino_weight W, the weight of each whole-image pair (None: no whole-image target, and no batch may carry whole images)
+        self.whole_image_dino_weight = whole_image_dino_weight
 
     @staticmethod
     def _heads(model, dataset):
@@ -93,6 +99,9 @@ class SSLMetaArch(nn.Module):
         teacher_crops = data.get("collated_global_crops_teacher")
         teacher_crops = global_crops if teacher_crops is None else teacher_crops.to(device, non_blocking=True)
         dataset = data.get("dataset")  # ours: --cyclic_ark_teacher's one dataset per batch, which picks the head pair under --heads per_dataset
+        whole_images = data.get("collated_whole_images")  # ours: --teacher_whole_image_size, [B, 3, S, S]
+        assert (whole_images is None) == (self.whole_image_dino_weight is None), (
+            "a batch carries whole images exactly when the meta has a whole_image_dino_weight (--teacher_whole_image_size)")
 
         with self._autocast(device):
             teacher_global = self.get_teacher_output(
@@ -103,6 +112,8 @@ class SSLMetaArch(nn.Module):
                 upperbound=data["upperbound"],
                 dataset=dataset,
             )
+            teacher_whole = None if whole_images is None else self.get_teacher_whole_output(
+                whole_images.to(device, non_blocking=True), teacher_temp=teacher_temp, dataset=dataset)
             student_global, student_local = self.get_student_output(
                 global_crops=global_crops.unflatten(0, (n_global_crops, B)),
                 local_crops=local_crops.unflatten(0, (n_local_crops, B)),
@@ -129,6 +140,7 @@ class SSLMetaArch(nn.Module):
                 masks=masks,
                 mask_indices_list=mask_indices_list,
                 masks_weight=masks_weight,
+                teacher_whole=teacher_whole,
             )
 
         self.backprop_loss(loss_accumulator)
@@ -176,6 +188,14 @@ class SSLMetaArch(nn.Module):
             "cls_centered": cls_centered,
             "masked_patch_centered": masked_patch_centered,
         }
+
+    @torch.no_grad()
+    def get_teacher_whole_output(self, images, *, teacher_temp, dataset=None):
+        """ours (--teacher_whole_image_size): the EMA teacher's DINO target for each sample's whole image [B, 3, S, S], as get_teacher_output makes the
+        crops' (backbone CLS, DINO head, Sinkhorn-Knopp) but in its own call, so the crop targets are unchanged. Returns [1, B, K]: one teacher view."""
+        dino_head, _ = self._heads(self.teacher, dataset)
+        cls = self.teacher.backbone(images, is_training=True)["x_norm_clstoken"]  # [B, D]
+        return self.dino_loss.sinkhorn_knopp_teacher(dino_head(cls), teacher_temp=teacher_temp).unsqueeze(0)
 
     def get_gram_teacher_output(self, images, *, masks, teacher_global, student_global, student_global_crops_size):
         # Get student patch features
@@ -257,7 +277,7 @@ class SSLMetaArch(nn.Module):
         return global_out, local_out
 
     def compute_losses(self, *, teacher_global, student_global, student_local, gram_global, masks, mask_indices_list,
-                       masks_weight):
+                       masks_weight, teacher_whole=None):
         n_global_crops = student_global["cls_after_head"].shape[0]
         n_local_crops = student_local["cls_after_head"].shape[0]
         loss_dict = {}
@@ -268,8 +288,11 @@ class SSLMetaArch(nn.Module):
             n_global_crops * (n_global_crops - 1) if self.dino_global_ignore_diagonal else n_global_crops**2
         )
         dino_local_terms = n_global_crops * n_local_crops
-        dino_global_scale = dino_global_terms / (dino_global_terms + dino_local_terms)
-        dino_local_scale = dino_local_terms / (dino_global_terms + dino_local_terms)
+        # ours (--teacher_whole_image_size): every student crop against its sample's whole-image target, each pair weighted W; 0 without (the sum is Meta's)
+        dino_whole_terms = 0 if teacher_whole is None else (n_global_crops + n_local_crops) * self.whole_image_dino_weight
+        dino_terms = dino_global_terms + dino_local_terms + dino_whole_terms
+        dino_global_scale = dino_global_terms / dino_terms
+        dino_local_scale = dino_local_terms / dino_terms
         koleo_scale = n_global_crops
 
         # DINO local loss: compare post-head CLS tokens: student(local crops) vs. teacher(global crops)
@@ -289,6 +312,15 @@ class SSLMetaArch(nn.Module):
         )
         loss_dict["dino_global_crops_loss"] = dino_global_crops_loss
         loss_accumulator += self.dino_loss_weight * dino_global_scale * dino_global_crops_loss
+
+        # ours: DINO whole-image loss: post-head CLS tokens of student(global and local crops) vs. teacher(whole image), the mean over the 10 pairs per sample
+        if teacher_whole is not None:
+            dino_whole_loss = self.dino_loss(
+                student_logits=torch.cat([student_global["cls_after_head"], student_local["cls_after_head"]]),
+                teacher_probs=teacher_whole,
+            )
+            loss_dict["dino_whole_loss"] = dino_whole_loss
+            loss_accumulator += self.dino_loss_weight * (dino_whole_terms / dino_terms) * dino_whole_loss
 
         # Koleo: regularize pre-head CLS tokens of student(global crops) (the backbone's CLS: no head, so --heads per_dataset leaves it alone)
         koleo_loss = sum(self.koleo_loss(x) for x in student_global["cls_pre_head"]) / n_global_crops

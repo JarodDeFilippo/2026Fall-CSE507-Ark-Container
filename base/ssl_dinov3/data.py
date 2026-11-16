@@ -177,7 +177,9 @@ class DataAugmentationCXR:
     The student-augmentation kwargs default to the crops above, bitwise and from the same RNG draws in the same order: intensity="ark" swaps the color jitter for Ark+'s OneOf brightness /
     contrast or gamma (ArkIntensity), blur_sigma=None drops the blur (nn.Identity, which draws nothing), and rotate_limit=D > 0 adds Ark+'s rotation (RandomRotationReflect, up to +/-D degrees at
     p 0.5) to every global and local crop right after its crop + flip: the clean teacher crops, the Gram crops and the default teacher view are made from the global crops' rotated bases, so
-    they carry exactly the student's rotation of that crop."""
+    they carry exactly the student's rotation of that crop.
+    whole_image_size=S (--teacher_whole_image_size) adds "whole_image": the image it is handed (the --pre_resize squash) resized, not cropped, to S x S (bicubic) and normalized, with no other
+    step; it draws no RNG, so every other crop is bitwise the same as without it. None (default): no such key."""
 
     def __init__(
         self,
@@ -195,6 +197,7 @@ class DataAugmentationCXR:
         intensity="jitter",  # "ark": ArkIntensity (Ark+'s OneOf brightness / contrast or gamma, p 0.3) instead of the color jitter
         blur_sigma=(0.1, 1.0),  # None: no blur at all
         rotate_limit=0,  # D > 0: Ark+'s rotation, up to +/-D degrees at p 0.5, on every global and local crop; 0: none
+        whole_image_size=None,  # S: also emit the whole image resized to S x S (the teacher's whole-image target); None: not emitted
     ):
         if intensity not in ("jitter", "ark"):
             raise ValueError(f"intensity must be 'jitter' or 'ark', got {intensity!r}")
@@ -203,6 +206,7 @@ class DataAugmentationCXR:
         self.teacher_no_distortions = teacher_no_distortions
         self.rotate = RandomRotationReflect(rotate_limit) if rotate_limit > 0 else nn.Identity()  # off: no rotation is built and nothing is drawn
         bicubic = v2.InterpolationMode.BICUBIC
+        self.resize_whole = None if whole_image_size is None else v2.Resize((whole_image_size, whole_image_size), interpolation=bicubic)
         flip = 0.5 if horizontal_flips else 0.0
 
         # one max-size crop serves both the global crop and the gram-teacher crop
@@ -280,6 +284,8 @@ class DataAugmentationCXR:
         output["local_crops"] = [
             self.local_transfo(self.rotate(self.geometric_augmentation_local(image))) for _ in range(self.local_crops_number)
         ]
+        if self.resize_whole is not None:  # the whole image, resized only: no RNG draw
+            output["whole_image"] = self.normalize(self.resize_whole(image))
         output["offsets"] = ()
         return output
 
@@ -300,6 +306,8 @@ def _collate_checked(samples, collate, teacher_crops=False):
         out["collated_global_crops_teacher"] = torch.stack(
             [s[0]["global_crops_teacher"][i] for i in range(n_global_crops) for s in samples]
         ).to(out["collated_global_crops"].dtype)
+    if "whole_image" in samples[0][0]:  # --teacher_whole_image_size: one whole image per sample, in sample order (entry b is the image of crops b, B + b, ...)
+        out["collated_whole_images"] = torch.stack([s[0]["whole_image"] for s in samples]).to(out["collated_global_crops"].dtype)
     return out
 
 
@@ -313,7 +321,8 @@ def make_collate_fn(
 ):
     """collate_data_and_cast + MaskingGenerator built as build_data_loader_from_cfg does (no multidistillation).
     Picklable (a partial of top-level functions), so DataLoader workers may use spawn. teacher_crops=True (--teacher_clean_view) also stacks
-    the samples' "global_crops_teacher" into "collated_global_crops_teacher" (the vendored collate, like Meta's, never reads them)."""
+    the samples' "global_crops_teacher" into "collated_global_crops_teacher" (the vendored collate, like Meta's, never reads them). Samples carrying "whole_image"
+    (--teacher_whole_image_size) also give "collated_whole_images", [B, 3, S, S] in sample order."""
     img_size = global_crops_size
     n_tokens = (img_size // patch_size) ** 2
     mask_generator = MaskingGenerator(
