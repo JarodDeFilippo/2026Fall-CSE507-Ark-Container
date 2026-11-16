@@ -3518,6 +3518,73 @@ print("OK (ab) two real ranks: pairing: each rank's 4 of the 8 images (%s / %s) 
          *(f["losses"]["rolled"]["dino_whole_loss"] for f in ab_found), len(ab_two_rows) - 1))
 
 
+# (ac) pass-end exports: --export_pass_end_every N (--cyclic_ark_teacher only) ---------------------------------------------------------------------------------------------------------------------------
+# In every cycle whose 1-based number is a multiple of N, the teacher backbone after each dataset's release pass and its blend, as export/pass_end/teacher_backbone_epoch_NNNN_after_<dataset>.pth, written by
+# the end-of-cycle export's writer; none after the cycle's last dataset (the end-of-cycle export is that state). (y)'s tied cyclic mode at 32 / 16 / 32 px on (x)'s data (MIMIC, CheXpert, ChestXray14, VinDrCXR)
+AC_LINE = [*Y_MODE, Y_FLAG, "--global_crops_size", "32", "--local_crops_size", "16", "--gram_teacher_size", "32", "--freeze_backbone_epochs", "0"]  # no frozen first cycle, as the planned run (a frozen backbone would leave the teacher backbone unmoved through cycle 1's blends)
+ac_name = lambda cycle, name: "teacher_backbone_epoch_%04d_after_%s.pth" % (cycle, name)
+ac_files = lambda out: sorted(os.listdir(os.path.join(out, "export", "pass_end")))
+ac_load = lambda out, name: torch.load(os.path.join(out, "export", "pass_end", name), map_location="cpu", weights_only=True)  # as Ark's loader reads an export (weights_only)
+
+# (a) parse: 0 (off) by default and not --resume-locked (it reads nothing back); N with --cyclic_ark_teacher changes nothing else; N without it, or below 0, exits 2 naming the flag
+assert P().export_pass_end_every == 0 and "export_pass_end_every" not in ssl_pretrain.RESUME_MATCH and P("--export_pass_end_every", "0").export_pass_end_every == 0
+assert vars(P("--cyclic_ark_teacher", "--export_pass_end_every", "2")) == dict(vars(P("--cyclic_ark_teacher")), export_pass_end_every=2)
+for ac_extra, ac_flags in ((["--export_pass_end_every", "1"], ("--export_pass_end_every", "--cyclic_ark_teacher")), (["--cyclic_ark_teacher", "--export_pass_end_every", "-1"], ("--export_pass_end_every",))):
+    with contextlib.redirect_stderr(io.StringIO()) as ac_err:
+        assert raises(SystemExit, P, *ac_extra) == "2", ac_extra
+    assert all(flag in ac_err.getvalue().split("error: ", 1)[1] for flag in ac_flags), (ac_extra, ac_err.getvalue())
+print("OK (ac) parse: --export_pass_end_every is 0 (off) by default and not --resume-locked; 2 with --cyclic_ark_teacher changes nothing else; 1 without --cyclic_ark_teacher (naming both) and -1 exit 2")
+
+# (b) N = 1, 2 cycles: exactly one file per cycle and non-final dataset, named by the cycle's number and the dataset, in export/pass_end/ (the top of export/ holds the two end-of-cycle exports only); each is
+# bitwise the teacher backbone right after that pass's blend (update_ema spied), in the end-of-cycle export's keys and dtypes; consecutive ones differ; the last blend of a cycle is bitwise its end-of-cycle export (the
+# file not written). The flag changes nothing else: the run's checkpoints (student, teacher, optimizer, RNG), CSV and end-of-cycle exports are bitwise those of the same run without it, which writes no export/pass_end/
+ac_blended, ac_real_ema = [], SSLMetaArch.update_ema
+
+
+def ac_update_ema(self, m):  # the teacher backbone as the export writer reads it, right after each blend (the cyclic mode's only update_ema calls)
+    ac_real_ema(self, m)
+    ac_blended.append(export_backbone(self.teacher.backbone))
+
+
+AC_0, AC_1 = os.path.join(TMP, "AC_0"), os.path.join(TMP, "AC_1")
+ac_text_0 = xgo(AC_0, *AC_LINE, "--stop_after_epochs", "2")[1]
+with mock.patch.object(SSLMetaArch, "update_ema", ac_update_ema):
+    ac_summary, ac_text = xgo(AC_1, *AC_LINE, "--export_pass_end_every", "1", "--stop_after_epochs", "2")
+assert (ac_summary["step"], ac_summary["epoch_length"]) == (30, 15) and len(ac_blended) == 8  # 4 blends a cycle, at steps 6, 10, 13, 15 of each
+assert ac_files(AC_1) == sorted(ac_name(c, d) for c in (1, 2) for d in X_ORDER[:3]), ac_files(AC_1)
+assert sorted(os.listdir(os.path.join(AC_1, "export"))) == ["pass_end", "teacher_backbone_epoch_0001.pth", "teacher_backbone_epoch_0002.pth"]
+for ac_c in (1, 2):
+    ac_end = torch.load(os.path.join(AC_1, "export", "teacher_backbone_epoch_%04d.pth" % ac_c), map_location="cpu", weights_only=True)
+    for ac_k, ac_d in enumerate(X_ORDER[:3]):
+        ac_file = ac_load(AC_1, ac_name(ac_c, ac_d))
+        assert same_state(ac_file, ac_blended[(ac_c - 1) * 4 + ac_k]) and list(ac_file) == list(ac_end) and all(ac_file[k].dtype == ac_end[k].dtype for k in ac_end), (ac_c, ac_d)
+        assert not same_state(ac_file, ac_end) and not same_state(ac_file, ac_blended[(ac_c - 1) * 4 + ac_k + 1]), (ac_c, ac_d)  # not vacuous: each pass moved the teacher
+    assert same_state(ac_blended[(ac_c - 1) * 4 + 3], ac_end), ac_c  # after VinDrCXR: the end-of-cycle export itself
+ac_lines = [line for line in ac_text.splitlines() if line.startswith("pass-end export")]
+assert ac_lines == ["pass-end exports (--export_pass_end_every 1): in every cycle whose number is a multiple of 1, the teacher backbone after the release pass and blend of MIMIC, CheXpert, ChestXray14, as "
+                    "export/pass_end/teacher_backbone_epoch_NNNN_after_<dataset>.pth; none after VinDrCXR's, the cycle's end (export/teacher_backbone_epoch_NNNN.pth is that state)"] + [
+    "pass-end export after step %d: %s" % (s, os.path.join(AC_1, "export", "pass_end", ac_name(c, d))) for c, s0 in ((1, 0), (2, 15)) for s, d in zip((s0 + 6, s0 + 10, s0 + 13), X_ORDER[:3])], ac_lines
+assert "pass-end" not in ac_text_0 and not os.path.exists(os.path.join(AC_0, "export", "pass_end")) and json.load(open(os.path.join(AC_1, "args.json")))["export_pass_end_every"] == 1
+for ac_ck in ("epoch_0001.pth", "epoch_0002.pth"):
+    ac_a, ac_b = load_ckpt(AC_0, ac_ck), load_ckpt(AC_1, ac_ck)
+    assert same_state({k: v for k, v in ac_a.items() if k != "args"}, {k: v for k, v in ac_b.items() if k != "args"}), ac_ck  # the data fingerprint included: the same images in each
+assert [r[:13] + r[15:] for r in read_csv(AC_0)] == [r[:13] + r[15:] for r in read_csv(AC_1)]  # every CSV column but the two timings
+assert all(same_state(torch.load(os.path.join(AC_0, "export", n), weights_only=True), torch.load(os.path.join(AC_1, "export", n), weights_only=True)) for n in ("teacher_backbone_epoch_0001.pth", "teacher_backbone_epoch_0002.pth"))
+print("OK (ac) N = 1, 2 cycles: export/pass_end/ holds exactly teacher_backbone_epoch_000{1,2}_after_{MIMIC,CheXpert,ChestXray14}.pth (none after VinDrCXR, the last), the top of export/ the two end-of-cycle exports only; "
+      "each file is bitwise the teacher backbone right after that pass's blend, in the end-of-cycle export's keys and dtypes, and differs from the next state; the last blend of each cycle is bitwise its end-of-cycle export; "
+      "one start line and one line per file (after steps 6, 10, 13, 21, 25, 28); args.json records 1; the checkpoints (student, teacher, optimizer, RNG), CSV and end-of-cycle exports are bitwise those of the run without "
+      "the flag, which prints nothing new and writes no export/pass_end/")
+
+# (c) N = 2, 4 cycles: files in cycles 2 and 4 only. (d) resume: AC_1 (N = 1, 2 cycles) with its export/pass_end/ deleted, resumed to cycle 3 with N = 3: accepted (not locked), nothing read back, and only cycle 3's three files
+AC_2 = os.path.join(TMP, "AC_2")
+xgo(AC_2, *AC_LINE, "--export_pass_end_every", "2", "--epochs", "4", "--stop_after_epochs", "4")
+assert ac_files(AC_2) == sorted(ac_name(c, d) for c in (2, 4) for d in X_ORDER[:3]), ac_files(AC_2)
+shutil.rmtree(os.path.join(AC_1, "export", "pass_end"))
+ac_resumed, ac_resumed_text = xgo(AC_1, *AC_LINE, "--export_pass_end_every", "3", "--resume", "--stop_after_epochs", "3")
+assert ac_resumed["step"] == 45 and "resumed from" in ac_resumed_text and ac_files(AC_1) == sorted(ac_name(3, d) for d in X_ORDER[:3]), (ac_resumed, ac_files(AC_1))
+print("OK (ac) N = 2 over 4 cycles writes cycles 2 and 4 only (3 files each); a resume with another N (3 after 1) is accepted, reads no pass-end file (the directory was deleted) and writes cycle 3's three")
+
+
 # (k) launch scripts ------------------------------------------------------------------------------------------------------------
 scripts = [os.path.join(REPO, "chain", f) for f in ("ssl_common.sh", "pilot_a.sh", "pilot_b.sh", "main.sh", "constlr.sh", "hires.sh")]
 scripts.append(os.path.join(REPO, "run_d1_8s_timing_gaudi.sh"))

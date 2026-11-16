@@ -14,14 +14,16 @@
 # usage (the repo root on the cluster is /scratch/$USER/2026Fall-CSE507-Ark-Container; this script cd's there), no arguments:
 #   sbatch run_d1_8_newdata224_cos100_smoke_gaudi.sh
 # Two lines in one job, each the run's launch line over the same truncated lists, one cycle each, into <smoke dir>/fp32/ and <smoke dir>/bf16/:
-#   fp32   the run's precision: its verdict is this script's exit code.
-#   bf16   the same line plus --bf16, REPORT ONLY: it always runs, even when the fp32 line failed, and its result never changes the exit code. The run is fp32, so the fp32 numbers are the run's and the bf16 ones are for reference: under --bf16 the loss math, KoLeo included, also runs in bf16 under autocast.
+#   fp32   the run's precision: its verdict is this script's exit code. The one line with --export_pass_end_every 1 (the run's value): it writes the run's pass-end exports, after every pass of its cycle but the last (6),
+#          whose names and sizes it reports before the cleanup deletes them with export/.
+#   bf16   the same line plus --bf16, REPORT ONLY: it always runs, even when the fp32 line failed, and its result never changes the exit code. The run is fp32, so the fp32 numbers are the run's and the bf16 ones are for reference: under --bf16 the loss math, KoLeo included, also runs in bf16 under autocast. No pass-end exports.
 # The launch line is chain/newdata224_cos100.sh's, flag for flag (its FLAGS, WHOLE, GRAM_TEACHER_SIZE and SSL_DATASETS are repeated below; base/test_newdata.py runs both in a fake repo and compares them); only these differ:
 #   --output_dir          /workspace/<smoke dir>/fp32 and /workspace/<smoke dir>/bf16, the smoke dir being smoke_newdata224_cos100_x8_<job id>: a name no run uses, new every job, so it can neither collide with ssl_dinov3_cxr_newdata224_cos100_tiedhead_arkteacher_seed_100
 #                         nor resume into anything (the script also refuses a smoke dir that exists)
 #   --datasets_config     /workspace/<smoke dir>/datasets_config_smoke.yaml in place of datasets_config_taix_original.yaml: the same seven entries, each data_dir unchanged and each train_list the truncated copy in <smoke dir>/lists/ (in-container paths: /workspace is the repo root)
 #   --stop_after_epochs 1 --print_freq 5 --log_peak_memory   added: one cycle, a log row every 5 steps, and each rank prints its own card's peak (the trainer logs no memory otherwise)
 #   --bf16                added to the second line only
+#   --export_pass_end_every 1   the run's own flag and value, given to the first line only (the second writes no pass-end export)
 # Truncated lists: each dataset's pass gets STEPS_PER_DATASET = 60 steps (a setting below, with BATCH = 64, ssl_launch's per-card batch): its train list is cut to its first ROWS = STEPS_PER_DATASET x cards x BATCH = 60 x 8 x 64 = 30,720 images (plus its header row, which every list has but
 # ChestXray14's and VinDrCXR's: ssl_dinov3/data.py image_paths), so each of the 8 ranks gets 3,840 images (DistributedSampler, drop_last) and the loader (drop_last) cuts 60 batches of 64 from them. A list shorter than ROWS is kept whole: VinDrCXR has 15,000 images, so it keeps its whole list,
 # 29 steps on 8 cards, as in the run. The cycle is 6 x 60 + 29 = 389 steps. The first rows of a list are not a random sample of it, so a dataset's speed and loss here are indicative of its pass, not a measurement of it.
@@ -38,6 +40,7 @@
 #   SMOKE <tag> speed, projection           the mean step_time and data_time (the wait for the loader) over the rows of ssl_losses.csv after the first, step 0, which holds the compile; each row is itself the mean over the steps since the row before. The projection is that mean x 238000 steps (100 cycles x 2380)
 #                                           in hours: arithmetic on this smoke's mean, not a measurement of the run
 #   SMOKE <tag> dataset <name>:release      one line per dataset, in the cycle's order: its rows (step 0's row not counted), mean s/step and data s/step, and its last row's dino_global, dino_local, dino_whole and total
+#   SMOKE <tag> pass-end export <file>: B bytes   each pass-end export the line wrote (the fp32 line only), before the cleanup deletes it
 #   SMOKE <tag> verdict                     FITS (the line exited 0), OUT OF MEMORY, or FAILED (anything else: read the log); the bf16 one says (report only)
 # The 1 h limit is a guess with margin, not measured: two lines, each a container start, the model build and the stock weights load, the first step's graph compile, 389 steps and the cycle-end save. The fp32 line runs first, so a time-out costs the bf16 report, not the verdict.
 # Fail closed as the other wrappers do: ./gaudi_check_cards.sh refuses to launch unless the container sees exactly the allocated cards.
@@ -60,7 +63,7 @@ WHOLE=(--teacher_whole_image_size 448 --whole_image_dino_weight 1.0)
 CONFIG=base/datasets_config_taix_original.yaml  # the run's --datasets_config, which the trainer reads from its cwd, base/
 # fail fast (seconds, not a queue wait): the datasets mount, a trainer that knows the flags used below, the cards
 [[ -d /scratch/$USER/datasets-new ]] || { echo "ERROR: /scratch/$USER/datasets-new not found: TAIXRay and ReXGradient live there" >&2; exit 1; }
-for flag in --teacher_whole_image_size --log_peak_memory; do
+for flag in --teacher_whole_image_size --log_peak_memory --export_pass_end_every; do
   grep -q -- "\"$flag\"" base/ssl_pretrain.py || { echo "ERROR: base/ssl_pretrain.py here has no $flag: copy the current one" >&2; exit 1; }
 done
 ./gaudi_check_cards.sh || exit 1
@@ -137,11 +140,14 @@ smoke_line() {
   else
     echo "SMOKE $tag verdict$note: FAILED (exit $RC) and not obviously memory: read the log above"
   fi
+  for f in "$SMOKE/$tag"/export/pass_end/*.pth; do  # --export_pass_end_every: what the run writes after each pass but the last, as written here
+    if [[ -f $f ]]; then echo "SMOKE $tag pass-end export ${f##*/}: $(wc -c < "$f" | tr -d '[:space:]') bytes"; fi
+  done
   if [[ $SMOKE == smoke_newdata224_cos100_* ]]; then rm -rf -- "./$SMOKE/$tag/ckpt" "./$SMOKE/$tag/export"; fi  # the cycle-end save: GBs nobody needs
   return 0
 }
 
-smoke_line fp32
+smoke_line fp32 --export_pass_end_every 1
 RC_FP32=$RC
 smoke_line bf16 --bf16
 exit "$RC_FP32"

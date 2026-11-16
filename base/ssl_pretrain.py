@@ -111,6 +111,12 @@ One line says so at the start, the step line shows dino_w, and ssl_losses.csv ga
 so every column before it keeps its place; without the flag there is no such column. Both are locked on --resume (a checkpoint without the keys reads as none), recorded in args.json and
 matched by --branch_from. Off by default: bitwise as before.
 
+--export_pass_end_every N (--cyclic_ark_teacher only; default 0, off) writes pass-end exports for focused / unfocused probe curves: in every cycle whose 1-based number is a multiple of N, after each
+dataset's release pass and its teacher blend, the teacher backbone as export/pass_end/teacher_backbone_epoch_NNNN_after_<dataset>.pth (NNNN the cycle's number, as in that cycle's end-of-cycle
+export/teacher_backbone_epoch_NNNN.pth; the same writer, export_backbone, so the same stock keys, loading into Ark's vit_base_dinov3 the same way). In a subdirectory, so no glob of the end-of-cycle
+exports matches one. None is written after the cycle's last dataset: its pass ends the cycle, and the end-of-cycle export is that very state. Rank 0 writes, nothing else changes (no RNG, no collective);
+nothing is read back on --resume (a resumed run restarts at a cycle boundary and writes that cycle's files again), so N is recorded in args.json but not locked on --resume.
+
 --cyclic_ark_teacher is the Ark+ / Foundation X teacher transplanted into this trainer (Jarod, 2026-10-26). A cycle replaces the mixed-batch epoch: the
 --data_set datasets in turn, largest first by image count (computed and logged; on the four CXR sets MIMIC, CheXpert, ChestXray14, VinDrCXR, whatever the
 --data_set order; a tie keeps that order), every batch from one dataset. Per dataset the cycle runs its release pass, one full pass over the dataset with
@@ -222,7 +228,8 @@ LOSS_KEYS = ("dino_global_crops_loss", "dino_local_crops_loss", "koleo_loss", "i
 # decode_min_side: the JPEG decode side when set by hand (0: follows the crop sizes); likewise
 # global_crops_scale / local_crops_scale / intensity_aug / no_blur / blur_sigma / no_horizontal_flips / rotate_limit: the student's crop ranges and augmentations (they change every crop, like the crop sizes), so a --branch_from must match them too (none is branch-free)
 # teacher_whole_image_size / whole_image_dino_weight: the whole-image DINO target and its weight in the loss, so a --branch_from must match them too (not branch-free)
-RESUME_MATCH = ("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_lr_scaling", "warmup_epochs",
+# not here: export_pass_end_every (it writes extra exports and reads nothing back; free between invocations like --print_freq and --log_peak_memory)
+RESUME_MATCH =("data_set", "epochs", "batch_size_per_gpu", "lr", "min_lr", "no_lr_scaling", "warmup_epochs",
                 "weight_decay", "momentum_teacher", "teacher_temp_warmup_epochs", "gram_weight", "global_crops_size",
                 "local_crops_size", "gram_teacher_size", "gram_refresh_steps", "freeze_backbone_epochs", "local_crops_number",
                 "seed", "bf16", "world_size", "init_from_checkpoint", "init_new_heads_from", "no_gram", "branch_from", "drop_path_rate",
@@ -385,6 +392,11 @@ def parse_args(argv=None):
     p.add_argument("--no_lock_half_pass", dest="lock_half_pass", action="store_const", const=False,
                    help="--cyclic_ark_teacher only: no lock passes, each dataset's release pass alone (the default, given explicitly)")
     p.add_argument("--keep_all_checkpoints", action="store_true", help="never prune ckpt/epoch_*.pth (default: the last 3 and every 10th are kept)")
+    p.add_argument("--export_pass_end_every", type=int, metavar="N", default=0,
+                   help="--cyclic_ark_teacher only: in every cycle whose 1-based number is a multiple of N, write the teacher backbone export (the end-of-cycle export's writer and keys) after each "
+                        "dataset's release pass and its teacher blend, as export/pass_end/teacher_backbone_epoch_NNNN_after_<dataset>.pth (NNNN: the cycle's number, as in its end-of-cycle "
+                        "export/teacher_backbone_epoch_NNNN.pth). None for the cycle's last dataset: its pass ends the cycle, whose own export is that very state. Backbone only; nothing is read "
+                        "back on --resume (a resumed cycle writes its files again) and N is not locked. 0 = off (default)")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--workers", type=int, default=16)
     p.add_argument("--seed", type=int, default=100)
@@ -433,6 +445,10 @@ def parse_args(argv=None):
         args.blur_sigma = (0.1, 1.0) if args.blur_sigma is None else tuple(args.blur_sigma)
         if not (0.0 < args.blur_sigma[0] <= args.blur_sigma[1] and math.isfinite(args.blur_sigma[1])):  # GaussianBlur's own rule (positive, MIN <= MAX); NaN fails it, and an infinite MAX would draw infinite sigmas
             p.error(f"--blur_sigma must satisfy 0 < MIN <= MAX (finite), got {args.blur_sigma[0]:g} {args.blur_sigma[1]:g}")
+    if args.export_pass_end_every < 0:  # 0 is off
+        p.error(f"--export_pass_end_every must be 0 (off) or a positive number of cycles, got {args.export_pass_end_every}")
+    if args.export_pass_end_every and not args.cyclic_ark_teacher:  # a mixed batch has no dataset passes to end
+        p.error("--export_pass_end_every needs --cyclic_ark_teacher (there are no per-dataset passes to export after)")
     if not (math.isfinite(args.rotate_limit) and 0.0 <= args.rotate_limit < 90.0):  # 0 is off; NaN and inf fail the test
         p.error(f"--rotate_limit must be a finite number of degrees in [0, 90) (0: no rotation), got {args.rotate_limit}")
     if args.pretrained_weights is None and args.init_from_checkpoint is None and args.branch_from is None:
@@ -845,6 +861,10 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
         say(f"teacher (--cyclic_ark_teacher): no per-step EMA, frozen through every pass; after each dataset's release pass teacher <- {args.ark_teacher_momentum:g} "
             f"x teacher + {1 - args.ark_teacher_momentum:g} x student (backbone and all heads)" + ("; FX lock-release: half-pass lock (backbone frozen, heads train) + "
                                                                                                  "full-pass release per dataset" if args.lock_half_pass else ""))
+        if args.export_pass_end_every:  # the default prints nothing new
+            say(f"pass-end exports (--export_pass_end_every {args.export_pass_end_every}): in every cycle whose number is a multiple of {args.export_pass_end_every}, the teacher backbone after the "
+                f"release pass and blend of {', '.join(order[:-1])}, as export/pass_end/teacher_backbone_epoch_NNNN_after_<dataset>.pth; none after {order[-1]}'s, the cycle's end "
+                "(export/teacher_backbone_epoch_NNNN.pth is that state)")
 
     global_batch = args.batch_size_per_gpu * world_size
     sch = build_schedules(lr=args.lr, min_lr=args.min_lr, epochs=args.epochs, warmup_epochs=args.warmup_epochs,
@@ -1017,6 +1037,12 @@ def run(args, vit_kwargs=None, head_kwargs=None, datasets_config=None, check_exi
                 accelerator.mark_step()
                 say(f"teacher blend after step {it + 1} (end of {name}'s release pass, cycle {epoch}, dataset {order.index(name) + 1}/{len(order)}): teacher <- "
                     f"{args.ark_teacher_momentum:g} x teacher + {1 - args.ark_teacher_momentum:g} x student, backbone and all heads")
+                # --export_pass_end_every N: the blended teacher's backbone, in every N-th cycle (1-based), but after the cycle's last pass (its end-of-cycle export is that state)
+                if args.export_pass_end_every and (epoch + 1) % args.export_pass_end_every == 0 and name != order[-1] and main:
+                    pass_end_path = os.path.join(export_dir, "pass_end", "teacher_backbone_epoch_%04d_after_%s.pth" % (epoch + 1, name))
+                    os.makedirs(os.path.dirname(pass_end_path), exist_ok=True)
+                    save_atomic(export_backbone(teacher.backbone), pass_end_path)
+                    say(f"pass-end export after step {it + 1}: {pass_end_path}")
             step += 1
             n_mark += 1
             refreshed = step in refresh_steps and step not in gram_refreshes

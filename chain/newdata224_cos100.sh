@@ -21,12 +21,16 @@
 # script, is how a killed or timed-out run continues; a run that finished all 100 cycles finds nothing to do and ends at once.
 # NOT a chain phase: it is never in chain/phases.txt and writes no chain/done marker.
 # Disk: a checkpoint holds the student and the teacher (the backbone, about 86M parameters, and one head of 23.1M each) plus AdamW's two moments, about 1.7 GB by parameter count (an estimate, not measured), and none is pruned (--keep_all_checkpoints).
+# Pass-end exports (EXPORT_PASS_END_EVERY, --export_pass_end_every): in each cycle whose number is a multiple of it, the teacher backbone after each dataset's pass and its blend but the last (whose state is the cycle's own
+# export), as export/pass_end/teacher_backbone_epoch_NNNN_after_<dataset>.pth, the end-of-cycle export's writer and keys. One file is 342,848,291 bytes (measured on the Mac: the trainer's export_backbone of a ViT-B/16 with
+# this recipe, 188 float32 keys), so 6 a cycle are about 2.06 GB: about 206 GB over 100 cycles at 1, 103 GB at 2, beside the end-of-cycle exports' 34 GB. Nothing reads them back, and the value is not locked on --resume.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/ssl_common.sh"
 
 RUN=ssl_dinov3_cxr_newdata224_cos100_tiedhead_arkteacher_seed_100  # confirmed by Jarod 2026-11-16
 REGISTRY_ID=ssl-newdata224_cos100_tiedhead_arkteacher  # the DINO-X registry id, proposed (not yet confirmed); printed on the run: line, the trainer does not read it
 GRAM_TEACHER_SIZE=224  # confirmed 2026-11-16: the global crops are cut at 224 straight from the 512 squash; 448 (the trainer default 2 x global) would cut at 448 and resize to 224
+EXPORT_PASS_END_EVERY=1  # --export_pass_end_every: the teacher backbone after every non-final dataset's pass in each cycle whose number is a multiple of this (1: every cycle; 2: even cycles), for focused / unfocused probe curves; 0: none
 export SSL_DATASETS="MIMIC ReXGradient CheXpert TAIXRay PadChest ChestXray14 VinDrCXR"  # ssl_launch's --data_set flags, in chain/newdata512.sh's order (the cycle visits them largest first whatever that order is; --resume locks it)
 FLAGS=(--no_gram --cyclic_ark_teacher --no_lock_half_pass --keep_all_checkpoints --no_ibot_separate_head
   --drop_path_rate 0.1 --rope_rescale_coords 2 --untie_local_cls_norm
@@ -37,6 +41,6 @@ WHOLE=(--teacher_whole_image_size 448 --whole_image_dino_weight 1.0)  # the whol
 
 CARDS=$(ark_device_count gaudi)  # the rank count ssl_launch passes as --nproc-per-node: the same function on the same environment
 [[ $CARDS == 8 ]] || { echo "ERROR: $CARDS cards in the allocation, this run needs 8: 64 per card x 8 = global batch 512, and the absolute LR and the 2380-step cycle are set for it; another card count changes all three" >&2; exit 1; }
-echo "run: $RUN (registry id $REGISTRY_ID; stock DINOv3 ViT-B/16, no start checkpoint; data sets $SSL_DATASETS, TAIXRay from the native files (datasets_config_taix_original.yaml); $CARDS cards x 64 = global batch $((64 * CARDS)); global crops cut at $GRAM_TEACHER_SIZE straight from the squash; no --stop_after_epochs: every cycle of the schedule trains; flags: ${FLAGS[*]} ${WHOLE[*]})"
+echo "run: $RUN (registry id $REGISTRY_ID; stock DINOv3 ViT-B/16, no start checkpoint; data sets $SSL_DATASETS, TAIXRay from the native files (datasets_config_taix_original.yaml); $CARDS cards x 64 = global batch $((64 * CARDS)); global crops cut at $GRAM_TEACHER_SIZE straight from the squash; pass-end exports every $EXPORT_PASS_END_EVERY cycle(s) (0: none); no --stop_after_epochs: every cycle of the schedule trains; flags: ${FLAGS[*]} ${WHOLE[*]})"
 
-ssl_launch "$RUN" "${FLAGS[@]}" "${WHOLE[@]}" --gram_teacher_size "$GRAM_TEACHER_SIZE" --datasets_config datasets_config_taix_original.yaml
+ssl_launch "$RUN" "${FLAGS[@]}" "${WHOLE[@]}" --export_pass_end_every "$EXPORT_PASS_END_EVERY" --gram_teacher_size "$GRAM_TEACHER_SIZE" --datasets_config datasets_config_taix_original.yaml

@@ -737,7 +737,7 @@ REGISTRY_COS = "ssl-newdata224_cos100_tiedhead_arkteacher"
 COS_LINE = ("--no_gram --cyclic_ark_teacher --no_lock_half_pass --keep_all_checkpoints --no_ibot_separate_head --drop_path_rate 0.1 --rope_rescale_coords 2 --untie_local_cls_norm "
             "--lr 2e-3 --min_lr 1e-6 --no_lr_scaling --epochs 100 --warmup_epochs 10 --teacher_temp_warmup_epochs 30 --weight_decay 0.04 --weight_decay_end 0.4 --pre_resize 512 "
             "--global_crops_scale 0.15 1.0 --local_crops_scale 0.05 0.15 --intensity_aug ark --no_blur --no_horizontal_flips --rotate_limit 10").split()  # the confirmed flag line (handoff 2026-11-16 section 4)
-COS_TAIL = ["--freeze_backbone_epochs", "0", "--teacher_whole_image_size", "448", "--whole_image_dino_weight", "1.0", "--gram_teacher_size", "224", "--datasets_config", NATIVE_YAML]  # after it: Jarod's no frozen first cycle, then the script's settings
+COS_TAIL = ["--freeze_backbone_epochs", "0", "--teacher_whole_image_size", "448", "--whole_image_dino_weight", "1.0", "--export_pass_end_every", "1", "--gram_teacher_size", "224", "--datasets_config", NATIVE_YAML]  # after it: Jarod's no frozen first cycle, then the script's settings
 
 
 def cos_expected(cards=8):
@@ -769,6 +769,7 @@ def test_newdata224_cos100_script():
         assert parsed.freeze_backbone_epochs == 0 and parse(argv[:i] + argv[i + 2:]).freeze_backbone_epochs == 1  # the trainer's default is the frozen first cycle: this line turns it off
         assert (parsed.pre_resize, parsed.global_crops_size, parsed.local_crops_size, parsed.gram_teacher_size) == (512, 224, 96, 224)  # cut at 224 straight from the 512 squash: no resize
         assert (parsed.teacher_whole_image_size, parsed.whole_image_dino_weight, parsed.no_gram, parsed.cyclic_ark_teacher) == (448, 1.0, True, True)
+        assert parsed.export_pass_end_every == 1  # pass-end exports in every cycle
         assert (parsed.heads, parsed.no_ibot_separate_head, parsed.lock_half_pass, parsed.keep_all_checkpoints) == ("shared", True, False, True)  # one tied head for all seven datasets
         assert (parsed.lr, parsed.min_lr, parsed.no_lr_scaling, parsed.epochs, parsed.warmup_epochs, parsed.teacher_temp_warmup_epochs) == (2e-3, 1e-6, True, 100, 10, 30)
         assert (parsed.weight_decay, parsed.weight_decay_end, parsed.drop_path_rate, parsed.rope_rescale_coords, parsed.untie_local_cls_norm) == (0.04, 0.4, 0.1, 2.0, True)
@@ -784,7 +785,7 @@ def test_newdata224_cos100_script():
         # the three settings are one line each, once, ahead of the flag line, each a one-line change
         text = open(script).read()
         head = text[:text.index("\nFLAGS=(")]
-        setting = {"RUN": "RUN=%s  #" % RUN_COS, "REGISTRY_ID": "REGISTRY_ID=%s  #" % REGISTRY_COS, "GRAM_TEACHER_SIZE": "GRAM_TEACHER_SIZE=224  #"}
+        setting = {"RUN": "RUN=%s  #" % RUN_COS, "REGISTRY_ID": "REGISTRY_ID=%s  #" % REGISTRY_COS, "GRAM_TEACHER_SIZE": "GRAM_TEACHER_SIZE=224  #", "EXPORT_PASS_END_EVERY": "EXPORT_PASS_END_EVERY=1  #"}
         for name, line in setting.items():
             assert text.count("\n" + line) == 1 and head.count("\n" + line) == 1, name
 
@@ -800,6 +801,8 @@ def test_newdata224_cos100_script():
         assert ssl_pretrain.check_args(parse(other)) == 100 and result.stdout.startswith("run: ssl_other_run_seed_7 (registry id " + REGISTRY_COS + "; "), result.stdout
         result, other = edited("REGISTRY_ID", "ssl-other")  # only printed: the trainer does not read it
         assert result.returncode == 0 and other == argv and result.stdout.startswith("run: %s (registry id ssl-other; " % RUN_COS), result.stdout
+        result, other = edited("EXPORT_PASS_END_EVERY", "2")  # every second cycle (Jarod may choose it): --export_pass_end_every and nothing else
+        assert result.returncode == 0 and changed(other, argv) == {"--export_pass_end_every"} and parse(other).export_pass_end_every == 2, result.stderr
         result, other = edited("GRAM_TEACHER_SIZE", "448")  # --gram_teacher_size and nothing else changes ...
         assert result.returncode == 0 and changed(other, argv) == {"--gram_teacher_size"} and flags(other)["--gram_teacher_size"] == [["448"]], result.stderr
         with contextlib.redirect_stderr(io.StringIO()) as err:  # ... and the trainer refuses it: with --no_gram its one accepted --gram_teacher_size is the global size (the 448 cut is the flag left out, not given)
@@ -822,6 +825,7 @@ SMOKE_COS = os.path.join(REPO, "run_d1_8_newdata224_cos100_smoke_gaudi.sh")
 SMOKE_ROWS = 60 * 8 * 64  # the smoke's cut: STEPS_PER_DATASET x cards x BATCH
 SMOKE_DIR = "smoke_newdata224_cos100_x8_4242"  # the smoke dir of job 4242 on 8 cards
 COS_HEADERS = {"MIMIC": "image_path,dicom_id,study_id", "CheXpert": "Path,Sex,Age", "PadChest": "Path", "TAIXRay": "Path", "ReXGradient": "Path"}  # the lists with a header row (ChestXray14's and VinDrCXR's have none)
+COS_PASS_END = ['MIMIC', 'ReXGradient', 'CheXpert', 'TAIXRay', 'PadChest', 'ChestXray14']  # the smoke cycle's passes but the last (the cut lists tie, so the --data_set order: VinDrCXR, the short one, last)
 COS_SHORT = {"VinDrCXR": 15000}  # the real list's size, below SMOKE_ROWS: the smoke keeps it whole (29 steps on 8 cards)
 COS_COLUMNS = "step,epoch,dino_global,dino_local,koleo,ibot,gram,total,lr,wd,momentum,teacher_temp,gram_weight,step_time,data_time,dataset,dino_whole"
 # the rows the stub trainer writes for each line: (step, dino_global, dino_local, total, step_time, data_time, dataset, dino_whole); the first, step 0, holds the compile. Values exact in binary, so Python's sums are awk's
@@ -836,6 +840,9 @@ printf "%s\n" "$@" > "$PWD/$out/argv.txt"; printf "%s" "${EXTRA_BINDS:-}" > "$PW
 if [[ -n ${FAKE_TRAINER:-} ]]; then  # what the trainer leaves behind in its run dir and prints, then its exit; the line is bf16 if --bf16 is among its args
   kind=fp32; base=80; for a in "$@"; do [[ $a == --bf16 ]] && { kind=bf16; base=60; }; done
   mkdir -p "$PWD/$out/ckpt" "$PWD/$out/export"; touch "$PWD/$out/ckpt/epoch_0001.pth" "$PWD/$out/export/teacher_backbone_epoch_0001.pth"; echo '{}' > "$PWD/$out/args.json"
+  for a in "$@"; do  # --export_pass_end_every: the trainer's pass-end exports of the cycle, after each of its passes but the last (4 bytes each here)
+    if [[ $a == --export_pass_end_every ]]; then mkdir -p "$PWD/$out/export/pass_end"; for d in MIMIC ReXGradient CheXpert TAIXRay PadChest ChestXray14; do printf abcd > "$PWD/$out/export/pass_end/teacher_backbone_epoch_0001_after_$d.pth"; done; fi
+  done
   cp "$FAKE_CSV_DIR/$kind.csv" "$PWD/$out/ssl_losses.csv"
   for step in 1 5 389; do for r in 0 1 2 3 4 5 6 7; do echo "peak_memory rank=$r step=$step GiB=${FAKE_PEAK:-$((base + step / 100 + r)).50}"; done; done  # FAKE_PEAK=unavailable: the trainer found no counter
   sleep 1
@@ -946,7 +953,7 @@ def test_newdata224_cos100_smoke_header():
     assert not any("main_lr" in line or "stop_after.txt" in line for line in code)  # no settings file
     for line in ("STEPS_PER_DATASET=60  #", "BATCH=64  #"):  # the two settings, one line each, once, near the top
         assert text.count("\n" + line) == 1 and text.index("\n" + line) < text.index("\nFLAGS=("), line
-    for needle in ("sbatch run_d1_8_newdata224_cos100_smoke_gaudi.sh", "report only", "grep -E '^(SMOKE|peak_memory)'", "29 steps", "30,720", "REPORT ONLY", "not measured", "dino_whole"):
+    for needle in ("sbatch run_d1_8_newdata224_cos100_smoke_gaudi.sh", "report only", "grep -E '^(SMOKE|peak_memory)'", "29 steps", "30,720", "REPORT ONLY", "not measured", "dino_whole", "\nsmoke_line fp32 --export_pass_end_every 1\n", "\nsmoke_line bf16 --bf16\n"):
         assert needle in text, needle
     assert "newdata224_cos100_smoke" not in [line.split("#")[0].strip() for line in open(os.path.join(REPO, "chain", "phases.txt"))]  # not a chain phase
 
@@ -964,7 +971,8 @@ def test_newdata224_cos100_smoke_lines():
         fp32, bf16 = (recorded(root, SMOKE_DIR + "/" + kind) for kind in ("fp32", "bf16"))
         assert fp32 is not None and bf16 is not None
         assert changed(fp32, run_argv) == {"--output_dir", "--datasets_config", "--stop_after_epochs", "--print_freq", "--log_peak_memory"}, changed(fp32, run_argv)  # the run's line, with exactly these
-        assert changed(bf16, fp32) == {"--output_dir", "--bf16"}, changed(bf16, fp32)
+        assert changed(bf16, fp32) == {"--output_dir", "--bf16", "--export_pass_end_every"}, changed(bf16, fp32)  # the pass-end exports: on the fp32 line only (the run's value there)
+        assert flags(fp32)["--export_pass_end_every"] == flags(run_argv)["--export_pass_end_every"] == [["1"]] and "--export_pass_end_every" not in flags(bf16)
         assert flags(fp32)["--output_dir"] == [["/workspace/%s/fp32" % SMOKE_DIR]] and flags(bf16)["--output_dir"] == [["/workspace/%s/bf16" % SMOKE_DIR]]
         config = "/workspace/%s/datasets_config_smoke.yaml" % SMOKE_DIR
         assert flags(fp32)["--datasets_config"] == flags(bf16)["--datasets_config"] == [[config]] and flags(run_argv)["--datasets_config"] == [[NATIVE_YAML]]
@@ -975,7 +983,7 @@ def test_newdata224_cos100_smoke_lines():
         assert ssl_pretrain.check_args(parsed) == ssl_pretrain.check_args(parsed_bf16) == 1 and ssl_pretrain.check_args(run_parsed) == 100  # one cycle each, of the run's 100-cycle schedule
         assert parsed.freeze_backbone_epochs == parsed_bf16.freeze_backbone_epochs == 0 and parsed.print_freq == 5 and parsed.log_peak_memory and not parsed.bf16 and parsed_bf16.bf16
         assert {k for k in vars(run_parsed) if vars(run_parsed)[k] != vars(parsed)[k]} == {"output_dir", "datasets_config", "stop_after_epochs", "print_freq", "log_peak_memory"}  # every other trainer setting, defaults included
-        assert {k for k in vars(parsed) if vars(parsed)[k] != vars(parsed_bf16)[k]} == {"output_dir", "bf16"}
+        assert {k for k in vars(parsed) if vars(parsed)[k] != vars(parsed_bf16)[k]} == {"output_dir", "bf16", "export_pass_end_every"} and (parsed.export_pass_end_every, parsed_bf16.export_pass_end_every) == (1, 0)
         # a throwaway dir that cannot be the run's, nor resume into it
         assert SMOKE_DIR != RUN_COS and not SMOKE_DIR.startswith(RUN_COS) and not RUN_COS.startswith(SMOKE_DIR)
         for kind in ("fp32", "bf16"):
@@ -1040,6 +1048,7 @@ def test_newdata224_cos100_smoke_summary():
                 assert expected in lines, (expected, lines)
             assert sorted(os.listdir(run_dir)) == ["args.json", "argv.txt", "extra_binds.txt", "hlsmi.txt", "ssl_losses.csv", "train.log"], os.listdir(run_dir)  # ckpt/ and export/ are gone, the evidence stays
             assert "peak_memory rank=7 step=389 GiB=%.2f" % (base + 7) in open(os.path.join(run_dir, "train.log")).read()
+        assert sorted(l for l in lines if "pass-end export" in l) == sorted("SMOKE fp32 pass-end export teacher_backbone_epoch_0001_after_%s.pth: 4 bytes" % d for d in COS_PASS_END), lines  # fp32 only, reported before the cleanup (glob order is the locale's)
         assert "SMOKE fp32 verdict: FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines
         assert "SMOKE bf16 verdict (report only): FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines
         assert max(i for i, l in enumerate(lines) if l.startswith("SMOKE fp32")) < min(i for i, l in enumerate(lines) if l.startswith("SMOKE bf16 "))  # fp32 first, its whole summary before bf16's
