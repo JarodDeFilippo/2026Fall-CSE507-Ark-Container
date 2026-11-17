@@ -34,6 +34,7 @@ def subset(d,ids):
  ids=set(ids); out={k:copy.deepcopy(v) for k,v in d.items() if k not in ('images','annotations')}
  out['images']=[x for x in d['images'] if x['id'] in ids];out['annotations']=[x for x in d['annotations'] if x['image_id'] in ids]
  out.setdefault('info',{});out.setdefault('licenses',[]);return out
+def drop_extra(d):return subset(d,[x['id'] for x in d['images'] if not x['file_name'].startswith('extra/')])
 def tb_split(d):
  # Stable across models/seeds; stratify positive/negative and source folder.
  pos={a['image_id'] for a in d['annotations'] if not a.get('iscrowd',0)}; groups=collections.defaultdict(list)
@@ -103,8 +104,9 @@ def main():
  if os.path.exists(a.out):raise RuntimeError('output already exists: '+a.out)
  torch.manual_seed(a.seed);np.random.seed(a.seed);random.seed(a.seed);assert torch.cuda.is_available();device=torch.device('cuda')
  if a.dataset=='tbx11k':
-  ftrain=TB+'/all_train_2.json';ftest=TB+'/all_val_2.json';raw=read_json(ftrain);train_ids,val_ids=tb_split(raw);tr=subset(raw,train_ids);va=subset(raw,val_ids);te=read_json(ftest)
-  manifest={'source':ftrain,'source_sha256':digest(ftrain),'algorithm':'sha256(tbx-split-100:filename), stratified by folder and annotation presence; 15% per group','train_filenames':sorted(x['file_name'] for x in tr['images']),'selection_filenames':sorted(x['file_name'] for x in va['images'])}
+  ftrain=TB+'/all_train_2.json';ftest=TB+'/all_val_2.json';full=read_json(ftrain);raw=drop_extra(full);train_ids,val_ids=tb_split(raw);tr=subset(raw,train_ids);va=subset(raw,val_ids);fullv=read_json(ftest);te=drop_extra(fullv)
+  print('extra/ images dropped: train',len(full['images'])-len(raw['images']),'val',len(fullv['images'])-len(te['images']),flush=True)
+  manifest={'source':ftrain,'source_sha256':digest(ftrain),'algorithm':'sha256(tbx-split-100:filename), stratified by folder and annotation presence; 15% per group; extra/ images excluded','train_filenames':sorted(x['file_name'] for x in tr['images']),'selection_filenames':sorted(x['file_name'] for x in va['images'])}
   if os.path.exists(a.manifest):
    if read_json(a.manifest)!=manifest:raise RuntimeError('existing split manifest differs')
   else:
