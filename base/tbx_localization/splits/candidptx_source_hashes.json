@@ -1,0 +1,20 @@
+{
+  "train": {
+    "source": "/data/jliang12/nuislam/FoundationX_localization_bbox_annotation_collections/CANDID_PTX/CANDID_PTX_train_1.json",
+    "sha256": "4c80ece32593affea0cf8c46705c7ca693b82f2a2a32d6ab5256e7cdcdbfd42e",
+    "image_count": 13748,
+    "box_count": 2499
+  },
+  "valid": {
+    "source": "/data/jliang12/nuislam/FoundationX_localization_bbox_annotation_collections/CANDID_PTX/CANDID_PTX_valid_1.json",
+    "sha256": "982740f294143ca3c33450067110e7d7c8b66182211292331effece4e7caa302",
+    "image_count": 1964,
+    "box_count": 357
+  },
+  "test": {
+    "source": "/data/jliang12/nuislam/FoundationX_localization_bbox_annotation_collections/CANDID_PTX/CANDID_PTX_test_1.json",
+    "sha256": "110e9ff674205efd56a40fb0ee583b5bae4d75c9144487a876ba7662d785016c",
+    "image_count": 3928,
+    "box_count": 714
+  }
+}
