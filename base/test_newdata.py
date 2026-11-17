@@ -4,7 +4,7 @@ squash, --no_gram with --gram_teacher_size = --global_crops_size, --init_new_hea
 Also its two variants and the 224 px run on the same seven datasets: --decode_min_side, base/datasets_config_taix_original.yaml (TAIXRay from the native files), chain/newdata512_cropsrc.sh and
 chain/newdata224.sh with their wrappers, each against the launch line it copies (newdata512.sh, the 224 px Ark-teacher trunk's constlr.sh) to show the only differences, and the LR the trainer
 computes from cropsrc's line (a base of 1e-4, a constant effective 1.4142e-4 at batch 128).
-And the cosine-schedule run on the same seven datasets (chain/newdata224_cos100.sh, its wrapper and its pre-run smoke run_d1_8_newdata224_cos100_smoke_gaudi.sh): the launch line word for word, its
+And the cosine-schedule run on the same seven datasets (chain/newdata224_cos50.sh, its wrapper and its pre-run smoke run_d1_8_newdata224_cos50_smoke_gaudi.sh): the launch line word for word, its
 one-line settings, the 8-card refusals, and the smoke in a fake repo with a recording gaudi.sh (its launch lines against the real launcher's, the truncated lists, the summary, the exit codes, the refusals).
 Run from base/: python test_newdata.py (needs torch, timm, torchvision, PIL; no Slurm, no Gaudi). The test_ functions are also collected by pytest."""
 import contextlib
@@ -372,7 +372,7 @@ def fake_repo(tmp, settings=SETTINGS, init=True):
     root = os.path.join(tmp, "repo")
     for directory in ("chain", "experiment_scripts", "weights", os.path.dirname(INIT.replace("/workspace/", ""))):
         os.makedirs(os.path.join(root, directory))
-    for name in ("newdata512.sh", "newdata512_cropsrc.sh", "newdata224.sh", "newdata224_cos100.sh", "constlr.sh", "ssl_common.sh"):  # constlr.sh: the 224 px trunk's launcher, which newdata224.sh is compared with
+    for name in ("newdata512.sh", "newdata512_cropsrc.sh", "newdata224.sh", "newdata224_cos50.sh", "constlr.sh", "ssl_common.sh"):  # constlr.sh: the 224 px trunk's launcher, which newdata224.sh is compared with
         shutil.copy(os.path.join(REPO, "chain", name), os.path.join(root, "chain", name))
     shutil.copy(os.path.join(REPO, "experiment_scripts", "common.sh"), os.path.join(root, "experiment_scripts"))
     for name, body in (("gaudi.sh", 'printf "%s\\n" "$@" > "$PWD/argv.txt"; printf "%s" "${EXTRA_BINDS:-}" > "$PWD/extra_binds.txt"'),
@@ -732,30 +732,30 @@ def test_ssl_datasets_default_and_gaudi_extra_binds():
         assert binds(EXTRA_BINDS="") == plain
 
 
-RUN_COS = "ssl_dinov3_cxr_newdata224_cos100_tiedhead_arkteacher_seed_100"
-REGISTRY_COS = "ssl-newdata224_cos100_tiedhead_arkteacher"
+RUN_COS = "ssl_dinov3_cxr_newdata224_cos50_tiedhead_arkteacher_seed_100"
+REGISTRY_COS = "ssl-newdata224_cos50_tiedhead_arkteacher"
 COS_LINE = ("--no_gram --cyclic_ark_teacher --no_lock_half_pass --keep_all_checkpoints --no_ibot_separate_head --drop_path_rate 0.1 --rope_rescale_coords 2 --untie_local_cls_norm "
-            "--lr 2e-3 --min_lr 1e-6 --no_lr_scaling --epochs 100 --warmup_epochs 10 --teacher_temp_warmup_epochs 30 --weight_decay 0.04 --weight_decay_end 0.4 --pre_resize 512 "
-            "--global_crops_scale 0.15 1.0 --local_crops_scale 0.05 0.15 --intensity_aug ark --no_blur --no_horizontal_flips --rotate_limit 10").split()  # the confirmed flag line (handoff 2026-11-16 section 4)
+            "--lr 2e-3 --min_lr 1e-6 --no_lr_scaling --epochs 50 --warmup_epochs 5 --teacher_temp_warmup_epochs 15 --weight_decay 0.04 --weight_decay_end 0.4 --pre_resize 512 "
+            "--global_crops_scale 0.15 1.0 --local_crops_scale 0.05 0.15 --intensity_aug ark --no_blur --no_horizontal_flips --rotate_limit 10").split()  # the confirmed flag line (handoff 2026-11-16 section 4), its schedule halved to 50 cycles by Jarod the same day (warm-ups 5 / 15: 10% / 30%)
 COS_TAIL = ["--freeze_backbone_epochs", "0", "--teacher_whole_image_size", "448", "--whole_image_dino_weight", "1.0", "--export_pass_end_every", "1", "--gram_teacher_size", "224", "--datasets_config", NATIVE_YAML]  # after it: Jarod's no frozen first cycle, then the script's settings
 
 
 def cos_expected(cards=8):
-    """The cos100 run's launch line as chain/newdata224_cos100.sh and ssl_launch give it: the cards, the seven --data_set, the stock weights, ssl_launch's defaults, the confirmed flag line, then the script's own settings."""
+    """The cos50 run's launch line as chain/newdata224_cos50.sh and ssl_launch give it: the cards, the seven --data_set, the stock weights, ssl_launch's defaults, the confirmed flag line, then the script's own settings."""
     return (["python", "-m", "torch.distributed.run", "--standalone", "--nproc-per-node", str(cards), "ssl_pretrain.py", "--device", "hpu"] + [x for name in SEVEN for x in ("--data_set", name)]
             + ["--pretrained_weights", "/workspace/weights/" + WEIGHT_NAME, "--batch_size_per_gpu", "64", "--workers", "16", "--seed", "100", "--output_dir", "/workspace/" + RUN_COS, "--resume"]
             + COS_LINE + COS_TAIL)
 
 
-def test_newdata224_cos100_script():
-    script = os.path.join(REPO, "chain", "newdata224_cos100.sh")
+def test_newdata224_cos50_script():
+    script = os.path.join(REPO, "chain", "newdata224_cos50.sh")
     subprocess.run(["bash", "-n", script], check=True)
     assert os.access(script, os.X_OK) and open(script).read().startswith("#!/usr/bin/env bash\n")
-    assert "newdata224_cos100" not in [line.split("#")[0].strip() for line in open(os.path.join(REPO, "chain", "phases.txt"))]  # not a chain phase
+    assert "newdata224_cos50" not in [line.split("#")[0].strip() for line in open(os.path.join(REPO, "chain", "phases.txt"))]  # not a chain phase
     expected = cos_expected()
     with tempfile.TemporaryDirectory() as tmp:
         root = fake_repo(tmp, SETTINGS_NEW)
-        result, argv = launch(root, script="chain/newdata224_cos100.sh", env=dict(ENV8, SSL_DATASETS="VinDrCXR"))  # an inherited SSL_DATASETS does not change the seven
+        result, argv = launch(root, script="chain/newdata224_cos50.sh", env=dict(ENV8, SSL_DATASETS="VinDrCXR"))  # an inherited SSL_DATASETS does not change the seven
         assert result.returncode == 0 and result.stderr == "" and argv == expected, (result.stderr, argv)
         i = argv.index(COS_LINE[0])
         assert argv[i:i + len(COS_LINE)] == COS_LINE  # the confirmed line's words, as one contiguous run
@@ -764,23 +764,23 @@ def test_newdata224_cos100_script():
         for needle in ("data sets " + " ".join(SEVEN), "8 cards x 64 = global batch 512", "cut at 224", " ".join(COS_LINE + COS_TAIL[:6])):  # the datasets, the batch, the cut size, the flags as launched
             assert needle in lines[0], (needle, lines[0])
         parsed = parse(argv)  # the trainer accepts the line, and reads it as meant
-        assert ssl_pretrain.check_args(parsed) == 100 and parsed.data_set == SEVEN and parsed.output_dir == "/workspace/" + RUN_COS  # no stop epoch: the run trains all 100 cycles
+        assert ssl_pretrain.check_args(parsed) == 50 and parsed.data_set == SEVEN and parsed.output_dir == "/workspace/" + RUN_COS  # no stop epoch: the run trains all 50 cycles
         i = argv.index("--freeze_backbone_epochs")
         assert parsed.freeze_backbone_epochs == 0 and parse(argv[:i] + argv[i + 2:]).freeze_backbone_epochs == 1  # the trainer's default is the frozen first cycle: this line turns it off
         assert (parsed.pre_resize, parsed.global_crops_size, parsed.local_crops_size, parsed.gram_teacher_size) == (512, 224, 96, 224)  # cut at 224 straight from the 512 squash: no resize
         assert (parsed.teacher_whole_image_size, parsed.whole_image_dino_weight, parsed.no_gram, parsed.cyclic_ark_teacher) == (448, 1.0, True, True)
         assert parsed.export_pass_end_every == 1  # pass-end exports in every cycle
         assert (parsed.heads, parsed.no_ibot_separate_head, parsed.lock_half_pass, parsed.keep_all_checkpoints) == ("shared", True, False, True)  # one tied head for all seven datasets
-        assert (parsed.lr, parsed.min_lr, parsed.no_lr_scaling, parsed.epochs, parsed.warmup_epochs, parsed.teacher_temp_warmup_epochs) == (2e-3, 1e-6, True, 100, 10, 30)
+        assert (parsed.lr, parsed.min_lr, parsed.no_lr_scaling, parsed.epochs, parsed.warmup_epochs, parsed.teacher_temp_warmup_epochs) == (2e-3, 1e-6, True, 50, 5, 15)  # the 50-cycle schedule, both warm-ups 10% / 30% of it
         assert (parsed.weight_decay, parsed.weight_decay_end, parsed.drop_path_rate, parsed.rope_rescale_coords, parsed.untie_local_cls_norm) == (0.04, 0.4, 0.1, 2.0, True)
         assert (parsed.global_crops_scale, parsed.local_crops_scale, parsed.intensity_aug, parsed.no_blur, parsed.no_horizontal_flips, parsed.rotate_limit) == ((0.15, 1.0), (0.05, 0.15), "ark", True, True, 10.0)
         assert (parsed.init_from_checkpoint, parsed.datasets_config, parsed.bf16, parsed.stop_after_epochs) == (None, NATIVE_YAML, False, None)  # the stock weights, the native TAIXRay files, fp32
         # no settings file and no start checkpoint are read: with neither in the repo the line is the same
-        result, bare = launch(fake_repo(tempfile.mkdtemp(dir=tmp), {}, init=False), script="chain/newdata224_cos100.sh", env=ENV8)
+        result, bare = launch(fake_repo(tempfile.mkdtemp(dir=tmp), {}, init=False), script="chain/newdata224_cos50.sh", env=ENV8)
         assert result.returncode == 0 and bare == expected, result.stderr
         # 8 cards or nothing: another count would change the global batch, the absolute LR's recipe and the length of the cycle; refused before anything is launched
         for cards in (2, 4, 16):
-            result, none = launch(root, script="chain/newdata224_cos100.sh", env=dict(ENV, SLURM_JOB_GPUS=",".join(str(card) for card in range(cards))))
+            result, none = launch(root, script="chain/newdata224_cos50.sh", env=dict(ENV, SLURM_JOB_GPUS=",".join(str(card) for card in range(cards))))
             assert result.returncode == 1 and none is None and result.stdout == "" and "ERROR: %d cards in the allocation" % cards in result.stderr, (cards, result)
         # the three settings are one line each, once, ahead of the flag line, each a one-line change
         text = open(script).read()
@@ -791,14 +791,14 @@ def test_newdata224_cos100_script():
 
         def edited(name, value):  # the script with one setting's value replaced, launched in a fresh fake repo: (result, argv)
             other_root = fake_repo(tempfile.mkdtemp(dir=tmp), SETTINGS_NEW)
-            path = os.path.join(other_root, "chain", "newdata224_cos100.sh")
+            path = os.path.join(other_root, "chain", "newdata224_cos50.sh")
             copy = open(path).read()
             open(path, "w").write(copy.replace("\n" + setting[name], "\n%s=%s  #" % (name, value)))
-            return launch(other_root, script="chain/newdata224_cos100.sh", env=ENV8)
+            return launch(other_root, script="chain/newdata224_cos50.sh", env=ENV8)
 
         result, other = edited("RUN", "ssl_other_run_seed_7")  # the run dir, nothing else
         assert result.returncode == 0 and changed(other, argv) == {"--output_dir"} and flags(other)["--output_dir"] == [["/workspace/ssl_other_run_seed_7"]], result.stderr
-        assert ssl_pretrain.check_args(parse(other)) == 100 and result.stdout.startswith("run: ssl_other_run_seed_7 (registry id " + REGISTRY_COS + "; "), result.stdout
+        assert ssl_pretrain.check_args(parse(other)) == 50 and result.stdout.startswith("run: ssl_other_run_seed_7 (registry id " + REGISTRY_COS + "; "), result.stdout
         result, other = edited("REGISTRY_ID", "ssl-other")  # only printed: the trainer does not read it
         assert result.returncode == 0 and other == argv and result.stdout.startswith("run: %s (registry id ssl-other; " % RUN_COS), result.stdout
         result, other = edited("EXPORT_PASS_END_EVERY", "2")  # every second cycle (Jarod may choose it): --export_pass_end_every and nothing else
@@ -815,15 +815,15 @@ def test_newdata224_cos100_script():
         assert "--gram_teacher_size cannot be combined with --no_gram" in err.getvalue(), err.getvalue()
 
 
-def test_newdata224_cos100_wrapper():
-    check_wrapper("run_d1_8_newdata224_cos100_gaudi.sh", ["--job-name=d1-8-newdata224-cos100", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:8", "-c 144", "--mem=480G"],
-                  "newdata224_cos100.sh", ("A=$(sbatch --parsable run_d1_8_newdata224_cos100_gaudi.sh)", "sbatch -d afterany:$A run_d1_8_newdata224_cos100_gaudi.sh", "taix_unpack_original.sh train",
-                                          "run_d1_8_newdata224_cos100_smoke_gaudi.sh", "re-submit"), ENV8)
+def test_newdata224_cos50_wrapper():
+    check_wrapper("run_d1_8_newdata224_cos50_gaudi.sh", ["--job-name=d1-8-newdata224-cos50", "-A grp_jliang12", "-p gaudi", "-q public", "-t 7-00:00:00", "-N 1", "--gres=gpu:hl225:8", "-c 144", "--mem=480G"],
+                  "newdata224_cos50.sh", ("A=$(sbatch --parsable run_d1_8_newdata224_cos50_gaudi.sh)", "sbatch -d afterany:$A run_d1_8_newdata224_cos50_gaudi.sh", "taix_unpack_original.sh train",
+                                          "run_d1_8_newdata224_cos50_smoke_gaudi.sh", "re-submit"), ENV8)
 
 
-SMOKE_COS = os.path.join(REPO, "run_d1_8_newdata224_cos100_smoke_gaudi.sh")
+SMOKE_COS = os.path.join(REPO, "run_d1_8_newdata224_cos50_smoke_gaudi.sh")
 SMOKE_ROWS = 60 * 8 * 64  # the smoke's cut: STEPS_PER_DATASET x cards x BATCH
-SMOKE_DIR = "smoke_newdata224_cos100_x8_4242"  # the smoke dir of job 4242 on 8 cards
+SMOKE_DIR = "smoke_newdata224_cos50_x8_4242"  # the smoke dir of job 4242 on 8 cards
 COS_HEADERS = {"MIMIC": "image_path,dicom_id,study_id", "CheXpert": "Path,Sex,Age", "PadChest": "Path", "TAIXRay": "Path", "ReXGradient": "Path"}  # the lists with a header row (ChestXray14's and VinDrCXR's have none)
 COS_PASS_END = ['MIMIC', 'ReXGradient', 'CheXpert', 'TAIXRay', 'PadChest', 'ChestXray14']  # the smoke cycle's passes but the last (the cut lists tie, so the --data_set order: VinDrCXR, the short one, last)
 COS_SHORT = {"VinDrCXR": 15000}  # the real list's size, below SMOKE_ROWS: the smoke keeps it whole (29 steps on 8 cards)
@@ -870,11 +870,11 @@ def cos_list(path, name, rows):
 
 
 def smoke_repo(tmp, trainer=True, rows=SMOKE_ROWS + 50):
-    """A fake repo for the cos100 smoke: the real launcher, ssl_common.sh, Ark's common.sh and gaudi_hlsmi.sh, a recording gaudi.sh (FAKE_TRAINER: it also plays the trainer), a card check that records it ran, the stock weights, the
+    """A fake repo for the cos50 smoke: the real launcher, ssl_common.sh, Ark's common.sh and gaudi_hlsmi.sh, a recording gaudi.sh (FAKE_TRAINER: it also plays the trainer), a card check that records it ran, the stock weights, the
     trainer's text (trainer=False: without --teacher_whole_image_size), base/datasets_config_taix_original.yaml as the real file with its two absolute lists moved under tmp, and the seven lists it names: `rows` images each,
     VinDrCXR's 15,000. The CSV the stub trainer writes, an hl-smi stub on PATH and the datasets-new directory."""
     root = os.path.join(tmp, "repo")
-    for name in ("chain/newdata224_cos100.sh", "chain/ssl_common.sh", "experiment_scripts/common.sh", "gaudi_hlsmi.sh"):
+    for name in ("chain/newdata224_cos50.sh", "chain/ssl_common.sh", "experiment_scripts/common.sh", "gaudi_hlsmi.sh"):
         put(os.path.join(root, name), open(os.path.join(REPO, name)).read(), stat.S_IMODE(os.stat(os.path.join(REPO, name)).st_mode))
     put(os.path.join(root, "gaudi.sh"), COS_GAUDI_STUB, 0o755)
     put(os.path.join(root, "gaudi_check_cards.sh"), '#!/usr/bin/env bash\ntouch "$PWD/cards_checked"\n', 0o755)
@@ -934,14 +934,14 @@ def no_launch(root, smoke_dir_exists=False):
         assert not os.path.exists(os.path.join(root, SMOKE_DIR))
 
 
-def test_newdata224_cos100_smoke_header():
+def test_newdata224_cos50_smoke_header():
     subprocess.run(["bash", "-n", SMOKE_COS], check=True)
     assert os.access(SMOKE_COS, os.X_OK) and stat.S_IMODE(os.stat(SMOKE_COS).st_mode) == 0o755
     text = open(SMOKE_COS).read()
     lines = text.splitlines()
     sbatch = [line[len("#SBATCH "):] for line in lines if line.startswith("#SBATCH ")]
-    assert sbatch == ["--job-name=d1-8-newdata224-cos100-smoke", "-A grp_jliang12", "-p gaudi", "-q public", "-t 00:30:00", "-N 1", "--gres=gpu:hl225:8", "-c 144", "--mem=480G"], lines
-    run = [line[len("#SBATCH "):] for line in open(os.path.join(REPO, "run_d1_8_newdata224_cos100_gaudi.sh")).read().splitlines() if line.startswith("#SBATCH ")]
+    assert sbatch == ["--job-name=d1-8-newdata224-cos50-smoke", "-A grp_jliang12", "-p gaudi", "-q public", "-t 00:30:00", "-N 1", "--gres=gpu:hl225:8", "-c 144", "--mem=480G"], lines
+    run = [line[len("#SBATCH "):] for line in open(os.path.join(REPO, "run_d1_8_newdata224_cos50_gaudi.sh")).read().splitlines() if line.startswith("#SBATCH ")]
     assert [s for s in sbatch if not s.startswith(("--job-name", "-t "))] == [s for s in run if not s.startswith(("--job-name", "-t "))]  # the run's account, partition, QOS, node, cards, CPUs and memory
     code = [line for line in lines if line and not line.startswith("#")]
     for needle in ("export PT_HPU_LAZY_MODE=1", "cd /scratch/$USER/2026Fall-CSE507-Ark-Container || exit 1", "source ./chain/ssl_common.sh", "source ./gaudi_hlsmi.sh", "./gaudi_check_cards.sh || exit 1",
@@ -950,17 +950,17 @@ def test_newdata224_cos100_smoke_header():
     assert not any("main_lr" in line or "stop_after.txt" in line for line in code)  # no settings file
     for line in ("STEPS_PER_DATASET=60  #", "BATCH=64  #"):  # the two settings, one line each, once, near the top
         assert text.count("\n" + line) == 1 and text.index("\n" + line) < text.index("\nFLAGS=("), line
-    for needle in ("sbatch run_d1_8_newdata224_cos100_smoke_gaudi.sh", "grep -E '^(SMOKE|peak_memory)'", "29 steps", "30,720", "not measured", "dino_whole", "The 30 min limit", "--export_pass_end_every 1 --gram_teacher_size"):
+    for needle in ("sbatch run_d1_8_newdata224_cos50_smoke_gaudi.sh", "grep -E '^(SMOKE|peak_memory)'", "29 steps", "30,720", "not measured", "dino_whole", "The 30 min limit", "--export_pass_end_every 1 --gram_teacher_size"):
         assert needle in text, needle
     assert "bf16" not in text.lower() and "smoke_line" not in text  # one line, fp32 as the run: no report-only bf16 line any more (Jarod, 2026-11-16)
-    assert "newdata224_cos100_smoke" not in [line.split("#")[0].strip() for line in open(os.path.join(REPO, "chain", "phases.txt"))]  # not a chain phase
+    assert "newdata224_cos50_smoke" not in [line.split("#")[0].strip() for line in open(os.path.join(REPO, "chain", "phases.txt"))]  # not a chain phase
 
 
-def test_newdata224_cos100_smoke_lines():
+def test_newdata224_cos50_smoke_lines():
     with tempfile.TemporaryDirectory() as tmp:
         root = smoke_repo(tmp)
         env = smoke_env(tmp, SSL_DATASETS="VinDrCXR")  # an inherited SSL_DATASETS changes neither the run's line nor the smoke's
-        real = smoke_run("chain/newdata224_cos100.sh", root, env)  # the run's own launch line, in the same fake repo
+        real = smoke_run("chain/newdata224_cos50.sh", root, env)  # the run's own launch line, in the same fake repo
         assert real.returncode == 0 and real.stderr == "", real.stderr
         run_argv = recorded(root, RUN_COS)
         assert run_argv == cos_expected(), run_argv
@@ -976,7 +976,7 @@ def test_newdata224_cos100_smoke_lines():
         assert smoke[:smoke.index("--output_dir")] == run_argv[:run_argv.index("--output_dir")]  # the cards, the trainer, the seven datasets, the weights, the batch of 64, the workers and the seed: the run's
         assert flags(smoke)["--batch_size_per_gpu"] == [["64"]] and flags(smoke)["--data_set"] == [[name] for name in SEVEN] and flags(smoke)["--gram_teacher_size"] == [["224"]]
         run_parsed, parsed = parse(run_argv), parse(smoke)
-        assert ssl_pretrain.check_args(parsed) == 1 and ssl_pretrain.check_args(run_parsed) == 100  # one cycle of the run's 100-cycle schedule
+        assert ssl_pretrain.check_args(parsed) == 1 and ssl_pretrain.check_args(run_parsed) == 50  # one cycle of the run's 50-cycle schedule
         assert parsed.freeze_backbone_epochs == 0 and parsed.export_pass_end_every == 1 and parsed.print_freq == 5 and parsed.log_peak_memory and not parsed.bf16
         assert {k for k in vars(run_parsed) if vars(run_parsed)[k] != vars(parsed)[k]} == {"output_dir", "datasets_config", "stop_after_epochs", "print_freq", "log_peak_memory"}  # every other trainer setting, defaults included
         # a throwaway dir that cannot be the run's, nor resume into it
@@ -986,7 +986,7 @@ def test_newdata224_cos100_smoke_lines():
         assert "SMOKE plan: 8 cards x per-card batch 64 (global batch 512), one cycle over lists cut to 30720 rows (60 steps a dataset; a shorter list is kept whole), smoke dir " + SMOKE_DIR in result.stdout
 
 
-def test_newdata224_cos100_smoke_lists():
+def test_newdata224_cos50_smoke_lists():
     with tempfile.TemporaryDirectory() as tmp:
         root = smoke_repo(tmp)
         result = smoke_run(smoke_script(tmp, root), root, smoke_env(tmp, FAKE_TRAINER="1"))
@@ -1014,8 +1014,8 @@ def cos_summary():
     after = COS_ROWS[1:]
     lines = ["SMOKE speed: %.3f s/step, data wait %.3f s/step (the mean of the %d rows after step 0, which holds the compile; each row is the mean over the steps since the row before)"
              % (sum(r[4] for r in after) / len(after), sum(r[5] for r in after) / len(after), len(after)),
-             "SMOKE projection: %.1f h = %.3f s/step x 238000 steps / 3600: arithmetic on the mean of this smoke, not a measurement of the run"
-             % (sum(r[4] for r in after) / len(after) * 238000 / 3600, sum(r[4] for r in after) / len(after))]
+             "SMOKE projection: %.1f h = %.3f s/step x 119000 steps / 3600: arithmetic on the mean of this smoke, not a measurement of the run"
+             % (sum(r[4] for r in after) / len(after) * 119000 / 3600, sum(r[4] for r in after) / len(after))]
     for dataset in dict.fromkeys(r[6] for r in COS_ROWS):
         mine, later = [r for r in COS_ROWS if r[6] == dataset], [r for r in after if r[6] == dataset]
         last = mine[-1]
@@ -1024,7 +1024,7 @@ def cos_summary():
     return lines
 
 
-def test_newdata224_cos100_smoke_summary():
+def test_newdata224_cos50_smoke_summary():
     with tempfile.TemporaryDirectory() as tmp:
         root = smoke_repo(tmp)
         script = smoke_script(tmp, root)
@@ -1039,7 +1039,7 @@ def test_newdata224_cos100_smoke_summary():
         assert all(peaks[i] >= 768 + i * 10 and (peaks[i] - 768 - i * 10) % 1000 == 0 for i in peaks), peaks  # the largest of several samples (the stub's reading grows by 1000 MiB a call)
         for expected in cos_summary():
             assert expected in lines, (expected, lines)
-        assert [l for l in lines if "pass-end export time" in l] == ["SMOKE pass-end export time: 6 files, mean 2.5 s to write each, 0.2 min per exporting cycle (6 files): 0.42 h over 100 cycles at "
+        assert [l for l in lines if "pass-end export time" in l] == ["SMOKE pass-end export time: 6 files, mean 2.5 s to write each, 0.2 min per exporting cycle (6 files): 0.21 h over 50 cycles at "
                                                                    "--export_pass_end_every 1, half that at 2 (arithmetic on this smoke's mean)"], lines  # the trainer's per-file seconds (2.5 each here)
         assert sorted(l for l in lines if l.startswith("SMOKE") and "pass-end export " in l and "time" not in l) == sorted("SMOKE pass-end export teacher_backbone_epoch_0001_after_%s.pth: 4 bytes" % d for d in COS_PASS_END), lines  # reported before the cleanup (glob order is the locale's)
         assert "SMOKE verdict: FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines and lines[-1].startswith("SMOKE verdict: ")
@@ -1056,9 +1056,16 @@ def test_newdata224_cos100_smoke_summary():
         assert len([l for l in lines if l.startswith("SMOKE hl-smi card index")]) == 8 and cos_summary()[0] in lines
         assert "peak_memory rank=7 step=389 GiB=unavailable" in open(os.path.join(run_dir, "train.log")).read()
         assert "SMOKE verdict: FITS: 8 cards x per-card batch 64 ran one cycle over the cut lists (exit 0)" in lines and not any("0.00 GiB" in l for l in lines)
+        # the projections read the run's cycle count from the line's own --epochs, not a second copy: 40 there gives 40 x 2380 = 95,200 steps and 40 cycles of saves
+        shutil.rmtree(run_dir)
+        text = open(script).read()
+        assert text.count(" --epochs 50 ") == 1
+        open(script, "w").write(text.replace(" --epochs 50 ", " --epochs 40 "))
+        lines = smoke_run(script, root, smoke_env(tmp, FAKE_TRAINER="1")).stdout.splitlines()
+        assert any(l.startswith("SMOKE projection: ") and " x 95200 steps / 3600" in l for l in lines) and any(l.startswith("SMOKE pass-end export time: ") and " over 40 cycles " in l for l in lines), lines
 
 
-def test_newdata224_cos100_smoke_exit_codes():
+def test_newdata224_cos50_smoke_exit_codes():
     oom, boom = "RuntimeError: Habana: no storage tensor attached to lazy tensor", "ValueError: boom"
     with tempfile.TemporaryDirectory() as tmp:
         root = smoke_repo(tmp)
@@ -1078,7 +1085,7 @@ def test_newdata224_cos100_smoke_exit_codes():
         assert not os.path.exists(os.path.join(root, SMOKE_DIR, "ckpt")) and not os.path.exists(os.path.join(root, SMOKE_DIR, "export"))
 
 
-def test_newdata224_cos100_smoke_refusals():
+def test_newdata224_cos50_smoke_refusals():
     with tempfile.TemporaryDirectory() as tmp:
         root = smoke_repo(tmp)
         script = smoke_script(tmp, root)

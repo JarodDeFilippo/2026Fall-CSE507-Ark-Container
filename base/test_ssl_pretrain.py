@@ -2745,7 +2745,7 @@ print("OK (y) two real ranks (tied, --no_gram --cyclic_ark_teacher, batch 1 per 
 # (z) weight decay schedule (--weight_decay_end) and the fixed-length cosine of the planned run -----------------------------------------------------------------------------------------------
 # --weight_decay_end W gives the weight decay DINOv2's build_schedulers wd: the vendored CosineScheduler(--weight_decay, W, epochs x epoch_length) as is, its entry at the step; none, the default, keeps --weight_decay itself on every step.
 # The planned run: --cyclic_ark_teacher on the seven datasets, --epochs E --warmup_epochs W --teacher_temp_warmup_epochs T --lr 2e-3 --min_lr 1e-6 --no_lr_scaling --weight_decay 0.04 --weight_decay_end 0.4 on 8 ranks x 64 (global
-# batch 512), (E, W, T) = (100, 10, 30) or (30, 3, 9). (c) checks its schedules at the real sizes; (d) and (e) its mode end to end in miniature: (x)'s data, --no_gram --cyclic_ark_teacher --no_ibot_separate_head, 15 steps a cycle,
+# batch 512), (E, W, T) = (50, 5, 15) (chain/newdata224_cos50.sh), (100, 10, 30) (the plan before it) or (30, 3, 9). (c) checks its schedules at the real sizes; (d) and (e) its mode end to end in miniature: (x)'s data, --no_gram --cyclic_ark_teacher --no_ibot_separate_head, 15 steps a cycle,
 # E = 2, W = T = 1
 from dinov3.train.cosine_lr_scheduler import CosineScheduler
 
@@ -2788,7 +2788,7 @@ z_L = sum(z_steps(8, 64).values())
 assert z_L == 2380 and sum(z_steps(4, 64).values()) == 4763 and sum(z_steps(8, 16).values()) == 9528  # the planned run (8 x 64); the 224 px seven-dataset run (4 x 64); the 512 px run (8 x 16)
 z_planned = [a for name in Z_IMAGES for a in ("--data_set", name)] + ["--pretrained_weights", "w", "--output_dir", "o", "--cyclic_ark_teacher", "--lr", "2e-3", "--min_lr", "1e-6", "--no_lr_scaling",
                                                                         "--weight_decay", "0.04", Z_FLAG, "0.4"]
-for z_E, z_W, z_T in ((100, 10, 30), (30, 3, 9)):
+for z_E, z_W, z_T in ((50, 5, 15), (100, 10, 30), (30, 3, 9)):  # the planned run (Jarod, 2026-11-16: 50 cycles, warm-ups 10% / 30%), the 100-cycle plan before it, and a 30-cycle one
     z_args = ssl_pretrain.parse_args(z_planned + ["--epochs", str(z_E), "--warmup_epochs", str(z_W), "--teacher_temp_warmup_epochs", str(z_T)])
     assert ssl_pretrain.check_args(z_args) == z_E  # accepted, and the run stops after cycle E
     z_sch = build_schedules(lr=z_args.lr, min_lr=z_args.min_lr, epochs=z_args.epochs, warmup_epochs=z_args.warmup_epochs, epoch_length=z_L, global_batch_size=8 * 64, scale_lr=not z_args.no_lr_scaling,
@@ -2806,9 +2806,9 @@ for z_E, z_W, z_T in ((100, 10, 30), (30, 3, 9)):
     assert (z_last[:z_L] == 0.0).all() and same_state(z_last[z_L:], z_lr[z_L:])  # the last layers' freeze: LR 0 for the first cycle, the LR itself after
     assert abs(z_wd[0] - 0.04) < 1e-15 and abs(z_wd[-1] - 0.4) < 1e-9 and (np.diff(z_wd) >= 0).all() and same_state(z_wd, CosineScheduler(0.04, 0.4, z_n).schedule)
 print("OK (z) planned run, at the real sizes: epoch_length 2380 at 8 x 64 (the seven lists' floor(floor(n / ranks) / 64) as build_data_loader counts them; 4763 at 4 x 64 as chain/newdata224.sh's header, 9528 at 8 x 16 as the 512 px run's "
-      "args.json); for (E, W, T) = (100, 10, 30) and (30, 3, 9), with the planned flags parsed and run()'s build_schedules call: %d / %d steps, lr 0 at step 0, rising linearly to exactly 2e-3 at step W x L, strictly down "
+      "args.json); for (E, W, T) = (50, 5, 15) (the planned run: chain/newdata224_cos50.sh), (100, 10, 30) and (30, 3, 9), with the planned flags parsed and run()'s build_schedules call: %d / %d / %d steps, lr 0 at step 0, rising linearly to exactly 2e-3 at step W x L, strictly down "
       "to exactly 1e-6 at step E x L - 1 (the last step of cycle E - 1, so the run ends after cycle E); the teacher temperature 0.04 rising linearly to exactly 0.07 at step T x L and 0.07 after; the last-layer LR 0 "
-      "through cycle 0 and the LR after; wd the vendored cosine from 0.04 (%.1e off) to 0.4 (%.1e short of it), never decreasing" % (100 * z_L, 30 * z_L, abs(z_wd[0] - 0.04), 0.4 - z_wd[-1]))
+      "through cycle 0 and the LR after; wd the vendored cosine from 0.04 (%.1e off) to 0.4 (%.1e short of it), never decreasing" % (50 * z_L, 100 * z_L, 30 * z_L, abs(z_wd[0] - 0.04), 0.4 - z_wd[-1]))
 
 # (d) end to end in the run's mode, tiny: --no_gram --cyclic_ark_teacher --no_ibot_separate_head, 2 cycles of (x)'s 15 steps, W = T = 1, the planned LR flags (make_args's own --epochs 3 etc. come first: argparse keeps the last value).
 # A spy on apply_optim_scheduler records the weight decay each step hands it and each optimizer group's weight_decay after it
