@@ -132,7 +132,7 @@ def main():
   if metrics['ap50_95']>best:
    best=metrics['ap50_95'];torch.save({'model':model.state_dict(),'epoch':epoch},os.path.join(a.out,'best.pt'))
  ck=torch.load(os.path.join(a.out,'best.pt'),map_location=device,weights_only=False);model.load_state_dict(ck['model']);score=evaluate(model,dl[2],te,device)
- result={'args':vars(a),'input_size':size,'weight_sha256':digest(a.weights),'train_sha256':digest(ftrain),'test_sha256':digest(ftest),'selected_epoch':ck['epoch'],'history':history,'heldout':score,'warning':'TBX val contains known train/pretraining duplicates; full val retained per request' if a.dataset=='tbx11k' else None}
+ result={'args':vars(a),'input_size':size,'weight_sha256':digest(a.weights),'train_sha256':digest(ftrain),'test_sha256':digest(ftest),'selected_epoch':ck['epoch'],'history':history,'heldout':score,'warning':'TBX val contains known train/pretraining duplicates, retained per request; extra/ images excluded' if a.dataset=='tbx11k' else None}
  with open(os.path.join(a.out,'result.json'),'x') as f:json.dump(result,f,indent=2)
  print('heldout',score,flush=True)
 if __name__=='__main__':main()
