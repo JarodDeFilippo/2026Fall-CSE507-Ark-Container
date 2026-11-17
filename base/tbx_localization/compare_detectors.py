@@ -13,6 +13,7 @@ from torch.utils.data import Dataset,DataLoader
 from torchvision.transforms.functional import to_tensor
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.ops import MultiScaleRoIAlign,RoIAlign
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 from ark_finetune.extract_embeddings import load_backbone
@@ -75,6 +76,14 @@ class Backbone(nn.Module):
  def forward(self,x):
   with torch.no_grad(): y=self.vit.get_intermediate_layers(x,n=1,reshape=True)[0]
   return self.projection(y)
+class RoIPool(MultiScaleRoIAlign):
+ # Pools at 1/patch: the default infers a power-of-two scale (RAD-DINO's 37x37 map at 518 px gets 1/16, not 1/14); subclassed only because FasterRCNN type-checks box_roi_pool.
+ def __init__(self,patch):super().__init__(['0'],7,2);self.pool=RoIAlign(7,spatial_scale=1/patch,sampling_ratio=2)
+ def forward(self,features,boxes,image_shapes):return self.pool(features['0'],boxes)
+def build_model(model,weights,normalization):
+ size,patch=(518,14) if model=='vit_base_raddino' else (512,16);anchors=AnchorGenerator(sizes=((16,32,64,128,256),),aspect_ratios=((.5,1.,2.),));mean,std=NORM[normalization]
+ m=FasterRCNN(Backbone(model,weights),num_classes=2,min_size=size,max_size=size,image_mean=mean,image_std=std,rpn_anchor_generator=anchors,box_roi_pool=RoIPool(patch),box_detections_per_img=100,box_score_thresh=.001)
+ m.transform.size_divisible=patch;return m
 def evaluate(model,loader,data,device):
  model.eval(); pred=[]
  with torch.no_grad():
@@ -109,10 +118,7 @@ def main():
  os.makedirs(a.out)
  ds=[BoxDataset(d,a.dataset) for d in (tr,va,te)]
  dl=[DataLoader(d,batch_size=a.batch,shuffle=(i==0),num_workers=a.workers,collate_fn=collate) for i,d in enumerate(ds)]
- size=518 if a.model=='vit_base_raddino' else 512
- b=Backbone(a.model,a.weights);anchors=AnchorGenerator(sizes=((16,32,64,128,256),),aspect_ratios=((.5,1.,2.),))
- mean,std=NORM[a.normalization];model=FasterRCNN(b,num_classes=2,min_size=size,max_size=size,image_mean=mean,image_std=std,rpn_anchor_generator=anchors,box_detections_per_img=100,box_score_thresh=.001).to(device)
- model.transform.size_divisible=14 if a.model=='vit_base_raddino' else 16
+ model=build_model(a.model,a.weights,a.normalization).to(device);size=model.transform.max_size
  opt=torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=.0001,weight_decay=.0001);best=-1;history=[]
  for epoch in range(1,a.epochs+1):
   model.train();losses=[]
